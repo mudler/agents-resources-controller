@@ -10,9 +10,20 @@ single SQLite transaction, workers on device hosts supervise the jobs, and
 
 Exclusive device leases, supervised job execution, live log streaming, and
 fleet visibility. **There is no queue yet** — a busy device is refused
-immediately with `no_device_available`. There is also no `rc kill`, no
-`rc attach`, no device selectors, and no web dashboard; those are later
-stages.
+immediately with `no_device_available`.
+
+**Not built yet**, so you will not find them documented below:
+
+| Not in Stage 1 | What you do instead today |
+|---|---|
+| Web dashboard | `rc devices`, `rc ps`, or `GET /v1/state` |
+| Capability probes (`/etc/rc/probe.d/*.sh`) and device labels | List device names in `worker.yaml` |
+| Per-host usage sheet (`/etc/rc/host.md`) and `rc describe` | Keep host notes wherever you keep them now |
+| Device selectors (`--select 'vram>=40G'`) | Address a device by exact ID: `-d gpubox:gpu0` |
+| Queue and priorities | Retry, or pick another device |
+| Watchdogs (max runtime, idle timeout) | Nothing stops a hung job holding its GPU |
+| `rc kill`, `rc attach`, `rc hold` | Ctrl-C detaches; the job keeps running |
+| Verify probes between jobs | Nothing checks VRAM was released after a job |
 
 ## Controller
 
@@ -35,6 +46,38 @@ rc: duplicate token "wtok" in RC_TOKENS
 `--data` holds the SQLite database and the append-only per-job log files;
 back that directory up if you care about job history.
 
+### Running the controller in Docker
+
+The controller is the piece worth keeping always-on, and it is cgo-free, so
+the image is a static binary on Alpine.
+
+```sh
+cp .env.example .env      # then edit it — see below
+docker compose up -d
+docker compose ps         # should report (healthy)
+```
+
+`.env` holds the tokens and is gitignored:
+
+```
+RC_TOKENS=<worker-token>:worker,<client-token>:client,<admin-token>:admin
+```
+
+Generate real values with `openssl rand -hex 24`. The controller refuses to
+start without `RC_TOKENS` — an unauthenticated scheduler that can execute
+commands on your GPU hosts is not something to fall back to silently.
+
+State lives in the `rc-data` volume (`/var/lib/rc` inside the container).
+
+The published port is bound to `127.0.0.1` on purpose. Workers and clients
+on other machines need to reach it, so put it behind a tunnel (Cloudflare,
+Tailscale, a VPN) or a private network rather than widening the binding —
+the tokens are bearer credentials with no transport security of their own.
+
+**Only the controller belongs in Docker.** A worker must see and signal the
+process group that touches the hardware, so it runs on the device host
+itself, not in a container.
+
 ## Device host
 
 Write `/etc/rc/worker.yaml` (see `examples/worker.yaml`):
@@ -56,6 +99,20 @@ Then:
 rc worker
 # or: rc worker --config /path/to/worker.yaml
 ```
+
+That file is the whole of a node's configuration in stage 1. There is no
+auto-detection: the controller knows only the device names you list, with no
+labels, no VRAM figures, no driver versions, and no per-host notes. If you
+list `gpu0` and `gpu1` on a four-GPU box, the other two do not exist as far
+as the scheduler is concerned.
+
+**Name devices after their GPU index.** The worker sets
+`CUDA_VISIBLE_DEVICES` from the trailing integer of the device name, so
+`gpubox:gpu1` runs its job with `CUDA_VISIBLE_DEVICES=1`. A name with no
+trailing integer leaves the variable unset rather than guessing an index —
+and an unset `CUDA_VISIBLE_DEVICES` means the job can see every GPU on the
+box, which is how two correctly-leased jobs end up on one card. An
+operator-supplied value in the job's own environment is never overridden.
 
 The worker registers its host and devices, long-polls the controller for
 assignments, spawns each job in its own process group, and streams the

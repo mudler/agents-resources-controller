@@ -1,0 +1,39 @@
+# Always-on controller.
+#
+# Only the CONTROLLER belongs in Docker. Workers run on the device hosts
+# themselves, because a worker must be able to see and signal the processes
+# that touch the hardware — a containerised worker supervising a process
+# group on the host is not something this design supports.
+#
+# Set RC_TOKENS before starting, e.g. in a .env file next to this one:
+#   RC_TOKENS=<worker-token>:worker,<client-token>:client,<admin-token>:admin
+# Generate values with: openssl rand -hex 24
+
+services:
+  controller:
+    build: .
+    image: agents-resources-controller:latest
+    container_name: rc-controller
+    restart: unless-stopped
+    environment:
+      # No default: the controller refuses to start without it, which is
+      # deliberate — an unauthenticated scheduler that can execute commands
+      # on your GPU hosts is not something to fall back to silently.
+      RC_TOKENS: ${RC_TOKENS:?set RC_TOKENS in .env, e.g. wtok:worker,ctok:client,atok:admin}
+    ports:
+      # Bound to loopback by default. Publish it wider only behind a tunnel
+      # or a private network — see the README's security note.
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - rc-data:/var/lib/rc
+    healthcheck:
+      # /v1/state requires a client token, so an unauthenticated 401 is proof
+      # the server is up and routing. Any other outcome fails the check.
+      test: ["CMD-SHELL", "wget -q -S -O /dev/null http://127.0.0.1:8080/v1/state 2>&1 | grep -q '401'"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  rc-data:
