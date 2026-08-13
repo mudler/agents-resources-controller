@@ -2,6 +2,7 @@ package cli_test
 
 import (
 	"bytes"
+	"errors"
 	"strings"
 	"testing"
 
@@ -28,10 +29,31 @@ func lineFor(t *testing.T, out, id string) string {
 	return match
 }
 
+// failWriter fails every Write with a fixed error, simulating a broken pipe
+// (`rc devices | head`) or a full disk.
+type failWriter struct{ err error }
+
+func (w failWriter) Write(p []byte) (int, error) { return 0, w.err }
+
+// TestRenderDevicesPropagatesWriteError guards against the table being
+// silently dropped: tabwriter buffers every row until Flush, so a discarded
+// Flush error would let `rc devices` print nothing and still exit 0 on a
+// broken pipe or full disk — exactly the kind of quiet lie this tool exists
+// to avoid.
+func TestRenderDevicesPropagatesWriteError(t *testing.T) {
+	wantErr := errors.New("disk full")
+
+	err := cli.RenderDevices(failWriter{wantErr}, []server.DeviceView{
+		{Device: model.Device{ID: "gpubox:gpu0", State: model.DeviceReady}},
+	})
+
+	require.ErrorIs(t, err, wantErr)
+}
+
 func TestRenderDevicesShowsHolderElapsedAndStaleness(t *testing.T) {
 	var out bytes.Buffer
 
-	cli.RenderDevices(&out, []server.DeviceView{
+	err := cli.RenderDevices(&out, []server.DeviceView{
 		{
 			// Busy, holder attached, heartbeat FRESH (well under the 30s
 			// grace): must render exactly like a healthy device — no "no
@@ -61,6 +83,7 @@ func TestRenderDevicesShowsHolderElapsedAndStaleness(t *testing.T) {
 			HeartbeatAgeSeconds: 5,
 		},
 	})
+	require.NoError(t, err)
 
 	got := out.String()
 

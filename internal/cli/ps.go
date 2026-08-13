@@ -19,7 +19,12 @@ import (
 // have the network partition heal, and start heartbeating again well before
 // anyone runs `rc devices clear`; annotating it "no contact 0s" forever in
 // that window would contradict the freshest information this command has.
-func RenderDevices(w io.Writer, views []server.DeviceView) {
+//
+// It returns tabwriter's Flush error rather than discarding it: tabwriter
+// buffers every row until Flush, so on a broken pipe (`rc devices | head`)
+// or a full disk the table can be silently dropped while this function (and
+// so `rc devices`) would otherwise still report success.
+func RenderDevices(w io.Writer, views []server.DeviceView) error {
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
 	fmt.Fprintln(tw, "DEVICE\tSTATE\tHOLDER\tELAPSED\tCOMMAND")
 
@@ -40,7 +45,7 @@ func RenderDevices(w io.Writer, views []server.DeviceView) {
 		}
 		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", v.Device.ID, state, holder, elapsed, command)
 	}
-	tw.Flush()
+	return tw.Flush()
 }
 
 func NewDevicesCmd() *cobra.Command {
@@ -60,8 +65,7 @@ func NewDevicesCmd() *cobra.Command {
 				enc.SetIndent("", "  ")
 				return enc.Encode(state.Devices)
 			}
-			RenderDevices(cmd.OutOrStdout(), state.Devices)
-			return nil
+			return RenderDevices(cmd.OutOrStdout(), state.Devices)
 		},
 	}
 	cmd.Flags().BoolVarP(&asJSON, "json", "o", false, "output JSON")
