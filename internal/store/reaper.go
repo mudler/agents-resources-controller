@@ -11,6 +11,7 @@ type SweepResult struct {
 	DevicesUnknown   []string `json:"devices_unknown"`
 	DevicesUnhealthy []string `json:"devices_unhealthy"`
 	JobsLost         []string `json:"jobs_lost"`
+	LeasesExpired    []string `json:"leases_expired"`
 }
 
 // Sweep demotes devices whose worker has stopped reporting. A device is never
@@ -117,6 +118,55 @@ func (s *Store) Sweep(grace, unhealthyAfter time.Duration) (SweepResult, error) 
 				return res, err
 			}
 			res.JobsLost = append(res.JobsLost, id)
+		}
+	}
+
+	// A lease past its expiry is released, but its device is quarantined
+	// rather than freed: expiry tells us the holder stopped renewing, not
+	// that the hardware is idle. Strictly less-than: a lease at exactly its
+	// TTL boundary has not yet gone unrenewed, only reached the instant it
+	// must be renewed by.
+	expRows, err := tx.Query(
+		`SELECT job_id, device_id FROM leases
+		 WHERE released_at IS NULL AND expires_at < ?`, now.Unix())
+	if err != nil {
+		return res, err
+	}
+	type expired struct{ jobID, deviceID string }
+	var stale []expired
+	for expRows.Next() {
+		var e expired
+		if err := expRows.Scan(&e.jobID, &e.deviceID); err != nil {
+			expRows.Close()
+			return res, err
+		}
+		stale = append(stale, e)
+	}
+	expRows.Close()
+	if err := expRows.Err(); err != nil {
+		return res, err
+	}
+
+	for _, e := range stale {
+		if _, err := tx.Exec(
+			`UPDATE leases SET released_at = ? WHERE job_id = ? AND released_at IS NULL`,
+			now.Unix(), e.jobID); err != nil {
+			return res, err
+		}
+		if _, err := tx.Exec(
+			`UPDATE devices SET state = ? WHERE id = ?`,
+			string(model.DeviceUnhealthy), e.deviceID); err != nil {
+			return res, err
+		}
+		if e.jobID != "" {
+			if _, err := tx.Exec(
+				`UPDATE jobs SET state = ?, kill_reason = ?, finished_at = ?
+				 WHERE id = ? AND state IN (?, ?)`,
+				string(model.JobLost), "lease expired", now.Unix(), e.jobID,
+				string(model.JobAssigned), string(model.JobRunning)); err != nil {
+				return res, err
+			}
+			res.LeasesExpired = append(res.LeasesExpired, e.jobID)
 		}
 	}
 

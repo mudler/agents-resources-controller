@@ -6,6 +6,7 @@ package store
 import (
 	"database/sql"
 	_ "embed"
+	"errors"
 	"fmt"
 	"time"
 
@@ -64,10 +65,25 @@ func (s *Store) UpsertWorker(w model.Worker, devices []model.Device) error {
 	}
 	defer tx.Rollback()
 
+	var priorBootID string
+	err = tx.QueryRow(`SELECT boot_id FROM workers WHERE id = ?`, w.ID).Scan(&priorBootID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("read prior boot id: %w", err)
+	}
+
+	// A changed boot ID is proof the machine rebooted, so nothing from before
+	// can still be holding a device. An unchanged or missing ID proves
+	// nothing, and an orphaned process may still pin VRAM.
+	rebooted := priorBootID != "" && w.BootID != "" && priorBootID != w.BootID
+	reason := "worker re-registered"
+	if rebooted {
+		reason = "host rebooted"
+	}
+
 	if _, err := tx.Exec(
-		`INSERT INTO workers (id, host, last_heartbeat_at) VALUES (?, ?, ?)
-		 ON CONFLICT(id) DO UPDATE SET host = excluded.host, last_heartbeat_at = excluded.last_heartbeat_at`,
-		w.ID, w.Host, w.LastHeartbeatAt.Unix(),
+		`INSERT INTO workers (id, host, boot_id, last_heartbeat_at) VALUES (?, ?, ?, ?)
+		 ON CONFLICT(id) DO UPDATE SET host = excluded.host, boot_id = excluded.boot_id, last_heartbeat_at = excluded.last_heartbeat_at`,
+		w.ID, w.Host, w.BootID, w.LastHeartbeatAt.Unix(),
 	); err != nil {
 		return fmt.Errorf("upsert worker: %w", err)
 	}
@@ -77,7 +93,7 @@ func (s *Store) UpsertWorker(w model.Worker, devices []model.Device) error {
 	// declares that device (a dropped or renamed entry in worker.yaml) — the
 	// upsert loop below must not be the only thing standing between a
 	// stranded job and a device that goes back to ready.
-	if err := s.reapInFlightJobsLocked(tx, w.ID, w.LastHeartbeatAt, "worker re-registered"); err != nil {
+	if err := s.reapInFlightJobsLocked(tx, w.ID, w.LastHeartbeatAt, reason, rebooted); err != nil {
 		return fmt.Errorf("reap in-flight jobs for %s: %w", w.ID, err)
 	}
 
@@ -110,11 +126,14 @@ func (s *Store) UpsertWorker(w model.Worker, devices []model.Device) error {
 }
 
 // reapInFlightJobsLocked marks every job this worker still has in "assigned"
-// or "running" state as lost, releases its lease, and quarantines the
-// device it occupied as unhealthy — all within the caller's transaction.
-// Nothing here ever sets a device to ready: silence (or, here, an
-// unannounced restart) is never proof a device is free.
-func (s *Store) reapInFlightJobsLocked(tx *sql.Tx, workerID string, at time.Time, reason string) error {
+// or "running" state as lost, releases its lease, and updates the device it
+// occupied — all within the caller's transaction. Normally that means
+// quarantining the device as unhealthy: silence (or an unannounced restart
+// with the same boot ID) is never proof a device is free. The one exception
+// is rebooted, set when the caller has proof — a changed boot ID — that the
+// machine restarted and nothing from before can still be running; only then
+// does the device go back to ready instead.
+func (s *Store) reapInFlightJobsLocked(tx *sql.Tx, workerID string, at time.Time, reason string, rebooted bool) error {
 	rows, err := tx.Query(
 		`SELECT id, device_id FROM jobs WHERE worker_id = ? AND state IN (?, ?)`,
 		workerID, string(model.JobAssigned), string(model.JobRunning))
@@ -136,6 +155,11 @@ func (s *Store) reapInFlightJobsLocked(tx *sql.Tx, workerID string, at time.Time
 		return err
 	}
 
+	quarantineState := model.DeviceUnhealthy
+	if rebooted {
+		quarantineState = model.DeviceReady
+	}
+
 	for _, j := range jobs {
 		if _, err := tx.Exec(
 			`UPDATE jobs SET state = ?, kill_reason = ?, finished_at = ? WHERE id = ?`,
@@ -151,7 +175,7 @@ func (s *Store) reapInFlightJobsLocked(tx *sql.Tx, workerID string, at time.Time
 		}
 		if _, err := tx.Exec(
 			`UPDATE devices SET state = ? WHERE id = ?`,
-			string(model.DeviceUnhealthy), j.deviceID,
+			string(quarantineState), j.deviceID,
 		); err != nil {
 			return fmt.Errorf("quarantine device %s: %w", j.deviceID, err)
 		}
