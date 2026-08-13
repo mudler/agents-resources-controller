@@ -202,6 +202,52 @@ func TestWorkerCannotReportStatusForAnotherWorkersJob(t *testing.T) {
 	require.False(t, got.State.Terminal())
 }
 
+// TestAssignmentIsHandedOutOnlyOnce guards against a worker's poll loop
+// re-running a job: handing out an assignment must be a state transition
+// (assigned -> running), not just a query, or the same job stays "assigned"
+// and gets returned — and re-executed — on every subsequent poll until the
+// worker's own "running" report happens to land.
+func TestAssignmentIsHandedOutOnlyOnce(t *testing.T) {
+	ts, st, _, _ := newServer(t)
+	workerID := registerWorker(t, ts)
+
+	job, err := st.Allocate(store.AllocateRequest{
+		DeviceID: "gpubox:gpu0", Command: []string{"true"}, Submitter: "agent-a", LeaseTTL: time.Minute,
+	})
+	require.NoError(t, err)
+
+	poll := func() []server.Assignment {
+		req, err := http.NewRequest(http.MethodGet,
+			ts.URL+"/v1/workers/"+workerID+"/assignments?wait=50ms", nil)
+		require.NoError(t, err)
+		req.Header.Set("Authorization", "Bearer wtok")
+		resp, err := ts.Client().Do(req)
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		if resp.StatusCode == http.StatusNoContent {
+			return nil
+		}
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		var out []server.Assignment
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&out))
+		return out
+	}
+
+	first := poll()
+	require.Len(t, first, 1)
+	require.Equal(t, job.ID, first[0].JobID)
+
+	// The job must not still be "assigned" after being handed out once: a
+	// second poll, arriving before any status report from the worker, must
+	// not see it again.
+	second := poll()
+	require.Empty(t, second, "a job must not be handed out twice before the worker has reported anything")
+
+	got, err := st.Job(job.ID)
+	require.NoError(t, err)
+	require.Equal(t, model.JobRunning, got.State)
+}
+
 func TestJobStatusForUnknownJobReturns404(t *testing.T) {
 	ts, _, _, _ := newServer(t)
 

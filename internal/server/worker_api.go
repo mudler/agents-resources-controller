@@ -104,8 +104,29 @@ func (s *Server) handleAssignments(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if len(jobs) > 0 {
+			// Handing out an assignment is a state transition, not just a
+			// query: mark each job running immediately, before it is ever
+			// written to the response. Otherwise the job stays "assigned"
+			// until the worker's own "running" report happens to land, and a
+			// second poll landing in that window (or a retried poll after a
+			// dropped response) sees it as "assigned" again and hands it out
+			// — and therefore starts it — a second time.
+			//
+			// This makes started_at mark handout rather than the moment the
+			// worker actually spawns the process, which is a deliberate,
+			// documented shift: if the worker dies between handout and spawn,
+			// the job simply sits in "running" until the reaper marks it
+			// lost, which is the correct outcome since nobody actually knows
+			// whether it started. The worker's own "running" report becomes a
+			// harmless no-op — MarkRunning only transitions assigned->running,
+			// so calling it again once already running affects no rows.
+			now := s.cfg.Clock.Now()
 			out := make([]Assignment, 0, len(jobs))
 			for _, j := range jobs {
+				if err := s.cfg.Store.MarkRunning(j.ID, now); err != nil {
+					writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
+					return
+				}
 				out = append(out, Assignment{
 					JobID: j.ID, DeviceID: j.DeviceID, Command: j.Command, Cwd: j.Cwd, Env: j.Env,
 				})
