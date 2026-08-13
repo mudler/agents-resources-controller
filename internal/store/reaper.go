@@ -37,6 +37,12 @@ func (s *Store) Sweep(grace, unhealthyAfter time.Duration) (SweepResult, error) 
 		state model.DeviceState
 	}
 	var pending []demotion
+	// reap holds every device past unhealthyAfter, regardless of whether its
+	// state actually transitions this sweep. A device that was already
+	// unhealthy (e.g. a worker self-reported a fault via SetDeviceState while
+	// its worker later went silent too) must still have its in-flight job
+	// reaped, or the job and lease are stranded forever.
+	var reap []string
 
 	for rows.Next() {
 		var id string
@@ -48,10 +54,13 @@ func (s *Store) Sweep(grace, unhealthyAfter time.Duration) (SweepResult, error) 
 		}
 		silence := now.Sub(time.Unix(hb, 0).UTC())
 		switch {
-		case silence >= unhealthyAfter && state != model.DeviceUnhealthy:
-			pending = append(pending, demotion{id, model.DeviceUnhealthy})
-			res.DevicesUnhealthy = append(res.DevicesUnhealthy, id)
-		case silence >= grace && silence < unhealthyAfter &&
+		case silence >= unhealthyAfter:
+			reap = append(reap, id)
+			if state != model.DeviceUnhealthy {
+				pending = append(pending, demotion{id, model.DeviceUnhealthy})
+				res.DevicesUnhealthy = append(res.DevicesUnhealthy, id)
+			}
+		case silence >= grace &&
 			(state == model.DeviceReady || state == model.DeviceBusy):
 			pending = append(pending, demotion{id, model.DeviceUnknown})
 			res.DevicesUnknown = append(res.DevicesUnknown, id)
@@ -66,14 +75,19 @@ func (s *Store) Sweep(grace, unhealthyAfter time.Duration) (SweepResult, error) 
 		if _, err := tx.Exec(`UPDATE devices SET state = ? WHERE id = ?`, string(d.state), d.id); err != nil {
 			return res, fmt.Errorf("demote %s: %w", d.id, err)
 		}
-		if d.state != model.DeviceUnhealthy {
-			continue
-		}
+	}
+
+	for _, deviceID := range reap {
 		// The worker is gone for good: its in-flight jobs are lost and their
-		// leases must be released, or the device is stuck forever.
+		// leases must be released, or the device is stuck forever. This runs
+		// for every device past unhealthyAfter, not just ones that just
+		// transitioned, so an already-unhealthy device with a still-live job
+		// (e.g. one demoted earlier by SetDeviceState) still gets reaped. It
+		// is idempotent: once a job is no longer assigned/running, the query
+		// below finds nothing and reports it lost only once.
 		jobRows, err := tx.Query(
 			`SELECT id FROM jobs WHERE device_id = ? AND state IN (?, ?)`,
-			d.id, string(model.JobAssigned), string(model.JobRunning))
+			deviceID, string(model.JobAssigned), string(model.JobRunning))
 		if err != nil {
 			return res, err
 		}
@@ -150,9 +164,12 @@ func (s *Store) RecordHeartbeat(workerID string, at time.Time) error {
 }
 
 // ClearDevice is the explicit operator acknowledgement that a device is free.
+// It must not be able to contradict the lease table: a device with a live
+// lease stays unhealthy no matter what the operator asserts.
 func (s *Store) ClearDevice(id string) error {
 	_, err := s.db.Exec(
-		`UPDATE devices SET state = ? WHERE id = ? AND state = ?`,
+		`UPDATE devices SET state = ? WHERE id = ? AND state = ?
+		   AND id NOT IN (SELECT device_id FROM leases WHERE released_at IS NULL)`,
 		string(model.DeviceReady), id, string(model.DeviceUnhealthy))
 	return err
 }

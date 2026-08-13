@@ -110,3 +110,45 @@ func TestClearDeviceMakesUnhealthyDeviceSchedulableAgain(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "gpubox:gpu0", job.DeviceID)
 }
+
+// ClearDevice is an operator's assertion that nothing is on the device. It
+// must not be able to contradict the lease table.
+func TestClearDeviceRefusesWhileLeaseIsLive(t *testing.T) {
+	s, _ := newStore(t)
+
+	_, err := s.Allocate(req("agent-a"))
+	require.NoError(t, err)
+	require.NoError(t, s.SetDeviceState("gpubox:gpu0", model.DeviceUnhealthy, time.Now()))
+
+	require.NoError(t, s.ClearDevice("gpubox:gpu0"))
+
+	devices, err := s.Devices()
+	require.NoError(t, err)
+	require.Equal(t, model.DeviceUnhealthy, devices[0].State)
+
+	_, err = s.Allocate(req("agent-b"))
+	require.ErrorIs(t, err, store.ErrNoDevice)
+}
+
+// A device that was already unhealthy when its worker went silent past
+// unhealthyAfter must still have its in-flight job reaped: it must not be
+// stranded non-terminal with a lease that never releases.
+func TestSweepReapsJobsOnAlreadyUnhealthyDevice(t *testing.T) {
+	s, c := newStore(t)
+
+	job, err := s.Allocate(req("agent-a"))
+	require.NoError(t, err)
+	require.NoError(t, s.SetDeviceState("gpubox:gpu0", model.DeviceUnhealthy, c.Now()))
+
+	c.Advance(10 * time.Minute)
+	_, err = s.Sweep(30*time.Second, 5*time.Minute)
+	require.NoError(t, err)
+
+	reloaded, err := s.Job(job.ID)
+	require.NoError(t, err)
+	require.Equal(t, model.JobLost, reloaded.State)
+
+	leases, err := s.Leases()
+	require.NoError(t, err)
+	require.Empty(t, leases)
+}
