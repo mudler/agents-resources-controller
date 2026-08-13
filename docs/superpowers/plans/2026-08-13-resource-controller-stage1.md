@@ -939,6 +939,37 @@ func TestHeartbeatRestoresUnknownDeviceToReady(t *testing.T) {
 	require.Equal(t, model.DeviceReady, devices[0].State)
 }
 
+// A device demoted to unknown while it was BUSY must come back as busy, not
+// ready: the job is still running on it. Returning it to the pool would hand
+// an occupied GPU to the next claimant.
+func TestHeartbeatRestoresLeasedDeviceToBusyNotReady(t *testing.T) {
+	s, c := newStore(t)
+
+	job, err := s.Allocate(req("agent-a"))
+	require.NoError(t, err)
+
+	c.Advance(45 * time.Second)
+	_, err = s.Sweep(30*time.Second, 5*time.Minute)
+	require.NoError(t, err)
+
+	require.NoError(t, s.RecordHeartbeat("w1", c.Now()))
+
+	devices, err := s.Devices()
+	require.NoError(t, err)
+	require.Equal(t, model.DeviceBusy, devices[0].State)
+
+	// And it must not be claimable while that lease is live.
+	_, err = s.Allocate(req("agent-b"))
+	require.ErrorIs(t, err, store.ErrNoDevice)
+
+	// Releasing the original job still returns it to the pool normally.
+	code := 0
+	require.NoError(t, s.Release(job.ID, model.JobSucceeded, &code, ""))
+	devices, err = s.Devices()
+	require.NoError(t, err)
+	require.Equal(t, model.DeviceReady, devices[0].State)
+}
+
 // A device whose worker never came back is NOT returned to the pool: we cannot
 // prove nothing is still occupying it.
 func TestSweepMarksLostWorkerDevicesUnhealthyNotReady(t *testing.T) {
@@ -1110,8 +1141,11 @@ func (s *Store) Sweep(grace, unhealthyAfter time.Duration) (SweepResult, error) 
 	return res, nil
 }
 
-// RecordHeartbeat refreshes a worker and promotes its unknown devices back to
-// ready. Devices marked unhealthy stay out until explicitly cleared.
+// RecordHeartbeat refreshes a worker and restores its unknown devices. A
+// device whose lease is still live returns to busy, NOT to ready: the job it
+// was demoted with is still running on it. Promoting a leased device to ready
+// would offer an occupied GPU to the next claimant. Devices marked unhealthy
+// stay out until explicitly cleared.
 func (s *Store) RecordHeartbeat(workerID string, at time.Time) error {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -1125,7 +1159,15 @@ func (s *Store) RecordHeartbeat(workerID string, at time.Time) error {
 	}
 	if _, err := tx.Exec(
 		`UPDATE devices SET state = ?, last_heartbeat_at = ?
-		 WHERE worker_id = ? AND state = ?`,
+		 WHERE worker_id = ? AND state = ?
+		   AND id IN (SELECT device_id FROM leases WHERE released_at IS NULL)`,
+		string(model.DeviceBusy), at.Unix(), workerID, string(model.DeviceUnknown)); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(
+		`UPDATE devices SET state = ?, last_heartbeat_at = ?
+		 WHERE worker_id = ? AND state = ?
+		   AND id NOT IN (SELECT device_id FROM leases WHERE released_at IS NULL)`,
 		string(model.DeviceReady), at.Unix(), workerID, string(model.DeviceUnknown)); err != nil {
 		return err
 	}
