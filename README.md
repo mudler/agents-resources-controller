@@ -69,10 +69,17 @@ commands on your GPU hosts is not something to fall back to silently.
 
 State lives in the `rc-data` volume (`/var/lib/rc` inside the container).
 
-The published port is bound to `127.0.0.1` on purpose. Workers and clients
-on other machines need to reach it, so put it behind a tunnel (Cloudflare,
-Tailscale, a VPN) or a private network rather than widening the binding —
-the tokens are bearer credentials with no transport security of their own.
+The port is published on `0.0.0.0`, because workers and clients live on
+other machines and have to reach it.
+
+That makes `RC_TOKENS` the only thing between your network and a service
+that runs commands on your GPU hosts. Two consequences worth taking
+seriously: use generated tokens (`openssl rand -hex 24`), never the values
+in `.env.example`; and put the controller behind a tunnel (Cloudflare,
+Tailscale), a VPN, or a private network, because bearer tokens cross the
+wire in the clear and stage 1 terminates no TLS of its own. On a machine
+with a public interface, bind it back to a private address or a loopback
+plus tunnel instead.
 
 **Only the controller belongs in Docker.** A worker must see and signal the
 process group that touches the hardware, so it runs on the device host

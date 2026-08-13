@@ -21,9 +21,12 @@ services:
       # on your GPU hosts is not something to fall back to silently.
       RC_TOKENS: ${RC_TOKENS:?set RC_TOKENS in .env, e.g. wtok:worker,ctok:client,atok:admin}
     ports:
-      # Bound to loopback by default. Publish it wider only behind a tunnel
-      # or a private network — see the README's security note.
-      - "127.0.0.1:8080:8080"
+      # Reachable from other machines: workers and clients live elsewhere.
+      # RC_TOKENS is the ONLY thing standing between the network and a
+      # service that runs commands on your GPU hosts, and bearer tokens
+      # cross the wire in the clear — put this behind a tunnel, a VPN, or a
+      # private network, and use real generated tokens, never the examples.
+      - "0.0.0.0:8080:8080"
     volumes:
       - rc-data:/var/lib/rc
     healthcheck:
