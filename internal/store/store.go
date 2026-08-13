@@ -35,6 +35,10 @@ func Open(path string, c clock.Clock) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("apply schema: %w", err)
 	}
+	if err := migrate(db); err != nil {
+		db.Close()
+		return nil, err
+	}
 	return &Store{db: db, clock: c}, nil
 }
 
