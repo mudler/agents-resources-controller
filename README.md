@@ -1,0 +1,150 @@
+# resource-controller
+
+Exclusive leases for shared hardware, across hosts, with the state visible.
+
+Replaces a `flock` file mutex: a central controller owns allocation in a
+single SQLite transaction, workers on device hosts supervise the jobs, and
+`rc ps` / `rc devices` show who holds what.
+
+## Stage 1 scope
+
+Exclusive device leases, supervised job execution, live log streaming, and
+fleet visibility. **There is no queue yet** — a busy device is refused
+immediately with `no_device_available`. There is also no `rc kill`, no
+`rc attach`, no device selectors, and no web dashboard; those are later
+stages.
+
+## Controller
+
+```sh
+export RC_TOKENS='wtok:worker,ctok:client,atok:admin'
+rc serve --addr :8080 --data /var/lib/rc
+```
+
+`RC_TOKENS` is a comma-separated list of `token:role` pairs, roles are
+`worker`, `client`, or `admin`. It is validated at startup: a malformed
+entry, an unknown role, an empty token, or the same token listed twice (even
+with different roles) is rejected before the controller binds a socket —
+for example:
+
+```
+$ RC_TOKENS='wtok:worker,wtok:client' rc serve --addr :8080 --data /var/lib/rc
+rc: duplicate token "wtok" in RC_TOKENS
+```
+
+`--data` holds the SQLite database and the append-only per-job log files;
+back that directory up if you care about job history.
+
+## Device host
+
+Write `/etc/rc/worker.yaml` (see `examples/worker.yaml`):
+
+```yaml
+controller_url: https://rc.internal.example
+token: replace-with-worker-token
+# host defaults to the machine's hostname; device IDs become <host>:<name>
+devices:
+  - gpu0
+  - gpu1
+heartbeat_interval: 10s
+poll_wait: 30s
+```
+
+Then:
+
+```sh
+rc worker
+# or: rc worker --config /path/to/worker.yaml
+```
+
+The worker registers its host and devices, long-polls the controller for
+assignments, spawns each job in its own process group, and streams the
+job's combined stdout/stderr back as it runs. On shutdown (SIGINT/SIGTERM)
+it stops taking new work but waits for jobs already running here to finish
+and report before exiting — a routine restart of the worker process does
+not abandon a job on the device.
+
+## Client
+
+```sh
+export RC_CONTROLLER=https://rc.internal.example
+export RC_TOKEN=ctok
+
+rc devices                              # who holds what, and what has gone quiet
+rc ps                                   # running/assigned jobs
+rc run -d gpubox:gpu0 --cwd /src -- ./bench --args
+```
+
+`rc run` claims the device, blocks, streams the job's combined stdout/stderr
+to your terminal, and exits with the job's own exit code — so it drops into
+scripts wherever `flock /tmp/gpu -c '...'` used to sit:
+
+```
+$ rc run -d gpubox:gpu0 -- sh -c 'echo hello; exit 3'
+rc: job ad3cd51f-3593-4a8b-9cf1-61ccbb803464 on gpubox:gpu0
+hello
+$ echo $?
+3
+```
+
+If the device is already held, `rc run` fails immediately — stage 1 has no
+queue:
+
+```
+$ rc run -d gpubox:gpu0 -- true
+rc: gpubox:gpu0 is busy (stage 1 has no queue — retry or pick another device)
+```
+
+**Ctrl-C detaches, it does not cancel the job.** The worker owns the process
+and its lease, not the client that submitted it, so losing the terminal (or
+pressing Ctrl-C on purpose) must never free a GPU that a process is still
+using. The job keeps running and keeps holding the device; `rc run` prints
+where things stand and exits with status 130:
+
+```
+$ rc run -d gpubox:gpu0 -- sh -c 'sleep 15'
+rc: job bfbf7d29-9306-41da-9a9f-413026b7361e on gpubox:gpu0
+^C
+rc: detached from job bfbf7d29-9306-41da-9a9f-413026b7361e — it is STILL RUNNING on gpubox:gpu0 and holds it until it finishes. Watch it with: rc ps
+```
+
+Server-side cancellation (`rc kill`) does not exist yet — it is a later
+stage. Until then, the only ways a device comes back are the job finishing
+on its own or the worker being stopped/killed directly on the device host.
+
+`rc devices` shows the fleet, including devices whose worker has gone quiet:
+
+```
+$ rc devices
+DEVICE       STATE  HOLDER                    ELAPSED  COMMAND
+gpubox:gpu0  busy   mudler@mudler-ubuntu-box  15s      sh -c sleep 15
+```
+
+`rc ps` shows the same information job-first, for the currently
+assigned/running jobs:
+
+```
+$ rc ps
+JOB                                   DEVICE       STATE    SUBMITTER                 COMMAND
+25147ef7-7bf4-40b9-9034-31e294e5be1a  gpubox:gpu0  running  mudler@mudler-ubuntu-box  sh -c sleep 30
+```
+
+## Guarantees
+
+- One live lease per device, enforced by a unique index in SQLite plus a
+  single allocation transaction — not by convention and not by a file in
+  `/tmp`. A second `rc run`/submit against a held device is refused with
+  `no_device_available` at allocation time, before any job is created.
+- A disconnected client does not release the device: the worker owns the
+  process and reports its outcome directly to the controller.
+- A worker that stops reporting has its devices marked `unknown` after 30s
+  without a heartbeat, then `unhealthy` after 5 minutes. Neither
+  transition ever puts the device back in the pool — silence is never
+  treated as proof a device is free. A worker that starts heartbeating
+  again restores its `unknown` devices on its own (to `busy` if their lease
+  is still live, to `ready` otherwise); a device that reached `unhealthy`
+  stays out until an admin token clears it explicitly:
+  `POST /v1/devices/{id}/clear` (only takes effect while the device has no
+  live lease).
+- Jobs run in their own process group, so a kill takes the whole tree with
+  it, including grandchildren that detached from the job's own stdio.
