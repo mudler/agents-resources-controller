@@ -1,6 +1,7 @@
 package server
 
 import (
+	"database/sql"
 	"errors"
 	"fmt"
 	"net/http"
@@ -47,6 +48,12 @@ func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "bad_request", "device_id required (selectors arrive in stage 2)")
 		return
 	}
+	if req.Submitter == "" {
+		// A blank holder on a busy device defeats the entire point of this
+		// system: answering "who has gpu0 right now".
+		writeErr(w, http.StatusBadRequest, "bad_request", "submitter required")
+		return
+	}
 
 	ttl := time.Duration(req.LeaseTTLSeconds) * time.Second
 	job, err := s.cfg.Store.Allocate(store.AllocateRequest{
@@ -71,10 +78,25 @@ func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {
 	job, err := s.cfg.Store.Job(r.PathValue("id"))
 	if err != nil {
-		writeErr(w, http.StatusNotFound, "not_found", err.Error())
+		writeJobLookupError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, job)
+}
+
+// writeJobLookupError maps a Store.Job error to the right client-facing
+// status. A missing job is 404 with a stable message; anything else (a
+// closed database, a driver error) must NOT also become 404 — a live job
+// reported as "not found" during an infrastructure failure would make a
+// client conclude the job vanished and resubmit onto a device that is
+// actually still busy. Anything other than sql.ErrNoRows is a 500 with a
+// generic message; the raw driver error never reaches the client.
+func writeJobLookupError(w http.ResponseWriter, err error) {
+	if errors.Is(err, sql.ErrNoRows) {
+		writeErr(w, http.StatusNotFound, "not_found", "job not found")
+		return
+	}
+	writeErr(w, http.StatusInternalServerError, "store_error", "failed to look up job")
 }
 
 func (s *Server) handleDevices(w http.ResponseWriter, r *http.Request) {
@@ -145,8 +167,16 @@ func (s *Server) deviceViews() ([]DeviceView, error) {
 }
 
 func (s *Server) handleClearDevice(w http.ResponseWriter, r *http.Request) {
-	if err := s.cfg.Store.ClearDevice(r.PathValue("id")); err != nil {
-		writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
+	cleared, err := s.cfg.Store.ClearDevice(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "store_error", "failed to clear device")
+		return
+	}
+	if !cleared {
+		// ClearDevice refuses to contradict the lease table. Answering 200
+		// here would tell the operator the opposite of what happened on the
+		// one manual override that exists for a stuck GPU.
+		writeErr(w, http.StatusConflict, "device_not_cleared", "device has a live lease and was not cleared")
 		return
 	}
 	w.WriteHeader(http.StatusOK)
@@ -160,6 +190,15 @@ func (s *Server) handleStreamLogs(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeErr(w, http.StatusInternalServerError, "unsupported", "streaming unsupported")
+		return
+	}
+
+	// The job must exist before anything is started: Follow would otherwise
+	// O_CREATE a log file for an unknown ID and the watcher below would spin
+	// forever since Job() never succeeds, leaking a goroutine and an fd per
+	// request to any client token.
+	if _, err := s.cfg.Store.Job(jobID); err != nil {
+		writeJobLookupError(w, err)
 		return
 	}
 
@@ -192,6 +231,11 @@ func (s *Server) handleStreamLogs(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.WriteHeader(http.StatusOK)
+	// Flush the status line and headers immediately: WriteHeader only
+	// buffers them. Without this a client blocks with no response at all
+	// until the first log chunk arrives, which may be never for a job that
+	// has not produced output yet.
+	flusher.Flush()
 
 	for chunk := range chunks {
 		if _, err := w.Write(chunk); err != nil {

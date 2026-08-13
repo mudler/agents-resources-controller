@@ -165,11 +165,20 @@ func (s *Store) RecordHeartbeat(workerID string, at time.Time) error {
 
 // ClearDevice is the explicit operator acknowledgement that a device is free.
 // It must not be able to contradict the lease table: a device with a live
-// lease stays unhealthy no matter what the operator asserts.
-func (s *Store) ClearDevice(id string) error {
-	_, err := s.db.Exec(
+// lease stays unhealthy no matter what the operator asserts. The bool return
+// tells the caller whether the device was actually cleared, so a live-lease
+// refusal is never reported as success.
+func (s *Store) ClearDevice(id string) (bool, error) {
+	res, err := s.db.Exec(
 		`UPDATE devices SET state = ? WHERE id = ? AND state = ?
 		   AND id NOT IN (SELECT device_id FROM leases WHERE released_at IS NULL)`,
 		string(model.DeviceReady), id, string(model.DeviceUnhealthy))
-	return err
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
