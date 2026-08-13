@@ -125,9 +125,13 @@ func (s *Server) handleAssignments(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAppendLogs(w http.ResponseWriter, r *http.Request) {
-	chunk, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	chunk, err := io.ReadAll(io.LimitReader(r.Body, maxLogChunk+1))
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	if len(chunk) > maxLogChunk {
+		writeErr(w, http.StatusRequestEntityTooLarge, "chunk_too_large", "log chunk exceeds 1MB; split and retry")
 		return
 	}
 	if err := s.cfg.Logs.Append(r.PathValue("id"), chunk); err != nil {
@@ -143,6 +147,24 @@ func (s *Server) handleJobStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jobID := r.PathValue("id")
+
+	job, err := s.cfg.Store.Job(jobID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeErr(w, http.StatusNotFound, "not_found", "job not found")
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
+		return
+	}
+	// A job belongs to the worker it was assigned to. Without this check any
+	// holder of a worker token could report status for someone else's job and
+	// have Release() hand its device to a second job while the first is still
+	// running on it — exactly the race this system exists to prevent.
+	if req.WorkerID == "" || req.WorkerID != job.WorkerID {
+		writeErr(w, http.StatusForbidden, "not_job_owner", "job is not assigned to this worker")
+		return
+	}
 
 	if req.State == model.JobRunning {
 		if err := s.cfg.Store.MarkRunning(jobID, s.cfg.Clock.Now()); err != nil {
