@@ -15,6 +15,13 @@ import (
 // queue, so the caller is told immediately rather than parked.
 var ErrNoDevice = errors.New("no device available")
 
+// errJobNoLongerQueued means the job assignQueued was asked to assign is no
+// longer in state queued (e.g. cancelled between the scheduling pass reading
+// its snapshot and reaching this job). It is distinct from ErrNoDevice: the
+// device may well be free, and the caller must not reserve it for a job that
+// no longer exists, nor let it block whoever is behind it in the queue.
+var errJobNoLongerQueued = errors.New("job no longer queued")
+
 const (
 	defaultLeaseTTL       = 5 * time.Minute
 	leaseGraceOverRuntime = 10 * time.Minute
@@ -233,7 +240,10 @@ func (s *Store) Job(id string) (*model.Job, error) {
 
 // assignQueued moves a queued job onto its device in ONE transaction:
 // device ready -> busy, job queued -> assigned, lease inserted. Returns
-// ErrNoDevice when the device is not free, leaving the job queued.
+// ErrNoDevice when the device is not free, leaving the job queued so it
+// blocks whoever is behind it — and errJobNoLongerQueued when the job itself
+// has moved on (e.g. cancelled) between the caller's snapshot and now, which
+// must not block anyone since there is no job left to reserve the device for.
 func (s *Store) assignQueued(jobID, deviceID string) (*model.Job, error) {
 	now := s.clock.Now()
 
@@ -260,7 +270,7 @@ func (s *Store) assignQueued(jobID, deviceID string) (*model.Job, error) {
 		`SELECT submitter, max_runtime FROM jobs WHERE id = ? AND state = ?`,
 		jobID, string(model.JobQueued)).Scan(&submitter, &ttl); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, ErrNoDevice // no longer queued; nothing to do
+			return nil, errJobNoLongerQueued
 		}
 		return nil, err
 	}

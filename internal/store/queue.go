@@ -29,11 +29,23 @@ type EnqueueRequest struct {
 }
 
 // SetDeviceMaxRuntime records the ceiling a host declares for one of its
-// devices. Called during registration.
+// devices. Called during registration. The column is seconds by design, so a
+// sub-second duration truncates — that's intentional, not a bug: runtime
+// ceilings are not meant to be enforced to sub-second precision.
 func (s *Store) SetDeviceMaxRuntime(deviceID string, d time.Duration) error {
-	_, err := s.db.Exec(`UPDATE devices SET max_runtime = ? WHERE id = ?`,
+	res, err := s.db.Exec(`UPDATE devices SET max_runtime = ? WHERE id = ?`,
 		int64(d.Seconds()), deviceID)
-	return err
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf("unknown device %q", deviceID)
+	}
+	return nil
 }
 
 // Enqueue records a job in state queued. It never assigns: ScheduleOnce does
@@ -139,10 +151,10 @@ func (s *Store) ScheduleOnce() ([]model.Job, error) {
 	}
 
 	var assigned []model.Job
-	reserved := map[string]string{} // device -> job that holds the reservation
+	reserved := map[string]bool{} // device -> a queued job ahead of us holds it
 
 	for _, job := range queued {
-		if holder, taken := reserved[job.DeviceID]; taken && holder != job.ID {
+		if reserved[job.DeviceID] {
 			continue // someone ahead of us is waiting for this device
 		}
 
@@ -152,10 +164,16 @@ func (s *Store) ScheduleOnce() ([]model.Job, error) {
 			assigned = append(assigned, *out)
 		case errors.Is(err, ErrNoDevice):
 			// Not free: hold it for this job so later jobs cannot jump ahead.
-			reserved[job.DeviceID] = job.ID
+			reserved[job.DeviceID] = true
 			if err := s.reserve(job.ID, job.DeviceID); err != nil {
 				return nil, err
 			}
+		case errors.Is(err, errJobNoLongerQueued):
+			// This job vanished (e.g. cancelled) between QueuedJobs and here.
+			// There is no job left to reserve the device for, so skip it
+			// entirely: reserve nothing, and let whoever is behind it in the
+			// queue — for the same device or otherwise — proceed this pass
+			// rather than idle a free device until the next tick.
 		default:
 			return nil, err
 		}
