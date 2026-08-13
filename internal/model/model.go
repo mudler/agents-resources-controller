@@ -63,7 +63,7 @@ type Job struct {
 	Priority           int               `json:"priority"`
 	MaxRuntimeSeconds  int               `json:"max_runtime_seconds,omitempty"`
 	IdleTimeoutSeconds int               `json:"idle_timeout_seconds,omitempty"`
-	QueuedAt           time.Time         `json:"queued_at,omitempty"`
+	QueuedAt           *time.Time        `json:"queued_at,omitempty"`
 	State              JobState          `json:"state"`
 	DeviceID           string            `json:"device_id"`
 	WorkerID           string            `json:"worker_id"`
