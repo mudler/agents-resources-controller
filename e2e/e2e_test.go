@@ -7,7 +7,10 @@
 package e2e_test
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"testing"
@@ -142,6 +145,119 @@ func TestEndToEndClaimRunRelease(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("worker did not shut down within 10s of context cancellation")
 	}
+}
+
+// TestWorkerRestartQuarantinesDeviceInsteadOfFalselyReady reproduces the
+// critical review finding live: a worker crashes mid-job — nothing SIGTERMs
+// the child, nothing reports a terminal state, the process just vanishes —
+// and a fresh process registers under the same host-derived worker ID while
+// the controller still believes the job is running. Registration must
+// reconcile that stranded job rather than falsify the device as ready (an
+// orphaned process from the dead worker may still be pinning the GPU) or
+// leave it busy forever with nothing left to ever release it.
+func TestWorkerRestartQuarantinesDeviceInsteadOfFalselyReady(t *testing.T) {
+	dir := t.TempDir()
+	c := clock.Real()
+
+	st, err := store.Open(filepath.Join(dir, "rc.db"), c)
+	require.NoError(t, err)
+	defer st.Close()
+
+	logs, err := logstore.New(filepath.Join(dir, "logs"))
+	require.NoError(t, err)
+
+	srv := server.New(server.Config{
+		Store: st, Logs: logs, Clock: c,
+		Tokens: map[string]string{"wtok": "worker", "ctok": "client"},
+	})
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	// wk's own context intentionally outlives this test's assertions and is
+	// only cancelled at the very end: an orderly cancellation would make wk
+	// SIGTERM its local job and report a terminal state, which is exactly
+	// the well-behaved shutdown this test is NOT trying to exercise. A real
+	// crash reports nothing and cleans up nothing, which is why the
+	// mid-flight registration below must not be able to trust the device.
+	wkCtx, cancelWk := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancelWk()
+
+	wk := worker.New(worker.Config{
+		ControllerURL: ts.URL, Token: "wtok", Host: "restartbox", Devices: []string{"dev0"},
+		HeartbeatInterval: time.Second, PollWait: time.Second,
+	})
+	go func() { _ = wk.Start(wkCtx) }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	cl := client.New(ts.URL, "ctok")
+
+	require.Eventually(t, func() bool {
+		state, err := cl.State(ctx)
+		return err == nil && len(state.Devices) == 1
+	}, 15*time.Second, 100*time.Millisecond, "worker never registered its device")
+
+	job, err := cl.Submit(ctx, client.SubmitOptions{
+		DeviceID:  "restartbox:dev0",
+		Command:   []string{"sleep", "30"},
+		Submitter: "agent-a",
+	})
+	require.NoError(t, err)
+
+	require.Eventually(t, func() bool {
+		j, err := cl.Job(ctx, job.ID)
+		return err == nil && j.State == model.JobRunning
+	}, 15*time.Second, 100*time.Millisecond, "job never reached running")
+
+	// Simulate the crash-restart on the wire: a fresh /v1/workers/register
+	// call under the same host-derived worker ID, with nothing having
+	// reported the old job's outcome. This is exactly what a real `rc
+	// worker` restart looks like to the controller. wk's local "sleep 30" —
+	// standing in for an orphaned CUDA process — is deliberately still alive
+	// right now (its context is not cancelled until this test's cleanup),
+	// which is precisely why the device must not come back as ready.
+	registerRestart(t, ts.URL, "wtok", "restartbox", []string{"dev0"})
+
+	state, err := cl.State(ctx)
+	require.NoError(t, err)
+	require.Len(t, state.Devices, 1)
+	require.NotEqual(t, model.DeviceReady, state.Devices[0].Device.State,
+		"a restarted worker must never leave the device ready while its lease was live")
+	require.Equal(t, model.DeviceUnhealthy, state.Devices[0].Device.State,
+		"the device must be quarantined pending an operator clear, not merely marked non-ready")
+	require.Empty(t, state.Devices[0].Holder, "no live lease should remain once the stranded job is reaped")
+
+	final, err := cl.Job(ctx, job.ID)
+	require.NoError(t, err)
+	require.Equal(t, model.JobLost, final.State)
+
+	// And the invariant holds end to end: nothing can claim the quarantined
+	// device until an operator clears it.
+	_, err = cl.Submit(ctx, client.SubmitOptions{
+		DeviceID: "restartbox:dev0", Command: []string{"true"}, Submitter: "agent-b",
+	})
+	require.ErrorIs(t, err, client.ErrNoDevice,
+		"a quarantined device must refuse a new claim, not silently hand out a GPU nobody has proven is clean")
+}
+
+// registerRestart posts a raw /v1/workers/register call, the same request a
+// genuinely restarted `rc worker` process sends. It bypasses the worker
+// package's own long-running Start loop so the test can register a second
+// "process" for the same host without disturbing the first one's still-live
+// local job.
+func registerRestart(t *testing.T, baseURL, token, host string, devices []string) {
+	t.Helper()
+	payload, err := json.Marshal(map[string]any{"host": host, "devices": devices})
+	require.NoError(t, err)
+	req, err := http.NewRequest(http.MethodPost, baseURL+"/v1/workers/register", bytes.NewReader(payload))
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
 }
 
 type logBuffer struct{ b []byte }

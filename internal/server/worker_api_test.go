@@ -248,6 +248,56 @@ func TestAssignmentIsHandedOutOnlyOnce(t *testing.T) {
 	require.Equal(t, model.JobRunning, got.State)
 }
 
+// TestReRegistrationCannotLeaveADeviceReadyWithALiveLease guards the fix for
+// the critical review finding: a worker that restarts mid-job — same
+// host-derived worker ID, brand-new process — must not falsify its device
+// as ready (or leave it busy forever) while the controller has no proof an
+// orphaned process from the dead worker isn't still holding it.
+// Registration must reconcile: reap the in-flight job, release its lease,
+// and quarantine the device unhealthy.
+func TestReRegistrationCannotLeaveADeviceReadyWithALiveLease(t *testing.T) {
+	ts, st, _, c := newServer(t)
+
+	resp := post(t, ts, "wtok", "/v1/workers/register",
+		server.RegisterRequest{Host: "gpubox", Devices: []string{"gpu0"}})
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	resp.Body.Close()
+
+	job, err := st.Allocate(store.AllocateRequest{
+		DeviceID: "gpubox:gpu0", Command: []string{"sleep", "30"}, Submitter: "agent-a", LeaseTTL: time.Minute,
+	})
+	require.NoError(t, err)
+	require.NoError(t, st.MarkRunning(job.ID, c.Now()))
+
+	leasesBefore, err := st.Leases()
+	require.NoError(t, err)
+	require.Len(t, leasesBefore, 1, "sanity: the job's lease must actually be live before the restart")
+
+	// The worker "restarts": a fresh process registers under the same
+	// host-derived worker ID while the controller still believes the job is
+	// running on it.
+	resp2 := post(t, ts, "wtok", "/v1/workers/register",
+		server.RegisterRequest{Host: "gpubox", Devices: []string{"gpu0"}})
+	defer resp2.Body.Close()
+	require.Equal(t, http.StatusOK, resp2.StatusCode)
+
+	devices, err := st.Devices()
+	require.NoError(t, err)
+	require.Len(t, devices, 1)
+	require.NotEqual(t, model.DeviceReady, devices[0].State,
+		"a re-registering worker must never leave a device ready while its lease was live")
+	require.Equal(t, model.DeviceUnhealthy, devices[0].State,
+		"the device must be quarantined, not merely left non-ready")
+
+	leasesAfter, err := st.Leases()
+	require.NoError(t, err)
+	require.Empty(t, leasesAfter, "the stranded lease must be released once the job is reaped, not left live and unreachable")
+
+	reloaded, err := st.Job(job.ID)
+	require.NoError(t, err)
+	require.Equal(t, model.JobLost, reloaded.State)
+}
+
 func TestJobStatusForUnknownJobReturns404(t *testing.T) {
 	ts, _, _, _ := newServer(t)
 

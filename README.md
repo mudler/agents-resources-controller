@@ -75,6 +75,19 @@ way in stage 1 to detach a job from a specific worker process and hand it to
 a replacement — the worker that started a job is the one supervising it for
 its entire life.
 
+**A worker that never got to run that shutdown sequence — killed -9, host
+power loss, an OOM of the worker process itself — leaves the controller
+believing the job is still assigned or running.** Registration reconciles
+this: when a worker registers, it is announcing (truthfully, since it is a
+fresh process) that it has no running jobs. Any job the controller still has
+this worker ID down as `assigned` or `running` is marked `lost`, its lease
+is released, and — critically — its device comes back `unhealthy`, never
+`ready` and never left `busy` forever. A device is never handed back to the
+pool on the strength of "the old process is gone now"; nothing proves an
+orphaned process from that process isn't still pinning it. Clearing it is
+the same explicit `POST /v1/devices/{id}/clear` used for any other
+unhealthy device.
+
 ## Client
 
 ```sh
@@ -160,5 +173,11 @@ JOB                                   DEVICE       STATE    SUBMITTER           
   currently `unhealthy` **and** has no live lease; called against a device
   in any other state (e.g. `ready`) it refuses with 409 rather than
   contradict the lease table.
+- A worker that registers is a fresh process, so registration reconciles: any
+  job that worker ID still had `assigned` or `running` is marked `lost`, its
+  lease released, and its device quarantined `unhealthy` — never handed back
+  as `ready`, never left `busy` with nothing left to release it. This is
+  what makes a `kill -9` of `rc worker`, not just its ordinary shutdown, safe
+  to restart from.
 - Jobs run in their own process group, so a kill takes the whole tree with
   it, including grandchildren that detached from the job's own stdio.

@@ -40,6 +40,19 @@ func Open(path string, c clock.Clock) (*Store, error) {
 
 func (s *Store) Close() error { return s.db.Close() }
 
+// UpsertWorker registers a worker and its declared devices. A worker that
+// registers is a fresh process announcing it has no running jobs — nothing
+// a brand-new process could be supervising survives a restart — so
+// registration must reconcile whatever the previous process left in flight
+// before it touches device state at all. Without that reconciliation a
+// restart either strands a job "running" forever with its device stuck
+// busy (nothing else keys off worker identity to notice), or, once the
+// reaper has already demoted the device, falsifies it as ready while an
+// orphaned process from the dead worker may still be pinning it. Both are
+// exactly what "never hand out a device we cannot prove is free" forbids,
+// so every device backing a reaped in-flight job comes back unhealthy —
+// never ready, never left busy — and only an explicit clear (or a verify
+// probe standing in for one) puts it back in the pool.
 func (s *Store) UpsertWorker(w model.Worker, devices []model.Device) error {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -55,26 +68,91 @@ func (s *Store) UpsertWorker(w model.Worker, devices []model.Device) error {
 		return fmt.Errorf("upsert worker: %w", err)
 	}
 
+	// The reap pass quarantines the DEVICE ROW directly (not just the job),
+	// so it applies even if this registration's device list no longer
+	// declares that device (a dropped or renamed entry in worker.yaml) — the
+	// upsert loop below must not be the only thing standing between a
+	// stranded job and a device that goes back to ready.
+	if err := s.reapInFlightJobsLocked(tx, w.ID, w.LastHeartbeatAt, "worker re-registered"); err != nil {
+		return fmt.Errorf("reap in-flight jobs for %s: %w", w.ID, err)
+	}
+
 	for _, d := range devices {
 		state := d.State
 		if state == "" {
 			state = model.DeviceReady
 		}
-		// A re-registering worker must not steal a device that is currently
-		// leased, so only non-busy devices are reset to ready.
+		// The reap pass above already quarantined every device that had a
+		// live job on this worker, so the only device state worth
+		// preserving across a re-registration is an existing unhealthy one
+		// (e.g. a verify-probe fault with no job attached, or the
+		// quarantine that reap pass just applied) — that still requires an
+		// explicit clear, registration must not paper over it. Anything
+		// else — ready, busy, unknown — is superseded by what was just
+		// computed above.
 		if _, err := tx.Exec(
 			`INSERT INTO devices (id, host, name, worker_id, state, last_heartbeat_at)
 			 VALUES (?, ?, ?, ?, ?, ?)
 			 ON CONFLICT(id) DO UPDATE SET
 			   worker_id = excluded.worker_id,
 			   last_heartbeat_at = excluded.last_heartbeat_at,
-			   state = CASE WHEN devices.state = 'busy' THEN devices.state ELSE excluded.state END`,
-			d.ID, d.Host, d.Name, w.ID, string(state), w.LastHeartbeatAt.Unix(),
+			   state = CASE WHEN devices.state = ? THEN devices.state ELSE excluded.state END`,
+			d.ID, d.Host, d.Name, w.ID, string(state), w.LastHeartbeatAt.Unix(), string(model.DeviceUnhealthy),
 		); err != nil {
 			return fmt.Errorf("upsert device %s: %w", d.ID, err)
 		}
 	}
 	return tx.Commit()
+}
+
+// reapInFlightJobsLocked marks every job this worker still has in "assigned"
+// or "running" state as lost, releases its lease, and quarantines the
+// device it occupied as unhealthy — all within the caller's transaction.
+// Nothing here ever sets a device to ready: silence (or, here, an
+// unannounced restart) is never proof a device is free.
+func (s *Store) reapInFlightJobsLocked(tx *sql.Tx, workerID string, at time.Time, reason string) error {
+	rows, err := tx.Query(
+		`SELECT id, device_id FROM jobs WHERE worker_id = ? AND state IN (?, ?)`,
+		workerID, string(model.JobAssigned), string(model.JobRunning))
+	if err != nil {
+		return err
+	}
+	type inflight struct{ jobID, deviceID string }
+	var jobs []inflight
+	for rows.Next() {
+		var j inflight
+		if err := rows.Scan(&j.jobID, &j.deviceID); err != nil {
+			rows.Close()
+			return err
+		}
+		jobs = append(jobs, j)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	for _, j := range jobs {
+		if _, err := tx.Exec(
+			`UPDATE jobs SET state = ?, kill_reason = ?, finished_at = ? WHERE id = ?`,
+			string(model.JobLost), reason, at.Unix(), j.jobID,
+		); err != nil {
+			return fmt.Errorf("mark job %s lost: %w", j.jobID, err)
+		}
+		if _, err := tx.Exec(
+			`UPDATE leases SET released_at = ? WHERE job_id = ? AND released_at IS NULL`,
+			at.Unix(), j.jobID,
+		); err != nil {
+			return fmt.Errorf("release lease for job %s: %w", j.jobID, err)
+		}
+		if _, err := tx.Exec(
+			`UPDATE devices SET state = ? WHERE id = ?`,
+			string(model.DeviceUnhealthy), j.deviceID,
+		); err != nil {
+			return fmt.Errorf("quarantine device %s: %w", j.deviceID, err)
+		}
+	}
+	return nil
 }
 
 func (s *Store) SetDeviceState(id string, state model.DeviceState, at time.Time) error {

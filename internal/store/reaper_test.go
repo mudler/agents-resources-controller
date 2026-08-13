@@ -134,6 +134,52 @@ func TestClearDeviceRefusesWhileLeaseIsLive(t *testing.T) {
 	require.ErrorIs(t, err, store.ErrNoDevice)
 }
 
+// TestRegistrationReapsInFlightJobsAndQuarantinesDevices is the critical
+// review fix: a worker that registers is a fresh process announcing it has
+// no running jobs, so registration must reconcile whatever the previous
+// process left in flight rather than trust the device's current state.
+// Without this, a worker restart while a job is running/assigned either
+// leaves the device stuck busy forever (the state-preserving CASE kept it
+// busy) or, once the reaper has already demoted it, falsifies the device as
+// ready while an orphaned process from the dead worker may still hold it.
+// Neither is acceptable under "never hand out a device we cannot prove is
+// free" — the device must come back unhealthy, not ready and not busy, and
+// stay that way until an operator clears it.
+func TestRegistrationReapsInFlightJobsAndQuarantinesDevices(t *testing.T) {
+	s, c := newStore(t)
+
+	job, err := s.Allocate(req("agent-a"))
+	require.NoError(t, err)
+	require.NoError(t, s.MarkRunning(job.ID, c.Now()))
+
+	// The same worker ID re-registers, as a genuinely restarted `rc worker`
+	// process would: nothing here has run the job to completion or reported
+	// its outcome.
+	require.NoError(t, s.UpsertWorker(
+		model.Worker{ID: "w1", Host: "gpubox", LastHeartbeatAt: c.Now()},
+		[]model.Device{{ID: "gpubox:gpu0", Host: "gpubox", Name: "gpu0", WorkerID: "w1", State: model.DeviceReady}},
+	))
+
+	reloaded, err := s.Job(job.ID)
+	require.NoError(t, err)
+	require.Equal(t, model.JobLost, reloaded.State, "the stranded job must be marked lost, not left running forever")
+	require.NotEmpty(t, reloaded.KillReason, "the kill reason must name the cause")
+
+	leases, err := s.Leases()
+	require.NoError(t, err)
+	require.Empty(t, leases, "the job's lease must be released, not left live and unreachable")
+
+	devices, err := s.Devices()
+	require.NoError(t, err)
+	require.Len(t, devices, 1)
+	require.Equal(t, model.DeviceUnhealthy, devices[0].State,
+		"a device backing a reaped in-flight job must be quarantined unhealthy, not ready and not busy — nothing proves an orphaned process isn't still holding it")
+
+	// Quarantined means genuinely unschedulable, not merely mislabeled.
+	_, err = s.Allocate(req("agent-b"))
+	require.ErrorIs(t, err, store.ErrNoDevice)
+}
+
 // A device that was already unhealthy when its worker went silent past
 // unhealthyAfter must still have its in-flight job reaped: it must not be
 // stranded non-terminal with a lease that never releases.
