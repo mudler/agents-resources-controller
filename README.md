@@ -59,10 +59,21 @@ rc worker
 
 The worker registers its host and devices, long-polls the controller for
 assignments, spawns each job in its own process group, and streams the
-job's combined stdout/stderr back as it runs. On shutdown (SIGINT/SIGTERM)
-it stops taking new work but waits for jobs already running here to finish
-and report before exiting — a routine restart of the worker process does
-not abandon a job on the device.
+job's combined stdout/stderr back as it runs.
+
+**Stopping or restarting the worker terminates its in-flight jobs — it does
+not let them survive the restart.** On shutdown (SIGINT/SIGTERM) the worker
+stops taking new work and SIGTERMs the process group of every job it has
+running here, escalating to SIGKILL after a 10s grace ceiling if the group
+hasn't exited by then. It then waits (up to 45s) for those jobs to actually
+die and for their terminal report — job state `killed`, reason `cancelled`
+— to reach the controller before the process exits. That ordered shutdown
+exists so the controller learns the job's real outcome and releases the
+device cleanly, not so the job survives; a `systemctl restart` (or any other
+SIGTERM) of `rc worker` during a multi-hour job kills that job. There is no
+way in stage 1 to detach a job from a specific worker process and hand it to
+a replacement — the worker that started a job is the one supervising it for
+its entire life.
 
 ## Client
 
@@ -110,7 +121,8 @@ rc: detached from job bfbf7d29-9306-41da-9a9f-413026b7361e — it is STILL RUNNI
 
 Server-side cancellation (`rc kill`) does not exist yet — it is a later
 stage. Until then, the only ways a device comes back are the job finishing
-on its own or the worker being stopped/killed directly on the device host.
+on its own, or stopping the worker process on the device host — which, as
+described above, kills the job rather than merely detaching from it.
 
 `rc devices` shows the fleet, including devices whose worker has gone quiet:
 
@@ -144,7 +156,9 @@ JOB                                   DEVICE       STATE    SUBMITTER           
   again restores its `unknown` devices on its own (to `busy` if their lease
   is still live, to `ready` otherwise); a device that reached `unhealthy`
   stays out until an admin token clears it explicitly:
-  `POST /v1/devices/{id}/clear` (only takes effect while the device has no
-  live lease).
+  `POST /v1/devices/{id}/clear`. That call only succeeds when the device is
+  currently `unhealthy` **and** has no live lease; called against a device
+  in any other state (e.g. `ready`) it refuses with 409 rather than
+  contradict the lease table.
 - Jobs run in their own process group, so a kill takes the whole tree with
   it, including grandchildren that detached from the job's own stdio.

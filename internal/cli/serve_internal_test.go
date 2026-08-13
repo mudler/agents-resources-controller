@@ -10,7 +10,7 @@ func TestLoadTokens(t *testing.T) {
 	cases := []struct {
 		name    string
 		raw     string
-		wantErr string          // substring expected in the error, "" means no error
+		wantErr string // substring expected in the error, "" means no error
 		want    map[string]string
 	}{
 		{

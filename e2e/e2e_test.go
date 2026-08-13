@@ -67,10 +67,15 @@ func TestEndToEndClaimRunRelease(t *testing.T) {
 		return err == nil && len(state.Devices) == 1
 	}, 15*time.Second, 100*time.Millisecond, "worker never registered its device")
 
-	// 2. A job is submitted and handed to the worker.
+	// 2. A job is submitted and handed to the worker. sleep 5, not 1: the
+	// busy/holder assertions below run a few HTTP round trips after this
+	// submit and need enough margin that the job is still reliably holding
+	// the device by the time they execute — a tight margin here is already
+	// the safe direction (a flake would read as failure, never a false
+	// pass), but still worth avoiding.
 	job, err := cl.Submit(ctx, client.SubmitOptions{
 		DeviceID:  "testbox:dev0",
-		Command:   []string{"sh", "-c", "echo hello-from-device; sleep 1"},
+		Command:   []string{"sh", "-c", "echo hello-from-device; sleep 5"},
 		Submitter: "agent-a",
 	})
 	require.NoError(t, err, "first submit for the free device must succeed")
