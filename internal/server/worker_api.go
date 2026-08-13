@@ -1,0 +1,156 @@
+package server
+
+import (
+	"io"
+	"net/http"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/mudler/resource-controller/internal/model"
+)
+
+type RegisterRequest struct {
+	Host    string   `json:"host"`
+	Devices []string `json:"devices"`
+}
+
+type RegisterResponse struct {
+	WorkerID string `json:"worker_id"`
+}
+
+type Assignment struct {
+	JobID    string            `json:"job_id"`
+	DeviceID string            `json:"device_id"`
+	Command  []string          `json:"command"`
+	Cwd      string            `json:"cwd,omitempty"`
+	Env      map[string]string `json:"env,omitempty"`
+}
+
+type StatusRequest struct {
+	State    model.JobState `json:"state"`
+	ExitCode *int           `json:"exit_code,omitempty"`
+	Reason   string         `json:"reason,omitempty"`
+}
+
+func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
+	var req RegisterRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	if req.Host == "" {
+		writeErr(w, http.StatusBadRequest, "bad_request", "host required")
+		return
+	}
+
+	now := s.cfg.Clock.Now()
+	// The worker ID is derived from the host so a restarted worker resumes its
+	// own devices instead of orphaning them.
+	workerID := uuid.NewSHA1(uuid.NameSpaceDNS, []byte(req.Host)).String()
+
+	devices := make([]model.Device, 0, len(req.Devices))
+	for _, name := range req.Devices {
+		devices = append(devices, model.Device{
+			ID: req.Host + ":" + name, Host: req.Host, Name: name,
+			WorkerID: workerID, State: model.DeviceReady, LastHeartbeatAt: now,
+		})
+	}
+
+	if err := s.cfg.Store.UpsertWorker(
+		model.Worker{ID: workerID, Host: req.Host, LastHeartbeatAt: now}, devices); err != nil {
+		writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, RegisterResponse{WorkerID: workerID})
+}
+
+func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
+	if err := s.cfg.Store.RecordHeartbeat(r.PathValue("id"), s.cfg.Clock.Now()); err != nil {
+		writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+// handleAssignments long-polls: it returns as soon as this worker has work,
+// otherwise 204 after the wait window so the worker simply calls again.
+func (s *Server) handleAssignments(w http.ResponseWriter, r *http.Request) {
+	workerID := r.PathValue("id")
+
+	wait := 30 * time.Second
+	if v := r.URL.Query().Get("wait"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 && d <= time.Minute {
+			wait = d
+		}
+	}
+
+	woken, cancel := s.notify.wait(workerID)
+	defer cancel()
+
+	deadline := time.NewTimer(wait)
+	defer deadline.Stop()
+
+	for {
+		jobs, err := s.cfg.Store.AssignedJobsFor(workerID)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
+			return
+		}
+		if len(jobs) > 0 {
+			out := make([]Assignment, 0, len(jobs))
+			for _, j := range jobs {
+				out = append(out, Assignment{
+					JobID: j.ID, DeviceID: j.DeviceID, Command: j.Command, Cwd: j.Cwd, Env: j.Env,
+				})
+			}
+			writeJSON(w, http.StatusOK, out)
+			return
+		}
+		select {
+		case <-woken:
+		case <-deadline.C:
+			w.WriteHeader(http.StatusNoContent)
+			return
+		case <-r.Context().Done():
+			return
+		}
+	}
+}
+
+func (s *Server) handleAppendLogs(w http.ResponseWriter, r *http.Request) {
+	chunk, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	if err := s.cfg.Logs.Append(r.PathValue("id"), chunk); err != nil {
+		writeErr(w, http.StatusInternalServerError, "log_error", err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+func (s *Server) handleJobStatus(w http.ResponseWriter, r *http.Request) {
+	var req StatusRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	jobID := r.PathValue("id")
+
+	if req.State == model.JobRunning {
+		if err := s.cfg.Store.MarkRunning(jobID, s.cfg.Clock.Now()); err != nil {
+			writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	if !req.State.Terminal() {
+		writeErr(w, http.StatusBadRequest, "bad_request", "state must be running or terminal")
+		return
+	}
+	if err := s.cfg.Store.Release(jobID, req.State, req.ExitCode, req.Reason); err != nil {
+		writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}

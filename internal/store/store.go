@@ -128,3 +128,36 @@ func (s *Store) Leases() ([]model.Lease, error) {
 	}
 	return out, rows.Err()
 }
+
+// AssignedJobsFor returns jobs handed to a worker that it has not started yet.
+func (s *Store) AssignedJobsFor(workerID string) ([]model.Job, error) {
+	rows, err := s.db.Query(
+		`SELECT id FROM jobs WHERE worker_id = ? AND state = ? ORDER BY submitted_at`,
+		workerID, string(model.JobAssigned))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	out := make([]model.Job, 0, len(ids))
+	for _, id := range ids {
+		j, err := s.Job(id)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *j)
+	}
+	return out, nil
+}
