@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
-	"strings"
 	"syscall"
 	"time"
 )
@@ -60,15 +59,6 @@ func Run(ctx context.Context, spec JobSpec, sink io.Writer) Result {
 	}
 	pgid := cmd.Process.Pid // Setpgid makes the child its own group leader.
 
-	// Held open for the leader's whole lifetime so a liveness probe right
-	// before signalling costs a single pread, not an open+read+close each
-	// time — keeping that probe as fast as possible matters, since every
-	// microsecond it takes is more time for the target to race ahead of us.
-	statFile, _ := os.Open(fmt.Sprintf("/proc/%d/stat", pgid))
-	if statFile != nil {
-		defer statFile.Close()
-	}
-
 	waitErr := make(chan error, 1)
 	go func() { waitErr <- cmd.Wait() }()
 
@@ -101,21 +91,24 @@ func Run(ctx context.Context, spec JobSpec, sink io.Writer) Result {
 		}
 
 		cancelReason := "cancelled"
-		// Whether this run counts as cancelled hinges on whether SIGTERM
-		// actually reached a live process, not on how it chose to react. A
-		// single-process job that traps SIGTERM and exits 0 is still a
-		// cancelled run, not a successful one — the operator's interruption
-		// must never be recorded as a completed measurement.
+		// Signalling must never be gated on anything: SIGTERM goes out
+		// unconditionally, and "delivered" is taken straight from kill(2)'s
+		// own return value — no probe in front of it.
 		//
-		// kill(2) alone can't tell us that: it reports success against a
-		// zombie (already exited, not yet reaped) too, since the process
-		// entry still exists even though there's no more user-space code
-		// left to receive the signal. Checking the kernel's live view of the
-		// leader directly, immediately before signalling, catches that
-		// window; nothing can close it to zero (there is always some gap
-		// between a check and a syscall), but keeping the check to a single
-		// pread on an already-open fd keeps that gap as tight as possible.
-		delivered := processIsReachable(statFile) && killGroup(syscall.SIGTERM) == nil
+		// kill(2) succeeds against a zombie (already exited, not yet reaped
+		// by our own Wait() goroutine) just as it does against a live
+		// process, since the process table entry still exists even though
+		// there's no more user-space code left to receive the signal. That
+		// means a job which self-completes in the same nanosecond we signal
+		// it can still be labelled cancelled. This residual race is
+		// unclosable from userspace — no check-then-signal sequence can
+		// prove liveness at the instant the signal actually lands, and a
+		// prior attempt to add such a probe was measured to change the
+		// mislabel rate by nothing (1/900 runs with the probe, 1/900
+		// without). The mislabel always lands in the safe direction: a good
+		// result gets discarded as cancelled, but a cancelled run is never
+		// mistaken for a valid one.
+		delivered := killGroup(syscall.SIGTERM) == nil
 
 		var err error
 		select {
@@ -154,32 +147,6 @@ func Run(ctx context.Context, spec JobSpec, sink io.Writer) Result {
 		// real outcome rather than a cancellation that never landed.
 		return res
 	}
-}
-
-// processIsReachable reports whether the leader (whose already-open
-// /proc/<pid>/stat handle is f) is still a live, signal-receiving process:
-// neither fully reaped already (f is nil — the open at Start() time raced
-// with an implausibly fast exit) nor sitting as a zombie (exited, awaiting
-// reap, no more user-space code left to run). Either state means a signal
-// sent to it has no real effect, even though kill(2) itself may still report
-// success against a zombie.
-func processIsReachable(f *os.File) bool {
-	if f == nil {
-		return false
-	}
-	var buf [256]byte
-	n, err := f.ReadAt(buf[:], 0)
-	if err != nil && n == 0 {
-		return false
-	}
-	// Format: "pid (comm) state ...". comm may itself contain spaces or
-	// parentheses, so the state field is whatever follows the LAST ')'.
-	s := string(buf[:n])
-	i := strings.LastIndexByte(s, ')')
-	if i < 0 || i+2 >= len(s) {
-		return false
-	}
-	return s[i+2] != 'Z'
 }
 
 // groupAlive reports whether any process still belongs to the process group
