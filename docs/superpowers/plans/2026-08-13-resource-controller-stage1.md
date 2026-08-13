@@ -18,7 +18,8 @@
 - **Stage 1 has no queue.** A submit that finds no free matching device returns `409 no_device_available` immediately. Queueing is Stage 2 and must not be built here.
 - Device states in Stage 1: `ready`, `busy`, `unknown`, `unhealthy`. (`draining` is Stage 2.)
 - Job states in Stage 1: `assigned`, `running`, `succeeded`, `failed`, `killed`, `lost`. (`queued` is Stage 2.)
-- All time is passed through a `Clock` interface so tests never sleep.
+- All **controller-side** time (store, reaper, server) passes through the `Clock` interface so those tests never sleep. Worker process supervision and the end-to-end test use real time and `require.Eventually` — a spawned process cannot observe a fake clock.
+- SQLite runs with `MaxOpenConns(1)`. Any query that iterates rows and then issues another query MUST drain its rows to completion first (which releases the connection); holding open `Rows` across a nested query deadlocks.
 - Every HTTP handler authenticates a bearer token and resolves a role (`worker`, `client`, `admin`).
 - The invariant under test everywhere: **no two live leases on one device, ever.**
 
@@ -2366,7 +2367,6 @@ package worker_test
 import (
 	"bytes"
 	"context"
-	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -2472,15 +2472,11 @@ func TestCancelKillsTheEntireProcessTree(t *testing.T) {
 	}, 5*time.Second, 50*time.Millisecond, "grandchild %d survived the kill", childPID)
 }
 
+// kill -0 probes for existence without signalling. os.FindProcess is useless
+// here: on Unix it never fails, and Process.Signal(nil) errors on the nil
+// signal rather than probing, which would make this always report "dead" and
+// the assertion below vacuous.
 func processAlive(pid int) bool {
-	p, err := os.FindProcess(pid)
-	if err != nil {
-		return false
-	}
-	if err := p.Signal(os.Signal(nil)); err != nil {
-		return false
-	}
-	// Signal(nil) is not portable enough on its own; confirm with kill -0.
 	return exec.Command("kill", "-0", strconv.Itoa(pid)).Run() == nil
 }
 ```
