@@ -1,0 +1,327 @@
+package server_test
+
+import (
+	"bytes"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/mudler/resource-controller/internal/clock"
+	"github.com/mudler/resource-controller/internal/logstore"
+	"github.com/mudler/resource-controller/internal/model"
+	"github.com/mudler/resource-controller/internal/server"
+	"github.com/mudler/resource-controller/internal/store"
+	"github.com/stretchr/testify/require"
+)
+
+func newServer(t *testing.T) (*httptest.Server, *store.Store, *logstore.Store, *clock.Fake) {
+	t.Helper()
+	dir := t.TempDir()
+	c := clock.NewFake(time.Date(2026, 8, 13, 12, 0, 0, 0, time.UTC))
+
+	st, err := store.Open(filepath.Join(dir, "rc.db"), c)
+	require.NoError(t, err)
+	t.Cleanup(func() { st.Close() })
+
+	logs, err := logstore.New(filepath.Join(dir, "logs"))
+	require.NoError(t, err)
+
+	srv := server.New(server.Config{
+		Store: st, Logs: logs, Clock: c,
+		Tokens: map[string]string{"wtok": "worker", "ctok": "client", "atok": "admin"},
+	})
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+	return ts, st, logs, c
+}
+
+func post(t *testing.T, ts *httptest.Server, token, path string, body any) *http.Response {
+	t.Helper()
+	var buf bytes.Buffer
+	if body != nil {
+		require.NoError(t, json.NewEncoder(&buf).Encode(body))
+	}
+	req, err := http.NewRequest(http.MethodPost, ts.URL+path, &buf)
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := ts.Client().Do(req)
+	require.NoError(t, err)
+	return resp
+}
+
+// postRaw sends a raw byte body without JSON-encoding it, and lets the
+// caller set the Authorization header verbatim (no automatic "Bearer "
+// prefixing), so tests can exercise malformed auth headers and oversized
+// bodies precisely.
+func postRaw(t *testing.T, ts *httptest.Server, authHeader, path string, body []byte) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, ts.URL+path, bytes.NewReader(body))
+	require.NoError(t, err)
+	if authHeader != "" {
+		req.Header.Set("Authorization", authHeader)
+	}
+	resp, err := ts.Client().Do(req)
+	require.NoError(t, err)
+	return resp
+}
+
+func TestUnauthenticatedRequestIsRejected(t *testing.T) {
+	ts, _, _, _ := newServer(t)
+	resp := post(t, ts, "bogus", "/v1/workers/register", server.RegisterRequest{Host: "gpubox"})
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+}
+
+func TestClientTokenCannotRegisterWorker(t *testing.T) {
+	ts, _, _, _ := newServer(t)
+	resp := post(t, ts, "ctok", "/v1/workers/register", server.RegisterRequest{Host: "gpubox"})
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusForbidden, resp.StatusCode)
+}
+
+func TestAuthorizationHeaderRequiresBearerScheme(t *testing.T) {
+	ts, _, _, _ := newServer(t)
+	// "wtok" is a valid token value but sent without the "Bearer " scheme
+	// prefix; TrimPrefix-style matching would silently accept this.
+	resp := postRaw(t, ts, "wtok", "/v1/workers/register", nil)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+}
+
+func TestRegisterCreatesDevices(t *testing.T) {
+	ts, st, _, _ := newServer(t)
+
+	resp := post(t, ts, "wtok", "/v1/workers/register",
+		server.RegisterRequest{Host: "gpubox", Devices: []string{"gpu0", "gpu1"}})
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	var out server.RegisterResponse
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&out))
+	require.NotEmpty(t, out.WorkerID)
+
+	devices, err := st.Devices()
+	require.NoError(t, err)
+	require.Len(t, devices, 2)
+	require.Equal(t, "gpubox:gpu0", devices[0].ID)
+	require.Equal(t, model.DeviceReady, devices[0].State)
+}
+
+func TestAssignmentsLongPollReturns204WhenIdle(t *testing.T) {
+	ts, _, _, _ := newServer(t)
+
+	resp := post(t, ts, "wtok", "/v1/workers/register",
+		server.RegisterRequest{Host: "gpubox", Devices: []string{"gpu0"}})
+	var reg server.RegisterResponse
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&reg))
+	resp.Body.Close()
+
+	req, err := http.NewRequest(http.MethodGet,
+		ts.URL+"/v1/workers/"+reg.WorkerID+"/assignments?wait=50ms", nil)
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer wtok")
+
+	got, err := ts.Client().Do(req)
+	require.NoError(t, err)
+	defer got.Body.Close()
+	require.Equal(t, http.StatusNoContent, got.StatusCode)
+}
+
+func TestWorkerReportingTerminalStatusFreesDevice(t *testing.T) {
+	ts, st, _, _ := newServer(t)
+
+	resp := post(t, ts, "wtok", "/v1/workers/register",
+		server.RegisterRequest{Host: "gpubox", Devices: []string{"gpu0"}})
+	var reg server.RegisterResponse
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&reg))
+	resp.Body.Close()
+
+	job, err := st.Allocate(store.AllocateRequest{
+		DeviceID: "gpubox:gpu0", Command: []string{"true"}, Submitter: "agent-a", LeaseTTL: time.Minute,
+	})
+	require.NoError(t, err)
+
+	code := 0
+	sr := post(t, ts, "wtok", "/v1/jobs/"+job.ID+"/status",
+		server.StatusRequest{WorkerID: reg.WorkerID, State: model.JobSucceeded, ExitCode: &code})
+	defer sr.Body.Close()
+	require.Equal(t, http.StatusOK, sr.StatusCode)
+
+	devices, err := st.Devices()
+	require.NoError(t, err)
+	require.Equal(t, model.DeviceReady, devices[0].State)
+}
+
+func TestWorkerCannotReportStatusForAnotherWorkersJob(t *testing.T) {
+	ts, st, _, _ := newServer(t)
+
+	resp1 := post(t, ts, "wtok", "/v1/workers/register",
+		server.RegisterRequest{Host: "gpubox", Devices: []string{"gpu0"}})
+	var reg1 server.RegisterResponse
+	require.NoError(t, json.NewDecoder(resp1.Body).Decode(&reg1))
+	resp1.Body.Close()
+
+	resp2 := post(t, ts, "wtok", "/v1/workers/register",
+		server.RegisterRequest{Host: "gpubox2", Devices: []string{"gpu0"}})
+	var reg2 server.RegisterResponse
+	require.NoError(t, json.NewDecoder(resp2.Body).Decode(&reg2))
+	resp2.Body.Close()
+	require.NotEqual(t, reg1.WorkerID, reg2.WorkerID)
+
+	job, err := st.Allocate(store.AllocateRequest{
+		DeviceID: "gpubox:gpu0", Command: []string{"true"}, Submitter: "agent-a", LeaseTTL: time.Minute,
+	})
+	require.NoError(t, err)
+
+	// Worker 2 reports status for worker 1's job.
+	sr := post(t, ts, "wtok", "/v1/jobs/"+job.ID+"/status",
+		server.StatusRequest{WorkerID: reg2.WorkerID, State: model.JobFailed, Reason: "not mine"})
+	defer sr.Body.Close()
+	require.Equal(t, http.StatusForbidden, sr.StatusCode)
+
+	// The device must still be busy and the job must still be non-terminal:
+	// the GPU was not handed away to a second job while the first is still
+	// running on it.
+	devices, err := st.Devices()
+	require.NoError(t, err)
+	var gpu0 *model.Device
+	for i := range devices {
+		if devices[i].ID == "gpubox:gpu0" {
+			gpu0 = &devices[i]
+		}
+	}
+	require.NotNil(t, gpu0)
+	require.Equal(t, model.DeviceBusy, gpu0.State)
+
+	got, err := st.Job(job.ID)
+	require.NoError(t, err)
+	require.False(t, got.State.Terminal())
+}
+
+// TestAssignmentIsHandedOutOnlyOnce guards against a worker's poll loop
+// re-running a job: handing out an assignment must be a state transition
+// (assigned -> running), not just a query, or the same job stays "assigned"
+// and gets returned — and re-executed — on every subsequent poll until the
+// worker's own "running" report happens to land.
+func TestAssignmentIsHandedOutOnlyOnce(t *testing.T) {
+	ts, st, _, _ := newServer(t)
+	workerID := registerWorker(t, ts)
+
+	job, err := st.Allocate(store.AllocateRequest{
+		DeviceID: "gpubox:gpu0", Command: []string{"true"}, Submitter: "agent-a", LeaseTTL: time.Minute,
+	})
+	require.NoError(t, err)
+
+	poll := func() []server.Assignment {
+		req, err := http.NewRequest(http.MethodGet,
+			ts.URL+"/v1/workers/"+workerID+"/assignments?wait=50ms", nil)
+		require.NoError(t, err)
+		req.Header.Set("Authorization", "Bearer wtok")
+		resp, err := ts.Client().Do(req)
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		if resp.StatusCode == http.StatusNoContent {
+			return nil
+		}
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		var out []server.Assignment
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&out))
+		return out
+	}
+
+	first := poll()
+	require.Len(t, first, 1)
+	require.Equal(t, job.ID, first[0].JobID)
+
+	// The job must not still be "assigned" after being handed out once: a
+	// second poll, arriving before any status report from the worker, must
+	// not see it again.
+	second := poll()
+	require.Empty(t, second, "a job must not be handed out twice before the worker has reported anything")
+
+	got, err := st.Job(job.ID)
+	require.NoError(t, err)
+	require.Equal(t, model.JobRunning, got.State)
+}
+
+// TestReRegistrationCannotLeaveADeviceReadyWithALiveLease guards the fix for
+// the critical review finding: a worker that restarts mid-job — same
+// host-derived worker ID, brand-new process — must not falsify its device
+// as ready (or leave it busy forever) while the controller has no proof an
+// orphaned process from the dead worker isn't still holding it.
+// Registration must reconcile: reap the in-flight job, release its lease,
+// and quarantine the device unhealthy.
+func TestReRegistrationCannotLeaveADeviceReadyWithALiveLease(t *testing.T) {
+	ts, st, _, c := newServer(t)
+
+	resp := post(t, ts, "wtok", "/v1/workers/register",
+		server.RegisterRequest{Host: "gpubox", Devices: []string{"gpu0"}})
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	resp.Body.Close()
+
+	job, err := st.Allocate(store.AllocateRequest{
+		DeviceID: "gpubox:gpu0", Command: []string{"sleep", "30"}, Submitter: "agent-a", LeaseTTL: time.Minute,
+	})
+	require.NoError(t, err)
+	require.NoError(t, st.MarkRunning(job.ID, c.Now()))
+
+	leasesBefore, err := st.Leases()
+	require.NoError(t, err)
+	require.Len(t, leasesBefore, 1, "sanity: the job's lease must actually be live before the restart")
+
+	// The worker "restarts": a fresh process registers under the same
+	// host-derived worker ID while the controller still believes the job is
+	// running on it.
+	resp2 := post(t, ts, "wtok", "/v1/workers/register",
+		server.RegisterRequest{Host: "gpubox", Devices: []string{"gpu0"}})
+	defer resp2.Body.Close()
+	require.Equal(t, http.StatusOK, resp2.StatusCode)
+
+	devices, err := st.Devices()
+	require.NoError(t, err)
+	require.Len(t, devices, 1)
+	require.NotEqual(t, model.DeviceReady, devices[0].State,
+		"a re-registering worker must never leave a device ready while its lease was live")
+	require.Equal(t, model.DeviceUnhealthy, devices[0].State,
+		"the device must be quarantined, not merely left non-ready")
+
+	leasesAfter, err := st.Leases()
+	require.NoError(t, err)
+	require.Empty(t, leasesAfter, "the stranded lease must be released once the job is reaped, not left live and unreachable")
+
+	reloaded, err := st.Job(job.ID)
+	require.NoError(t, err)
+	require.Equal(t, model.JobLost, reloaded.State)
+}
+
+func TestJobStatusForUnknownJobReturns404(t *testing.T) {
+	ts, _, _, _ := newServer(t)
+
+	resp := post(t, ts, "wtok", "/v1/workers/register",
+		server.RegisterRequest{Host: "gpubox", Devices: []string{"gpu0"}})
+	var reg server.RegisterResponse
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&reg))
+	resp.Body.Close()
+
+	sr := post(t, ts, "wtok", "/v1/jobs/does-not-exist/status",
+		server.StatusRequest{WorkerID: reg.WorkerID, State: model.JobFailed})
+	defer sr.Body.Close()
+	require.Equal(t, http.StatusNotFound, sr.StatusCode)
+}
+
+func TestOversizedLogChunkIsRejected(t *testing.T) {
+	ts, _, logs, _ := newServer(t)
+
+	oversized := bytes.Repeat([]byte("x"), (1<<20)+1)
+	resp := postRaw(t, ts, "Bearer wtok", "/v1/jobs/job1/logs", oversized)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusRequestEntityTooLarge, resp.StatusCode)
+
+	got, err := logs.Read("job1")
+	require.NoError(t, err)
+	require.Empty(t, got)
+}

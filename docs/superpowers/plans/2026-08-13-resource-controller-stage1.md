@@ -18,7 +18,8 @@
 - **Stage 1 has no queue.** A submit that finds no free matching device returns `409 no_device_available` immediately. Queueing is Stage 2 and must not be built here.
 - Device states in Stage 1: `ready`, `busy`, `unknown`, `unhealthy`. (`draining` is Stage 2.)
 - Job states in Stage 1: `assigned`, `running`, `succeeded`, `failed`, `killed`, `lost`. (`queued` is Stage 2.)
-- All time is passed through a `Clock` interface so tests never sleep.
+- All **controller-side** time (store, reaper, server) passes through the `Clock` interface so those tests never sleep. Worker process supervision and the end-to-end test use real time and `require.Eventually` — a spawned process cannot observe a fake clock.
+- SQLite runs with `MaxOpenConns(1)`. Any query that iterates rows and then issues another query MUST drain its rows to completion first (which releases the connection); holding open `Rows` across a nested query deadlocks.
 - Every HTTP handler authenticates a bearer token and resolves a role (`worker`, `client`, `admin`).
 - The invariant under test everywhere: **no two live leases on one device, ever.**
 
@@ -938,6 +939,37 @@ func TestHeartbeatRestoresUnknownDeviceToReady(t *testing.T) {
 	require.Equal(t, model.DeviceReady, devices[0].State)
 }
 
+// A device demoted to unknown while it was BUSY must come back as busy, not
+// ready: the job is still running on it. Returning it to the pool would hand
+// an occupied GPU to the next claimant.
+func TestHeartbeatRestoresLeasedDeviceToBusyNotReady(t *testing.T) {
+	s, c := newStore(t)
+
+	job, err := s.Allocate(req("agent-a"))
+	require.NoError(t, err)
+
+	c.Advance(45 * time.Second)
+	_, err = s.Sweep(30*time.Second, 5*time.Minute)
+	require.NoError(t, err)
+
+	require.NoError(t, s.RecordHeartbeat("w1", c.Now()))
+
+	devices, err := s.Devices()
+	require.NoError(t, err)
+	require.Equal(t, model.DeviceBusy, devices[0].State)
+
+	// And it must not be claimable while that lease is live.
+	_, err = s.Allocate(req("agent-b"))
+	require.ErrorIs(t, err, store.ErrNoDevice)
+
+	// Releasing the original job still returns it to the pool normally.
+	code := 0
+	require.NoError(t, s.Release(job.ID, model.JobSucceeded, &code, ""))
+	devices, err = s.Devices()
+	require.NoError(t, err)
+	require.Equal(t, model.DeviceReady, devices[0].State)
+}
+
 // A device whose worker never came back is NOT returned to the pool: we cannot
 // prove nothing is still occupying it.
 func TestSweepMarksLostWorkerDevicesUnhealthyNotReady(t *testing.T) {
@@ -1109,8 +1141,11 @@ func (s *Store) Sweep(grace, unhealthyAfter time.Duration) (SweepResult, error) 
 	return res, nil
 }
 
-// RecordHeartbeat refreshes a worker and promotes its unknown devices back to
-// ready. Devices marked unhealthy stay out until explicitly cleared.
+// RecordHeartbeat refreshes a worker and restores its unknown devices. A
+// device whose lease is still live returns to busy, NOT to ready: the job it
+// was demoted with is still running on it. Promoting a leased device to ready
+// would offer an occupied GPU to the next claimant. Devices marked unhealthy
+// stay out until explicitly cleared.
 func (s *Store) RecordHeartbeat(workerID string, at time.Time) error {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -1124,7 +1159,15 @@ func (s *Store) RecordHeartbeat(workerID string, at time.Time) error {
 	}
 	if _, err := tx.Exec(
 		`UPDATE devices SET state = ?, last_heartbeat_at = ?
-		 WHERE worker_id = ? AND state = ?`,
+		 WHERE worker_id = ? AND state = ?
+		   AND id IN (SELECT device_id FROM leases WHERE released_at IS NULL)`,
+		string(model.DeviceBusy), at.Unix(), workerID, string(model.DeviceUnknown)); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(
+		`UPDATE devices SET state = ?, last_heartbeat_at = ?
+		 WHERE worker_id = ? AND state = ?
+		   AND id NOT IN (SELECT device_id FROM leases WHERE released_at IS NULL)`,
 		string(model.DeviceReady), at.Unix(), workerID, string(model.DeviceUnknown)); err != nil {
 		return err
 	}
@@ -2366,7 +2409,6 @@ package worker_test
 import (
 	"bytes"
 	"context"
-	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -2472,15 +2514,11 @@ func TestCancelKillsTheEntireProcessTree(t *testing.T) {
 	}, 5*time.Second, 50*time.Millisecond, "grandchild %d survived the kill", childPID)
 }
 
+// kill -0 probes for existence without signalling. os.FindProcess is useless
+// here: on Unix it never fails, and Process.Signal(nil) errors on the nil
+// signal rather than probing, which would make this always report "dead" and
+// the assertion below vacuous.
 func processAlive(pid int) bool {
-	p, err := os.FindProcess(pid)
-	if err != nil {
-		return false
-	}
-	if err := p.Signal(os.Signal(nil)); err != nil {
-		return false
-	}
-	// Signal(nil) is not portable enough on its own; confirm with kill -0.
 	return exec.Command("kill", "-0", strconv.Itoa(pid)).Run() == nil
 }
 ```
@@ -2961,7 +2999,10 @@ func (w *Worker) execute(ctx context.Context, a assignment) {
 		w.mu.Unlock()
 	}()
 
-	w.report(ctx, a.JobID, map[string]any{"state": "running"})
+	// worker_id is required: the controller rejects a status report for a job
+	// it did not assign to this worker, so one worker cannot free another's
+	// device out from under a running process.
+	w.report(ctx, a.JobID, map[string]any{"state": "running", "worker_id": w.workerID})
 
 	env := map[string]string{}
 	for k, v := range a.Env {
@@ -2981,7 +3022,7 @@ func (w *Worker) execute(ctx context.Context, a assignment) {
 	case res.Err != nil || res.ExitCode != 0:
 		state = "failed"
 	}
-	body := map[string]any{"state": state, "exit_code": res.ExitCode}
+	body := map[string]any{"state": state, "exit_code": res.ExitCode, "worker_id": w.workerID}
 	if res.Reason != "" {
 		body["reason"] = res.Reason
 	}
