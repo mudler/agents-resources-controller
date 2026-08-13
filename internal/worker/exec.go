@@ -8,6 +8,8 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"runtime"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -58,12 +60,21 @@ func Run(ctx context.Context, spec JobSpec, sink io.Writer) Result {
 	}
 	pgid := cmd.Process.Pid // Setpgid makes the child its own group leader.
 
+	// Held open for the leader's whole lifetime so a liveness probe right
+	// before signalling costs a single pread, not an open+read+close each
+	// time — keeping that probe as fast as possible matters, since every
+	// microsecond it takes is more time for the target to race ahead of us.
+	statFile, _ := os.Open(fmt.Sprintf("/proc/%d/stat", pgid))
+	if statFile != nil {
+		defer statFile.Close()
+	}
+
 	waitErr := make(chan error, 1)
 	go func() { waitErr <- cmd.Wait() }()
 
-	killGroup := func(sig syscall.Signal) {
+	killGroup := func(sig syscall.Signal) error {
 		// Negative pid addresses the whole group.
-		_ = syscall.Kill(-pgid, sig)
+		return syscall.Kill(-pgid, sig)
 	}
 
 	select {
@@ -74,21 +85,43 @@ func Run(ctx context.Context, spec JobSpec, sink io.Writer) Result {
 		// a job that finished in the same instant we observed cancellation
 		// could otherwise be mislabelled as killed. Whatever cmd.Wait() sent
 		// is still sitting unclaimed in the buffered channel — nothing else
-		// reads it — so this non-blocking re-check reliably catches it.
-		select {
-		case err := <-waitErr:
-			return finish(err)
-		default:
+		// reads it — so a re-check reliably catches it once our own Wait()
+		// goroutine has actually been scheduled to observe it. Give that
+		// goroutine every realistic chance to catch up before we commit to
+		// treating this as a live signal target: under normal scheduling
+		// this loop exits on its first or second spin, but it bounds how
+		// long we wait rather than trusting timing blindly.
+		for spins := 0; spins < 200; spins++ {
+			select {
+			case err := <-waitErr:
+				return finish(err)
+			default:
+			}
+			runtime.Gosched()
 		}
 
 		cancelReason := "cancelled"
-		killGroup(syscall.SIGTERM)
+		// Whether this run counts as cancelled hinges on whether SIGTERM
+		// actually reached a live process, not on how it chose to react. A
+		// single-process job that traps SIGTERM and exits 0 is still a
+		// cancelled run, not a successful one — the operator's interruption
+		// must never be recorded as a completed measurement.
+		//
+		// kill(2) alone can't tell us that: it reports success against a
+		// zombie (already exited, not yet reaped) too, since the process
+		// entry still exists even though there's no more user-space code
+		// left to receive the signal. Checking the kernel's live view of the
+		// leader directly, immediately before signalling, catches that
+		// window; nothing can close it to zero (there is always some gap
+		// between a check and a syscall), but keeping the check to a single
+		// pread on an already-open fd keeps that gap as tight as possible.
+		delivered := processIsReachable(statFile) && killGroup(syscall.SIGTERM) == nil
 
 		var err error
 		select {
 		case err = <-waitErr:
 		case <-time.After(grace):
-			killGroup(syscall.SIGKILL)
+			_ = killGroup(syscall.SIGKILL)
 			err = <-waitErr
 		}
 
@@ -101,30 +134,52 @@ func Run(ctx context.Context, spec JobSpec, sink io.Writer) Result {
 		// say so honestly if something still won't die.
 		stragglers := groupAlive(pgid)
 		if stragglers {
-			killGroup(syscall.SIGKILL)
+			_ = killGroup(syscall.SIGKILL)
 			if !awaitGroupExit(pgid, stragglerWait) {
 				cancelReason = "cancelled; survivors remained after SIGKILL"
 			}
 		}
 
-		switch {
-		case res.Killed:
-			// The leader itself died on our signal; that is the
-			// authoritative, more useful reason for why this job ended.
-			res.Reason = cancelReason
-		case stragglers:
-			// The leader happened to exit cleanly on its own — a benign
-			// race between its own completion and our SIGTERM — but the
-			// group still had members we had to reap forcibly. That is
-			// still an intervention worth reporting as a kill.
+		if delivered || stragglers {
+			// SIGTERM reached at least one member of the group (or a
+			// straggler needed forcing out after the fact): this run was
+			// cancelled. Keep the real ExitCode from the wait status, but
+			// the label belongs to us, not to whatever exit path the
+			// process happened to take.
 			res.Killed = true
 			res.Reason = cancelReason
 		}
-		// Otherwise the job simply finished on its own in the window
-		// between cancellation and our first signal: report the real
-		// outcome rather than a cancellation that never actually landed.
+		// Otherwise the process had already exited by the time the signal
+		// went out and nothing in the group was left to reach: report the
+		// real outcome rather than a cancellation that never landed.
 		return res
 	}
+}
+
+// processIsReachable reports whether the leader (whose already-open
+// /proc/<pid>/stat handle is f) is still a live, signal-receiving process:
+// neither fully reaped already (f is nil — the open at Start() time raced
+// with an implausibly fast exit) nor sitting as a zombie (exited, awaiting
+// reap, no more user-space code left to run). Either state means a signal
+// sent to it has no real effect, even though kill(2) itself may still report
+// success against a zombie.
+func processIsReachable(f *os.File) bool {
+	if f == nil {
+		return false
+	}
+	var buf [256]byte
+	n, err := f.ReadAt(buf[:], 0)
+	if err != nil && n == 0 {
+		return false
+	}
+	// Format: "pid (comm) state ...". comm may itself contain spaces or
+	// parentheses, so the state field is whatever follows the LAST ')'.
+	s := string(buf[:n])
+	i := strings.LastIndexByte(s, ')')
+	if i < 0 || i+2 >= len(s) {
+		return false
+	}
+	return s[i+2] != 'Z'
 }
 
 // groupAlive reports whether any process still belongs to the process group
