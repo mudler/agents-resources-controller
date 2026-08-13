@@ -79,7 +79,11 @@ func (s *Store) subscribe(jobID string) (chan struct{}, func()) {
 				out = append(out, c)
 			}
 		}
-		s.listeners[jobID] = out
+		if len(out) == 0 {
+			delete(s.listeners, jobID)
+		} else {
+			s.listeners[jobID] = out
+		}
 	}
 }
 
@@ -97,6 +101,11 @@ func (s *Store) Read(jobID string) ([]byte, error) {
 
 // Follow streams the file from the beginning and then tails it. The returned
 // channel closes when done closes, the context ends, or the file is unreadable.
+//
+// The caller MUST either read the returned channel until it closes, or cancel ctx.
+// done signals that no further writes will occur (the job ended).
+// Abandoning the channel without cancelling ctx leaks the goroutine and its file handle.
+// Closing done is not a substitute for cancelling ctx.
 func (s *Store) Follow(ctx context.Context, jobID string, done <-chan struct{}) (<-chan []byte, error) {
 	p, err := s.path(jobID)
 	if err != nil {
