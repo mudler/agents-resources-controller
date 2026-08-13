@@ -8,6 +8,8 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -47,9 +49,15 @@ func New(cfg Config) *Worker {
 // already running to actually finish and report before giving up on them. It
 // must comfortably cover Run's own worst case (SIGTERM, up to GraceCeiling —
 // default 10s — then SIGKILL, then up to a couple of seconds for a stubborn
-// process-group straggler) plus the terminal report's retry budget, or a
-// routine shutdown would itself trigger the "abandoned job" path this exists
-// to avoid.
+// process-group straggler: ~12s total) plus the terminal report's retry
+// budget — bounded to ~28s worst case by terminalReportAttemptTimeout, see
+// that constant for the arithmetic — for ~40s total, or a routine shutdown
+// would itself trigger the "abandoned job" path this exists to avoid. That
+// retry budget is only a real bound because each attempt has its own
+// timeout: without terminalReportAttemptTimeout, a blackholed controller
+// (connection accepted, nothing ever comes back) could let a single attempt
+// run for w's full 2-minute http.Client timeout, and five of those blow
+// through this 45s many times over.
 const shutdownGrace = 45 * time.Second
 
 func (w *Worker) Start(ctx context.Context) error {
@@ -84,6 +92,30 @@ func (w *Worker) Start(ctx context.Context) error {
 		}
 	}
 	return ctx.Err()
+}
+
+// cudaDeviceIndex derives a CUDA_VISIBLE_DEVICES value from a device ID of
+// the form "host:name" by taking the trailing run of digits off the NAME —
+// "gpubox:gpu1" yields ("1", true). A name with no trailing digits (or a
+// malformed ID with no ":") yields ("", false): silently setting a wrong
+// index would be worse than leaving the variable unset.
+func cudaDeviceIndex(deviceID string) (string, bool) {
+	_, name, ok := strings.Cut(deviceID, ":")
+	if !ok || name == "" {
+		return "", false
+	}
+	i := len(name)
+	for i > 0 && name[i-1] >= '0' && name[i-1] <= '9' {
+		i--
+	}
+	if i == len(name) {
+		return "", false // no trailing digits
+	}
+	digits := name[i:]
+	if _, err := strconv.Atoi(digits); err != nil {
+		return "", false
+	}
+	return digits, true
 }
 
 func (w *Worker) do(ctx context.Context, method, path string, body io.Reader) (*http.Response, error) {
@@ -138,6 +170,16 @@ func (w *Worker) heartbeatLoop(ctx context.Context) {
 	}
 }
 
+// minPollInterval floors the gap between successive polls when the previous
+// one returned no work and no error. A conforming controller already blocks
+// for close to PollWait before answering empty-handed, so this is normally a
+// no-op. It exists for a non-conforming controller or a proxy in front of it
+// that answers the long-poll instantly: without a floor here, pollLoop would
+// spin as fast as the network round trip allows — thousands of requests per
+// second at the controller from a single worker, enough for one misbehaving
+// proxy to stall scheduling fleet-wide rather than just for this one worker.
+const minPollInterval = 250 * time.Millisecond
+
 // pollLoop long-polls for work. A failed poll is retried: the controller being
 // down must never abandon jobs already running here.
 func (w *Worker) pollLoop(ctx context.Context) {
@@ -152,6 +194,14 @@ func (w *Worker) pollLoop(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-time.After(2 * time.Second):
+			}
+			continue
+		}
+		if len(assignments) == 0 {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(minPollInterval):
 			}
 			continue
 		}
@@ -236,6 +286,19 @@ func (w *Worker) execute(ctx context.Context, a assignment) {
 	}
 	env["RC_JOB_ID"] = a.JobID
 	env["RC_DEVICE"] = a.DeviceID
+	// Scheduling a device is meaningless if the process is free to touch
+	// every GPU on the box (the exact OOM this project exists to prevent on
+	// a multi-GPU host). The convention, documented in the README: the index
+	// is the trailing integer of the device NAME, the part after "host:" —
+	// "gpubox:gpu1" yields "1". A name with no trailing integer sets
+	// nothing rather than guess wrong, and an operator-supplied value that
+	// already arrived in the job's env (checked above via a.Env) is never
+	// overridden.
+	if _, set := env["CUDA_VISIBLE_DEVICES"]; !set {
+		if idx, ok := cudaDeviceIndex(a.DeviceID); ok {
+			env["CUDA_VISIBLE_DEVICES"] = idx
+		}
+	}
 
 	sink := &logSink{w: w, jobID: a.JobID, ctx: reportCtx}
 	res := Run(jobCtx, JobSpec{Command: a.Command, Cwd: a.Cwd, Env: env}, sink)
@@ -267,10 +330,30 @@ func (w *Worker) execute(ctx context.Context, a assignment) {
 // bounded, logged failure for that risk.
 const terminalReportAttempts = 5
 
+// terminalReportAttemptTimeout bounds a SINGLE terminal-report HTTP call.
+// w's http.Client has a 2-minute Timeout (see New) sized for ordinary log
+// streaming, but a blackholed controller — TCP accepted, nothing ever comes
+// back, unlike a refused connection which fails in milliseconds — would let
+// one stuck attempt consume up to that full 2 minutes on its own. With 5
+// attempts that is up to 10 minutes, which does not fit inside Start's 45s
+// shutdownGrace no matter how the backoff is tuned. Capping each attempt
+// here, not the retry loop as a whole, is what actually makes shutdownGrace's
+// comment about covering "the terminal report's retry budget" true: worst
+// case is terminalReportAttempts*terminalReportAttemptTimeout plus the
+// backoff between them (5*5s + ~3s ≈ 28s), comfortably inside 45s alongside
+// Run's own worst-case kill sequence (~12s).
+//
+// A var, not a const, solely so an internal test can shrink it and prove the
+// bound is real without actually waiting on a blackholed connection.
+var terminalReportAttemptTimeout = 5 * time.Second
+
 func (w *Worker) reportTerminalWithRetry(ctx context.Context, jobID string, body map[string]any) {
 	backoff := 200 * time.Millisecond
 	for attempt := 1; attempt <= terminalReportAttempts; attempt++ {
-		if w.report(ctx, jobID, body) {
+		attemptCtx, cancel := context.WithTimeout(ctx, terminalReportAttemptTimeout)
+		ok := w.report(attemptCtx, jobID, body)
+		cancel()
+		if ok {
 			return
 		}
 		if attempt == terminalReportAttempts {

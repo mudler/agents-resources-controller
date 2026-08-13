@@ -11,14 +11,20 @@ import (
 	"github.com/mudler/resource-controller/internal/store"
 )
 
+// SubmitRequest deliberately has no lease-TTL field: stage 1 enforces no
+// expiry (watchdogs arrive in a later stage — see the design doc's staging
+// section), and the store's leases.expires_at column is written with an
+// internal default that nothing reads yet. Advertising a lease_ttl_seconds
+// knob on the wire that silently did nothing was worse than not having the
+// knob; the internal column and default stay, ready for the stage that
+// actually enforces them.
 type SubmitRequest struct {
-	DeviceID        string            `json:"device_id"`
-	Command         []string          `json:"command"`
-	Cwd             string            `json:"cwd,omitempty"`
-	Env             map[string]string `json:"env,omitempty"`
-	Submitter       string            `json:"submitter"`
-	IdempotencyKey  string            `json:"idempotency_key,omitempty"`
-	LeaseTTLSeconds int               `json:"lease_ttl_seconds,omitempty"`
+	DeviceID       string            `json:"device_id"`
+	Command        []string          `json:"command"`
+	Cwd            string            `json:"cwd,omitempty"`
+	Env            map[string]string `json:"env,omitempty"`
+	Submitter      string            `json:"submitter"`
+	IdempotencyKey string            `json:"idempotency_key,omitempty"`
 }
 
 type DeviceView struct {
@@ -55,10 +61,12 @@ func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ttl := time.Duration(req.LeaseTTLSeconds) * time.Second
+	// LeaseTTL is left zero: Allocate applies its own internal default (see
+	// store.AllocateRequest.LeaseTTL). Stage 1 has no expiry enforcement, so
+	// there is nothing for a client-supplied value to control yet.
 	job, err := s.cfg.Store.Allocate(store.AllocateRequest{
 		DeviceID: req.DeviceID, Command: req.Command, Cwd: req.Cwd, Env: req.Env,
-		Submitter: req.Submitter, IdempotencyKey: req.IdempotencyKey, LeaseTTL: ttl,
+		Submitter: req.Submitter, IdempotencyKey: req.IdempotencyKey,
 	})
 	if errors.Is(err, store.ErrNoDevice) {
 		// No queue in stage 1: say so immediately rather than block.

@@ -88,6 +88,17 @@ orphaned process from that process isn't still pinning it. Clearing it is
 the same explicit `POST /v1/devices/{id}/clear` used for any other
 unhealthy device.
 
+The job's environment receives `RC_JOB_ID` and `RC_DEVICE` (the assigned
+device ID), plus `CUDA_VISIBLE_DEVICES` derived by convention: **device
+names should end in the GPU's index**, e.g. `gpu0`, `gpu1`. The worker takes
+the trailing integer off the device name (the part after `host:`), so a job
+assigned `gpubox:gpu1` runs with `CUDA_VISIBLE_DEVICES=1`. If a device's
+name has no trailing integer, the worker leaves `CUDA_VISIBLE_DEVICES`
+unset rather than guess wrong — silently setting the wrong index would let a
+job touch a GPU it was never leased, which is worse than setting nothing. An
+operator-supplied `CUDA_VISIBLE_DEVICES` already present in the job's own
+`env` is never overridden.
+
 ## Client
 
 ```sh

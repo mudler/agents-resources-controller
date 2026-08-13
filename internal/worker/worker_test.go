@@ -1,6 +1,7 @@
 package worker_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -338,6 +339,186 @@ func TestTerminalReportIsRetriedOnServerError(t *testing.T) {
 		defer mu.Unlock()
 		return attempts >= 2
 	}, 10*time.Second, 50*time.Millisecond, "terminal report must be retried after a 500")
+}
+
+// TestCUDAVisibleDevicesIsSetFromTheDeviceName guards the fix for the
+// review finding that CUDA_VISIBLE_DEVICES was never set at all: on a
+// multi-GPU host a job leased gpu1 would see every GPU, defeating the whole
+// point of leasing a specific device. The convention is the trailing
+// integer of the device NAME (the part after "host:"); a device with no
+// trailing integer must leave the variable unset rather than guess wrong,
+// and an operator-supplied value already present in the job's env must
+// never be overridden. Each case's job command prints exactly one line
+// naming what it sees, so the assertion never depends on parsing a full
+// environment dump.
+func TestCUDAVisibleDevicesIsSetFromTheDeviceName(t *testing.T) {
+	const unsetMarker = "__UNSET__"
+
+	tests := []struct {
+		name     string
+		deviceID string
+		jobEnv   map[string]string
+		want     string
+	}{
+		{
+			name:     "trailing index sets CUDA_VISIBLE_DEVICES",
+			deviceID: "gpubox:gpu1",
+			want:     "1",
+		},
+		{
+			name:     "no trailing index leaves it unset",
+			deviceID: "gpubox:mydevice",
+			want:     unsetMarker,
+		},
+		{
+			name:     "operator-supplied value is preserved, not overridden",
+			deviceID: "gpubox:gpu1",
+			jobEnv:   map[string]string{"CUDA_VISIBLE_DEVICES": "0,1"},
+			want:     "0,1",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var (
+				mu     sync.Mutex
+				logs   []byte
+				served bool
+			)
+
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.URL.Path == "/v1/workers/register":
+					json.NewEncoder(w).Encode(map[string]string{"worker_id": "w1"})
+
+				case r.URL.Path == "/v1/workers/w1/assignments":
+					mu.Lock()
+					first := !served
+					served = true
+					mu.Unlock()
+					if !first {
+						w.WriteHeader(http.StatusNoContent)
+						return
+					}
+					out := map[string]any{
+						"job_id":    "job1",
+						"device_id": tc.deviceID,
+						"command":   []string{"sh", "-c", "echo CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-" + unsetMarker + "}"},
+					}
+					if len(tc.jobEnv) > 0 {
+						out["env"] = tc.jobEnv
+					}
+					json.NewEncoder(w).Encode([]map[string]any{out})
+
+				case r.URL.Path == "/v1/workers/w1/heartbeat":
+					w.WriteHeader(http.StatusOK)
+
+				case r.URL.Path == "/v1/jobs/job1/logs":
+					buf := make([]byte, 4096)
+					n, _ := r.Body.Read(buf)
+					mu.Lock()
+					logs = append(logs, buf[:n]...)
+					mu.Unlock()
+					w.WriteHeader(http.StatusOK)
+
+				case r.URL.Path == "/v1/jobs/job1/status":
+					w.WriteHeader(http.StatusOK)
+
+				default:
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			defer ts.Close()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
+			wk := worker.New(worker.Config{
+				ControllerURL:     ts.URL,
+				Host:              "gpubox",
+				Devices:           []string{"gpu0"},
+				HeartbeatInterval: 500 * time.Millisecond,
+				PollWait:          50 * time.Millisecond,
+			})
+			go func() { _ = wk.Start(ctx) }()
+
+			require.Eventually(t, func() bool {
+				mu.Lock()
+				defer mu.Unlock()
+				return bytes.Contains(logs, []byte("CUDA_VISIBLE_DEVICES="))
+			}, 10*time.Second, 50*time.Millisecond)
+
+			mu.Lock()
+			defer mu.Unlock()
+			require.Contains(t, string(logs), "CUDA_VISIBLE_DEVICES="+tc.want)
+		})
+	}
+}
+
+// TestPollLoopFloorsDelayAgainstMisbehavingController guards the fix for the
+// review finding that a non-conforming controller (or a proxy in front of
+// it) which answers the long-poll instantly, instead of blocking for
+// roughly PollWait, can turn a single worker's poll loop into thousands of
+// requests per second — busy-looping the controller and stalling scheduling
+// fleet-wide, not just for this one worker. A conforming controller with a
+// real wait= parameter is unaffected: this floor only bites when polls
+// return instantly.
+func TestPollLoopFloorsDelayAgainstMisbehavingController(t *testing.T) {
+	var (
+		mu    sync.Mutex
+		polls int
+	)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/v1/workers/register":
+			json.NewEncoder(w).Encode(map[string]string{"worker_id": "w1"})
+
+		case r.URL.Path == "/v1/workers/w1/assignments":
+			mu.Lock()
+			polls++
+			mu.Unlock()
+			// Misbehaving: ignores wait= and answers empty-handed instantly,
+			// the way a non-conforming controller or an interfering proxy
+			// might.
+			json.NewEncoder(w).Encode([]map[string]any{})
+
+		case r.URL.Path == "/v1/workers/w1/heartbeat":
+			w.WriteHeader(http.StatusOK)
+
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer ts.Close()
+
+	const window = 1200 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), window)
+	defer cancel()
+
+	wk := worker.New(worker.Config{
+		ControllerURL:     ts.URL,
+		Host:              "gpubox",
+		Devices:           []string{"gpu0"},
+		HeartbeatInterval: time.Second,
+		PollWait:          10 * time.Millisecond, // irrelevant: the fake controller ignores it anyway
+	})
+	go func() { _ = wk.Start(ctx) }()
+
+	<-ctx.Done()
+	time.Sleep(100 * time.Millisecond) // let any poll already in flight land
+
+	mu.Lock()
+	n := polls
+	mu.Unlock()
+
+	// With no floor, this fake controller's near-zero response latency lets
+	// pollLoop spin at network-round-trip speed — hundreds to thousands of
+	// requests in ~1.2s on a local httptest server. With the 250ms floor,
+	// ~1.2s / 250ms caps it at roughly 5, plus a little slack for scheduling
+	// jitter and the request already in flight when the window closed.
+	require.Less(t, n, 20,
+		"a misbehaving controller that never blocks the long-poll must not be hammered thousands of times per second by a single worker; got %d polls in %s", n, window)
 }
 
 // TestStatusReportsIncludeWorkerID guards the ownership invariant the
