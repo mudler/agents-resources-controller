@@ -8,9 +8,9 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/mudler/resource-controller/internal/clock"
-	"github.com/mudler/resource-controller/internal/logstore"
-	"github.com/mudler/resource-controller/internal/store"
+	"github.com/mudler/agents-resources-controller/internal/clock"
+	"github.com/mudler/agents-resources-controller/internal/logstore"
+	"github.com/mudler/agents-resources-controller/internal/store"
 )
 
 type Config struct {

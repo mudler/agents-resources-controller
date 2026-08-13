@@ -11,10 +11,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/mudler/resource-controller/internal/clock"
-	"github.com/mudler/resource-controller/internal/logstore"
-	"github.com/mudler/resource-controller/internal/server"
-	"github.com/mudler/resource-controller/internal/store"
+	"github.com/mudler/agents-resources-controller/internal/clock"
+	"github.com/mudler/agents-resources-controller/internal/logstore"
+	"github.com/mudler/agents-resources-controller/internal/server"
+	"github.com/mudler/agents-resources-controller/internal/store"
 	"github.com/spf13/cobra"
 )
 

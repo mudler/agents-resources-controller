@@ -11,8 +11,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/mudler/resource-controller/internal/client"
-	"github.com/mudler/resource-controller/internal/model"
+	"github.com/mudler/agents-resources-controller/internal/client"
+	"github.com/mudler/agents-resources-controller/internal/model"
 	"github.com/spf13/cobra"
 )
 

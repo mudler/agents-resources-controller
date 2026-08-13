@@ -12,11 +12,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mudler/resource-controller/internal/clock"
-	"github.com/mudler/resource-controller/internal/logstore"
-	"github.com/mudler/resource-controller/internal/model"
-	"github.com/mudler/resource-controller/internal/server"
-	"github.com/mudler/resource-controller/internal/store"
+	"github.com/mudler/agents-resources-controller/internal/clock"
+	"github.com/mudler/agents-resources-controller/internal/logstore"
+	"github.com/mudler/agents-resources-controller/internal/model"
+	"github.com/mudler/agents-resources-controller/internal/server"
+	"github.com/mudler/agents-resources-controller/internal/store"
 	"github.com/stretchr/testify/require"
 )
 

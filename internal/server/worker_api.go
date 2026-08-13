@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/mudler/resource-controller/internal/model"
+	"github.com/mudler/agents-resources-controller/internal/model"
 )
 
 // maxLogChunk bounds a single log upload. A worker whose chunk exceeds this

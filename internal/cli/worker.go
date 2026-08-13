@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 
-	"github.com/mudler/resource-controller/internal/worker"
+	"github.com/mudler/agents-resources-controller/internal/worker"
 	"github.com/spf13/cobra"
 )
 

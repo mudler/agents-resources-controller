@@ -1,4 +1,4 @@
-module github.com/mudler/resource-controller
+module github.com/mudler/agents-resources-controller
 
 go 1.26.1
 

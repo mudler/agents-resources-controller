@@ -11,8 +11,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/mudler/resource-controller/internal/model"
-	"github.com/mudler/resource-controller/internal/server"
+	"github.com/mudler/agents-resources-controller/internal/model"
+	"github.com/mudler/agents-resources-controller/internal/server"
 )
 
 // ErrNoDevice mirrors the controller's 409: nothing free right now. Stage 1

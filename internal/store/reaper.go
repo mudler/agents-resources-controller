@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/mudler/resource-controller/internal/model"
+	"github.com/mudler/agents-resources-controller/internal/model"
 )
 
 type SweepResult struct {
