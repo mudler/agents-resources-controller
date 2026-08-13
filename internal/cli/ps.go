@@ -4,32 +4,30 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"os"
 	"strings"
 	"text/tabwriter"
 	"time"
 
 	"github.com/mudler/resource-controller/internal/client"
-	"github.com/mudler/resource-controller/internal/model"
 	"github.com/mudler/resource-controller/internal/server"
 	"github.com/spf13/cobra"
 )
 
 // RenderDevices prints the fleet as a table. Heartbeat age is shown for any
-// device that is not reporting, because a silent worker looks identical to a
-// healthy one otherwise.
+// device whose worker has gone quiet for longer than HeartbeatGrace,
+// regardless of the device's own state — a device can be marked unhealthy,
+// have the network partition heal, and start heartbeating again well before
+// anyone runs `rc devices clear`; annotating it "no contact 0s" forever in
+// that window would contradict the freshest information this command has.
 func RenderDevices(w io.Writer, views []server.DeviceView) {
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
 	fmt.Fprintln(tw, "DEVICE\tSTATE\tHOLDER\tELAPSED\tCOMMAND")
 
 	for _, v := range views {
 		state := string(v.Device.State)
-		if v.Device.State != model.DeviceReady && v.Device.State != model.DeviceBusy {
-			state = fmt.Sprintf("%s (no contact %s)", state,
-				time.Duration(v.HeartbeatAgeSeconds)*time.Second)
-		} else if v.HeartbeatAgeSeconds > 30 {
-			state = fmt.Sprintf("%s (no contact %s)", state,
-				time.Duration(v.HeartbeatAgeSeconds)*time.Second)
+		age := time.Duration(v.HeartbeatAgeSeconds) * time.Second
+		if age > HeartbeatGrace {
+			state = fmt.Sprintf("%s (no contact %s)", state, age)
 		}
 
 		holder, elapsed, command := "-", "-", "-"
@@ -58,11 +56,11 @@ func NewDevicesCmd() *cobra.Command {
 				return err
 			}
 			if asJSON {
-				enc := json.NewEncoder(os.Stdout)
+				enc := json.NewEncoder(cmd.OutOrStdout())
 				enc.SetIndent("", "  ")
 				return enc.Encode(state.Devices)
 			}
-			RenderDevices(os.Stdout, state.Devices)
+			RenderDevices(cmd.OutOrStdout(), state.Devices)
 			return nil
 		},
 	}
@@ -80,7 +78,7 @@ func NewPsCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+			tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 4, 2, ' ', 0)
 			fmt.Fprintln(tw, "JOB\tDEVICE\tSTATE\tSUBMITTER\tCOMMAND")
 			for _, j := range state.Jobs {
 				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n",

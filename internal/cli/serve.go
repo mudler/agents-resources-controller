@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mudler/resource-controller/internal/clock"
@@ -16,6 +17,12 @@ import (
 	"github.com/mudler/resource-controller/internal/store"
 	"github.com/spf13/cobra"
 )
+
+// HeartbeatGrace is how long a device's worker may go without heartbeating
+// before it is treated as out of contact. It gates both the reaper's Sweep
+// threshold below and rc devices' "no contact" annotation (internal/cli/ps.go)
+// so the two thresholds cannot silently drift apart.
+const HeartbeatGrace = 30 * time.Second
 
 func NewServeCmd() *cobra.Command {
 	var (
@@ -51,7 +58,16 @@ func NewServeCmd() *cobra.Command {
 
 			// The reaper: silent workers lose their devices to unknown, then
 			// unhealthy. Nothing here ever promotes a device to ready.
+			//
+			// reaperDone is joined before RunE returns (and st.Close() runs via
+			// the defer above): without it, a sweep already in flight when the
+			// context is cancelled can still be running — or a new tick can
+			// still fire — after the store is closed, logging a spurious
+			// "sql: database is closed" on shutdown.
+			var reaperWG sync.WaitGroup
+			reaperWG.Add(1)
 			go func() {
+				defer reaperWG.Done()
 				t := time.NewTicker(10 * time.Second)
 				defer t.Stop()
 				for {
@@ -59,7 +75,7 @@ func NewServeCmd() *cobra.Command {
 					case <-cmd.Context().Done():
 						return
 					case <-t.C:
-						res, err := st.Sweep(30*time.Second, 5*time.Minute)
+						res, err := st.Sweep(HeartbeatGrace, 5*time.Minute)
 						if err != nil {
 							slog.Error("sweep", "err", err)
 							continue
@@ -71,6 +87,7 @@ func NewServeCmd() *cobra.Command {
 					}
 				}
 			}()
+			defer reaperWG.Wait()
 
 			httpSrv := &http.Server{Addr: addr, Handler: srv.Handler()}
 			go func() {
@@ -93,7 +110,12 @@ func NewServeCmd() *cobra.Command {
 	return cmd
 }
 
-// loadTokens reads RC_TOKENS as "token:role,token:role".
+// loadTokens reads RC_TOKENS as "token:role,token:role". It rejects anything
+// that would make the resulting policy something other than what the
+// operator literally wrote: a malformed entry, an unknown role, an empty
+// token, or a token repeated with a second (possibly different, possibly
+// higher-privileged) role. A silently-dropped or silently-overwritten entry
+// is an auth policy nobody actually reviewed.
 func loadTokens() (map[string]string, error) {
 	raw := os.Getenv("RC_TOKENS")
 	if raw == "" {
@@ -105,10 +127,16 @@ func loadTokens() (map[string]string, error) {
 		if !ok {
 			return nil, fmt.Errorf("malformed RC_TOKENS entry %q", pair)
 		}
+		if token == "" {
+			return nil, fmt.Errorf("empty token in RC_TOKENS entry %q", pair)
+		}
 		switch role {
 		case "worker", "client", "admin":
 		default:
 			return nil, fmt.Errorf("unknown role %q in RC_TOKENS", role)
+		}
+		if _, dup := tokens[token]; dup {
+			return nil, fmt.Errorf("duplicate token %q in RC_TOKENS", token)
 		}
 		tokens[token] = role
 	}
