@@ -1,9 +1,12 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/mudler/resource-controller/internal/cli"
 	"github.com/spf13/cobra"
@@ -16,9 +19,13 @@ func main() {
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
-	root.AddCommand(cli.NewRunCmd())
+	root.AddCommand(cli.NewRunCmd(), cli.NewPsCmd(), cli.NewDevicesCmd(),
+		cli.NewServeCmd(), cli.NewWorkerCmd())
 
-	if err := root.Execute(); err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if err := root.ExecuteContext(ctx); err != nil {
 		var coded interface{ ExitCode() int }
 		if errors.As(err, &coded) {
 			os.Exit(coded.ExitCode())
