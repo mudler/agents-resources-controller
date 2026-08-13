@@ -5,11 +5,16 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/mudler/resource-controller/internal/client"
+	"github.com/mudler/resource-controller/internal/model"
 	"github.com/stretchr/testify/require"
 )
+
+func intPtr(i int) *int { return &i }
 
 func TestSubmitReturnsErrNoDeviceOn409(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -28,9 +33,15 @@ func TestSubmitReturnsErrNoDeviceOn409(t *testing.T) {
 }
 
 func TestSubmitSendsBearerToken(t *testing.T) {
-	var gotAuth string
+	// The handler runs on a goroutine spawned by net/http's server loop. A
+	// bare `var gotAuth string` written there and read from the test
+	// goroutine after Submit returns is a data race as far as -race is
+	// concerned: nothing in that pair synchronizes through a primitive the
+	// race detector tracks (network I/O completing isn't one). A buffered
+	// channel send/receive is, so use that instead.
+	authCh := make(chan string, 1)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotAuth = r.Header.Get("Authorization")
+		authCh <- r.Header.Get("Authorization")
 		w.WriteHeader(http.StatusCreated)
 		json.NewEncoder(w).Encode(map[string]any{"id": "job1", "state": "assigned"})
 	}))
@@ -42,5 +53,48 @@ func TestSubmitSendsBearerToken(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Equal(t, "job1", job.ID)
-	require.Equal(t, "Bearer ctok", gotAuth)
+
+	select {
+	case gotAuth := <-authCh:
+		require.Equal(t, "Bearer ctok", gotAuth)
+	case <-time.After(time.Second):
+		t.Fatal("handler was never invoked")
+	}
+}
+
+func TestWaitTerminalGivesUpWithClearError(t *testing.T) {
+	// The job never leaves "assigned" — e.g. no worker ever attached to
+	// the device — so WaitTerminal must give up rather than poll forever.
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(model.Job{ID: "job1", State: model.JobAssigned})
+	}))
+	defer ts.Close()
+
+	c := client.New(ts.URL, "tok")
+	start := time.Now()
+	_, err := c.WaitTerminal(context.Background(), "job1", 300*time.Millisecond)
+	elapsed := time.Since(start)
+
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "job1")
+	require.Contains(t, err.Error(), "assigned")
+	require.Less(t, elapsed, 3*time.Second, "WaitTerminal must give up promptly, not hang")
+}
+
+func TestWaitTerminalToleratesTransientFailure(t *testing.T) {
+	var calls int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&calls, 1) == 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(model.Job{ID: "job1", State: model.JobSucceeded, ExitCode: intPtr(0)})
+	}))
+	defer ts.Close()
+
+	c := client.New(ts.URL, "tok")
+	job, err := c.WaitTerminal(context.Background(), "job1", 5*time.Second)
+	require.NoError(t, err)
+	require.Equal(t, model.JobSucceeded, job.State)
+	require.GreaterOrEqual(t, atomic.LoadInt32(&calls), int32(2))
 }

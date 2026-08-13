@@ -126,22 +126,80 @@ func (c *Client) State(ctx context.Context) (*server.StateResponse, error) {
 	return &state, nil
 }
 
-// WaitTerminal polls until the job reaches a terminal state.
-func (c *Client) WaitTerminal(ctx context.Context, id string) (*model.Job, error) {
+const (
+	pollInterval = 500 * time.Millisecond
+	// pollTimeout bounds each individual state request. Without it a wedged
+	// controller connection (TCP established, nothing ever comes back) hangs
+	// the whole call, since the client's http.Client deliberately has no
+	// global timeout.
+	pollTimeout = 10 * time.Second
+	// maxPollFailures tolerates a short run of transient errors (a dropped
+	// connection, a 500) without giving up on a job that may still be
+	// running perfectly fine. It resets on every successful poll.
+	maxPollFailures = 5
+)
+
+// WaitTerminal polls until the job reaches a terminal state. maxWait bounds
+// the whole call so a job stuck in "assigned" (no worker ever attached) or a
+// controller that stops responding cannot hang it forever; pass 0 for no
+// bound. On giveup — either the overall bound or too many consecutive poll
+// failures — the returned error names the job and its last known state
+// rather than leaving the caller with a bare timeout.
+func (c *Client) WaitTerminal(ctx context.Context, id string, maxWait time.Duration) (*model.Job, error) {
+	overall := ctx
+	if maxWait > 0 {
+		var cancel context.CancelFunc
+		overall, cancel = context.WithTimeout(ctx, maxWait)
+		defer cancel()
+	}
+
+	var lastJob *model.Job
+	var lastErr error
+	failures := 0
+
 	for {
-		job, err := c.Job(ctx, id)
-		if err != nil {
-			return nil, err
+		pollCtx, cancel := context.WithTimeout(overall, pollTimeout)
+		job, err := c.Job(pollCtx, id)
+		cancel()
+
+		if err == nil {
+			failures = 0
+			lastJob = job
+			if job.State.Terminal() {
+				return job, nil
+			}
+		} else {
+			if ctx.Err() != nil {
+				// The caller's own context ended (e.g. rc run detaching on
+				// Ctrl-C) — that is the caller's business, not a giveup we
+				// need to explain.
+				return nil, ctx.Err()
+			}
+			failures++
+			lastErr = err
+			if failures > maxPollFailures {
+				return nil, fmt.Errorf("giving up on job %s after %d consecutive poll failures (last known state: %s): %w",
+					id, failures, lastJobState(lastJob), lastErr)
+			}
 		}
-		if job.State.Terminal() {
-			return job, nil
-		}
+
 		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(500 * time.Millisecond):
+		case <-overall.Done():
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			return nil, fmt.Errorf("timed out after %s waiting for job %s to finish (last known state: %s)",
+				maxWait, id, lastJobState(lastJob))
+		case <-time.After(pollInterval):
 		}
 	}
+}
+
+func lastJobState(job *model.Job) string {
+	if job == nil {
+		return "unknown"
+	}
+	return string(job.State)
 }
 
 func apiError(resp *http.Response) error {
