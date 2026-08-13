@@ -28,7 +28,11 @@ func (n *notifier) wait(workerID string) (chan struct{}, func()) {
 				out = append(out, c)
 			}
 		}
-		n.waiters[workerID] = out
+		if len(out) == 0 {
+			delete(n.waiters, workerID)
+		} else {
+			n.waiters[workerID] = out
+		}
 	}
 }
 

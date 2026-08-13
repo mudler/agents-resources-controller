@@ -1,6 +1,8 @@
 package server
 
 import (
+	"database/sql"
+	"errors"
 	"io"
 	"net/http"
 	"time"
@@ -8,6 +10,11 @@ import (
 	"github.com/google/uuid"
 	"github.com/mudler/resource-controller/internal/model"
 )
+
+// maxLogChunk bounds a single log upload. A worker whose chunk exceeds this
+// is told so explicitly (413) and must split and retry: silently truncating
+// a job's output would lose data without telling anyone.
+const maxLogChunk = 1 << 20
 
 type RegisterRequest struct {
 	Host    string   `json:"host"`
@@ -27,6 +34,7 @@ type Assignment struct {
 }
 
 type StatusRequest struct {
+	WorkerID string         `json:"worker_id"`
 	State    model.JobState `json:"state"`
 	ExitCode *int           `json:"exit_code,omitempty"`
 	Reason   string         `json:"reason,omitempty"`

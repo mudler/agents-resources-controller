@@ -29,10 +29,6 @@ func New(cfg Config) *Server {
 	return &Server{cfg: cfg, notify: newNotifier()}
 }
 
-type ctxKey string
-
-const roleKey ctxKey = "role"
-
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
@@ -58,9 +54,10 @@ func (s *Server) Handler() http.Handler {
 // but worker routes accept only worker and admin tokens.
 func (s *Server) require(role string, h http.HandlerFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		auth := r.Header.Get("Authorization")
+		token, hasScheme := strings.CutPrefix(auth, "Bearer ")
 		got, ok := s.cfg.Tokens[token]
-		if token == "" || !ok {
+		if !hasScheme || token == "" || !ok {
 			writeErr(w, http.StatusUnauthorized, "unauthorized", "unknown or missing token")
 			return
 		}

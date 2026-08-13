@@ -2999,7 +2999,10 @@ func (w *Worker) execute(ctx context.Context, a assignment) {
 		w.mu.Unlock()
 	}()
 
-	w.report(ctx, a.JobID, map[string]any{"state": "running"})
+	// worker_id is required: the controller rejects a status report for a job
+	// it did not assign to this worker, so one worker cannot free another's
+	// device out from under a running process.
+	w.report(ctx, a.JobID, map[string]any{"state": "running", "worker_id": w.workerID})
 
 	env := map[string]string{}
 	for k, v := range a.Env {
@@ -3019,7 +3022,7 @@ func (w *Worker) execute(ctx context.Context, a assignment) {
 	case res.Err != nil || res.ExitCode != 0:
 		state = "failed"
 	}
-	body := map[string]any{"state": state, "exit_code": res.ExitCode}
+	body := map[string]any{"state": state, "exit_code": res.ExitCode, "worker_id": w.workerID}
 	if res.Reason != "" {
 		body["reason"] = res.Reason
 	}
