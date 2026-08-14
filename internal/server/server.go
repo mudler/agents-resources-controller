@@ -30,10 +30,11 @@ type Config struct {
 type Server struct {
 	cfg    Config
 	notify *notifier
+	events *broadcaster
 }
 
 func New(cfg Config) *Server {
-	return &Server{cfg: cfg, notify: newNotifier()}
+	return &Server{cfg: cfg, notify: newNotifier(), events: newBroadcaster()}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -51,6 +52,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /v1/jobs/{id}/logs", s.require("client", s.handleStreamLogs))
 	mux.Handle("GET /v1/devices", s.require("client", s.handleDevices))
 	mux.Handle("GET /v1/state", s.require("client", s.handleState))
+	mux.Handle("GET /v1/events", s.require("client", s.handleEvents))
 
 	mux.Handle("POST /v1/devices/{id}/clear", s.require("admin", s.handleClearDevice))
 

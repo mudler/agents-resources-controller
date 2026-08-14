@@ -110,6 +110,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	s.publishDevices()
 	writeJSON(w, http.StatusOK, RegisterResponse{WorkerID: workerID})
 }
 
@@ -243,6 +244,7 @@ func (s *Server) handleJobStatus(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
 			return
 		}
+		s.publishJob(jobID, req.State)
 		w.WriteHeader(http.StatusOK)
 		return
 	}
@@ -254,5 +256,6 @@ func (s *Server) handleJobStatus(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
 		return
 	}
+	s.publishJob(jobID, req.State)
 	w.WriteHeader(http.StatusOK)
 }

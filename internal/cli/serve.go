@@ -90,6 +90,7 @@ func NewServeCmd() *cobra.Command {
 							slog.Warn("devices demoted",
 								"unhealthy", res.DevicesUnhealthy, "jobs_lost", res.JobsLost,
 								"leases_expired", res.LeasesExpired)
+							srv.Publish("devices", nil)
 						}
 					}
 				}
@@ -121,6 +122,9 @@ func NewServeCmd() *cobra.Command {
 						}
 						for _, job := range assigned {
 							srv.Poke(job.WorkerID)
+						}
+						if len(assigned) > 0 {
+							srv.Publish("jobs", nil)
 						}
 					}
 				}

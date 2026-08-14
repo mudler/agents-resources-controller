@@ -135,14 +135,17 @@ func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 				writeErr(w, http.StatusInternalServerError, "store_error", "could not read job")
 				return
 			}
+			s.publishJob(reloaded.ID, reloaded.State)
 			writeJSON(w, http.StatusCreated, reloaded)
 			return
 		}
+		s.publishJob(current.ID, model.JobKilled)
 		writeErr(w, http.StatusConflict, "no_device_available",
 			fmt.Sprintf("%s is not free", req.DeviceID))
 		return
 	}
 
+	s.publishJob(current.ID, current.State)
 	writeJSON(w, http.StatusCreated, current)
 }
 
@@ -226,6 +229,7 @@ func (s *Server) handleKill(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusConflict, "not_cancellable", "job already started")
 			return
 		}
+		s.publishJob(jobID, model.JobKilled)
 	case model.JobAssigned, model.JobRunning:
 		flagged, err := s.cfg.Store.RequestKill(jobID)
 		if err != nil {
@@ -237,6 +241,7 @@ func (s *Server) handleKill(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.notify.poke(job.WorkerID)
+		s.publishJob(jobID, job.State)
 	default:
 		writeErr(w, http.StatusConflict, "not_cancellable", "job already finished")
 		return
@@ -344,6 +349,7 @@ func (s *Server) handleClearDevice(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusConflict, "device_not_cleared", "device has a live lease and was not cleared")
 		return
 	}
+	s.publishDevices()
 	w.WriteHeader(http.StatusOK)
 }
 
