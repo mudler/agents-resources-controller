@@ -27,6 +27,10 @@ const (
 	defaultProbeDir      = "/etc/rc/probe.d"
 	defaultProbeInterval = 5 * time.Minute
 	defaultProbeTimeout  = 5 * time.Second
+
+	// defaultSheetDir is where readSheets looks for host.md and
+	// host.d/<device>.md when the operator does not set sheet_dir.
+	defaultSheetDir = "/etc/rc"
 )
 
 type Config struct {
@@ -53,6 +57,10 @@ type Config struct {
 	// one drop-in executable — before it is killed as a process group and
 	// skipped. Optional; falls back to defaultProbeTimeout.
 	ProbeTimeout time.Duration `yaml:"probe_timeout"`
+	// SheetDir is where this worker looks for its usage-sheet documentation:
+	// <SheetDir>/host.md and <SheetDir>/host.d/<device>.md. Optional; falls
+	// back to defaultSheetDir.
+	SheetDir string `yaml:"sheet_dir"`
 }
 
 // HooksConfig is the host-level default for lease lifecycle hooks. A
@@ -153,6 +161,9 @@ func (c Config) withDefaults() Config {
 	}
 	if c.ProbeTimeout <= 0 {
 		c.ProbeTimeout = defaultProbeTimeout
+	}
+	if c.SheetDir == "" {
+		c.SheetDir = defaultSheetDir
 	}
 	return c
 }
