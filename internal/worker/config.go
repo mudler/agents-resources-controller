@@ -3,9 +3,18 @@ package worker
 import (
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
+)
+
+// defaultHookTimeout and defaultReleaseLinger are the documented fallbacks
+// applied when neither the host-level "hooks:" section nor a device
+// overrides them.
+const (
+	defaultHookTimeout   = 60 * time.Second
+	defaultReleaseLinger = 30 * time.Second
 )
 
 type Config struct {
@@ -15,13 +24,38 @@ type Config struct {
 	Devices           []DeviceConfig `yaml:"devices"`
 	HeartbeatInterval time.Duration  `yaml:"heartbeat_interval"`
 	PollWait          time.Duration  `yaml:"poll_wait"`
+	// Hooks holds host-level defaults for the lifecycle hook timeout and
+	// release linger, so a multi-GPU box need not repeat them on every
+	// device. Both are optional; unset fields fall back to
+	// defaultHookTimeout / defaultReleaseLinger.
+	Hooks HooksConfig `yaml:"hooks"`
+}
+
+// HooksConfig is the host-level default for lease lifecycle hooks. A
+// per-device value (DeviceConfig.HookTimeout / ReleaseLinger) overrides it.
+type HooksConfig struct {
+	Timeout       time.Duration `yaml:"timeout"`
+	ReleaseLinger time.Duration `yaml:"release_linger"`
 }
 
 // DeviceConfig is one device this host offers. It accepts either a bare name
-// (stage 1 style) or an object with a runtime ceiling.
+// (stage 1 style) or an object with a runtime ceiling and optional lease
+// lifecycle hooks.
 type DeviceConfig struct {
 	Name       string        `yaml:"name"`
 	MaxRuntime time.Duration `yaml:"max_runtime"`
+	// OnAcquire and OnRelease are paths to scripts run (via the same
+	// process-group supervision jobs get) when this device transitions
+	// worker-side between free and held. Both are optional and
+	// independent — either, neither, or both may be set.
+	OnAcquire string `yaml:"on_acquire"`
+	OnRelease string `yaml:"on_release"`
+	// HookTimeout and ReleaseLinger override the host-level Hooks defaults
+	// for this device only. Zero means "not overridden": LoadConfig
+	// resolves each to the host default (or the built-in default, if the
+	// host declared none) once loading is complete.
+	HookTimeout   time.Duration `yaml:"timeout"`
+	ReleaseLinger time.Duration `yaml:"release_linger"`
 }
 
 func (d *DeviceConfig) UnmarshalYAML(value *yaml.Node) error {
@@ -63,7 +97,16 @@ func LoadConfig(path string) (Config, error) {
 	if len(c.Devices) == 0 {
 		return Config{}, fmt.Errorf("at least one device required in %s", path)
 	}
-	for _, d := range c.Devices {
+	hostHookTimeout := c.Hooks.Timeout
+	if hostHookTimeout <= 0 {
+		hostHookTimeout = defaultHookTimeout
+	}
+	hostReleaseLinger := c.Hooks.ReleaseLinger
+	if hostReleaseLinger <= 0 {
+		hostReleaseLinger = defaultReleaseLinger
+	}
+
+	for i, d := range c.Devices {
 		if d.Name == "" {
 			return Config{}, fmt.Errorf("device entry needs a name in %s", path)
 		}
@@ -77,6 +120,23 @@ func LoadConfig(path string) (Config, error) {
 			return Config{}, fmt.Errorf(
 				"device %q: max_runtime %s is below the one-second granularity runtime ceilings are enforced at, in %s",
 				d.Name, d.MaxRuntime, path)
+		}
+		// A hook path is optional, but if given it must actually name
+		// something: a blank or whitespace-only value is almost certainly
+		// an operator mistake (e.g. a stray quoted empty string), not an
+		// intentional "no hook". The path is deliberately NOT stat'd here —
+		// the script may legitimately not exist yet.
+		if d.OnAcquire != "" && strings.TrimSpace(d.OnAcquire) == "" {
+			return Config{}, fmt.Errorf("device %q: on_acquire must not be blank, in %s", d.Name, path)
+		}
+		if d.OnRelease != "" && strings.TrimSpace(d.OnRelease) == "" {
+			return Config{}, fmt.Errorf("device %q: on_release must not be blank, in %s", d.Name, path)
+		}
+		if d.HookTimeout <= 0 {
+			c.Devices[i].HookTimeout = hostHookTimeout
+		}
+		if d.ReleaseLinger <= 0 {
+			c.Devices[i].ReleaseLinger = hostReleaseLinger
 		}
 	}
 	if c.HeartbeatInterval <= 0 {
