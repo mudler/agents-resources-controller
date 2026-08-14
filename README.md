@@ -246,6 +246,13 @@ whole if it runs past `timeout`), with `RC_EVENT` (`acquire` or `release`),
 `RC_DEVICE`, `RC_JOB_ID`, `RC_SUBMITTER`, and `CUDA_VISIBLE_DEVICES` (derived
 the same way a job's is) in its environment.
 
+**Treat `RC_SUBMITTER` (and `RC_JOB_ID`) as untrusted input.** The submitter
+is free text chosen by whoever submitted the job; it is passed to the hook
+as an environment variable and never through a shell, so nothing is
+injectable today, but a hook that interpolates it into a shell command
+(`eval`, backticks, an unquoted `$RC_SUBMITTER` in a `sh -c` string) makes
+it one. Quote it, or better, only ever log it.
+
 **The release is lingered, not immediate, and that is what makes "held" a
 per-device state instead of a per-job event.** When a job ends, the worker
 doesn't run `on_release` right away — it arms a timer for `release_linger`
@@ -255,10 +262,27 @@ skipped: the device was never actually released, so stopping and restarting
 the service in between would be pure churn. Net effect: a burst of
 back-to-back jobs on one device produces exactly one `on_acquire` (before
 the first job touches it) and one `on_release` (once the device has
-genuinely sat idle for `release_linger`) — not one pair per job. The linger
-only delays the hook, never the next job: a queued job is scheduled and
-starts the instant the device frees up, whether or not `on_release` has run
-yet.
+genuinely sat idle for `release_linger`) — not one pair per job.
+
+The linger itself never delays scheduling: the controller frees the device
+the moment the job's terminal report lands, and a queued job is scheduled
+against it immediately, whether or not `on_release` has run yet. **A hook
+already executing does hold that device's next job up, though**, for as long
+as it runs (up to `timeout`): the worker serialises one device's hooks
+against each other, so a job landing while an `on_release` is mid-flight
+waits for it to finish before its own `on_acquire` is even considered. That
+is what makes "one acquire per burst" decidable at all — the alternative is
+an acquire and a release for the same device running at the same time,
+fighting over the same service. Devices never wait on each other; only jobs
+for the *same* device do. Keep hooks quick, and keep `timeout` no higher
+than the delay you are willing to add to a queued job.
+
+**A job whose `on_acquire` is still running when the worker is asked to stop
+(`systemctl restart rc-worker`, or `rc kill` on that job) is reported
+`killed`, not `failed`, and its device is not quarantined.** An interrupted
+hook is our own doing and says nothing about the device. Note that the
+service the hook was in the middle of stopping may be left stopped — the
+next start's reconciliation pass (below) puts it back.
 
 **An `on_acquire` failure (non-zero exit or a timeout) fails the job before
 it ever runs**, with the hook's own output as the failure reason (so it
@@ -268,6 +292,16 @@ reboot deliberately does **not** clear (see "Device host" above): a reboot
 proves no process survived, but proves nothing about failing hardware or a
 service the hook could not stop. Only an admin's explicit
 `POST /v1/devices/{id}/clear` puts it back in the pool.
+
+**A failed `on_acquire` schedules no `on_release`, and may well leave the
+service it was stopping stopped.** The hook failed somewhere — quite
+possibly after it had already stopped LocalAI — and the worker will not
+guess that it got far enough to be worth undoing: nothing is "held", so
+there is nothing to release. Since the device is quarantined at the same
+moment, no job lands on it either way. Bringing the service back is part of
+clearing the fault: run the release hook by hand, or simply restart the
+worker (its startup pass runs every declared `on_release`) once the
+underlying problem is fixed.
 
 **An `on_release` failure is logged loudly but never quarantines the
 device.** The job that held it is already done, the device is genuinely
@@ -281,7 +315,19 @@ was `kill -9`'d, or the host itself crashed) heals its own node's stopped
 service without anyone having to notice and intervene. **This is exactly
 why the release hook must be idempotent — safe to run when the service is
 already up:** the worker starting up has no way to know whether the service
-it targets is already running or not, and runs the hook regardless.
+it targets is already running or not, and runs the hook regardless. The pass
+is bounded as a whole (two minutes, across every device), so a wedged hook
+delays this worker's first poll by a known amount instead of holding up
+startup indefinitely; whatever it cuts short the next start attempts again.
+The heartbeat starts before the pass, so the controller never marks this
+worker's own devices unknown while it runs.
+
+**Stopping the worker fires any pending release before it exits.** A job
+that ended seconds before a `systemctl stop` leaves a release armed but not
+yet fired; the worker runs it on the way out (bounded, so it cannot stretch
+the drain indefinitely) rather than leaving the node with the operator's
+service stopped and no job running — a state nothing but a restart would
+heal.
 
 ## Client
 
@@ -556,4 +602,8 @@ from — still requires the header and rejects a query-string token.
   `POST /v1/devices/{id}/clear`. The failure reason itself (the hook's tail
   output) travels only in the job's own failure report, surfaced by `rc ps`;
   it is not stored on the device row, which only ever records the fixed
-  reason `fault`.
+  reason `fault`. That report is retried on the same budget as a job's
+  terminal report — it is the only thing standing between a device the hook
+  has just called unusable and the next job scheduled onto it — and a
+  device ID the controller does not know answers `404`, never a `200` the
+  worker would log as a quarantine that never happened.
