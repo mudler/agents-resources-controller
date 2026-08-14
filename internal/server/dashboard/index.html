@@ -7,12 +7,14 @@
 <style>
   :root {
     --bg:#fbfbfd; --panel:#fff; --ink:#16181d; --muted:#6b7280; --line:#e5e7eb;
-    --ready:#15803d; --busy:#b45309; --unknown:#6b7280; --unhealthy:#b91c1c;
+    --ready:#15803d; --busy:#b45309; --unknown:#7c3aed; --unhealthy:#b91c1c;
+    --unhealthy-bg:#fef2f2; --stale:#c2410c; --stale-bg:#fff7ed; --warn:#b45309;
   }
   @media (prefers-color-scheme: dark) {
     :root {
       --bg:#0f1115; --panel:#171a21; --ink:#e8eaed; --muted:#9aa1ab; --line:#262b34;
-      --ready:#4ade80; --busy:#fbbf24; --unknown:#9aa1ab; --unhealthy:#f87171;
+      --ready:#4ade80; --busy:#fbbf24; --unknown:#c4b5fd; --unhealthy:#f87171;
+      --unhealthy-bg:#2a1010; --stale:#fb923c; --stale-bg:#2a1608; --warn:#fbbf24;
     }
   }
   * { box-sizing:border-box; }
@@ -21,18 +23,33 @@
   header { display:flex; gap:12px; align-items:center; justify-content:space-between;
            padding:14px 20px; border-bottom:1px solid var(--line); }
   h1 { font-size:15px; margin:0; font-weight:600; letter-spacing:.01em; }
+  .hstat { display:flex; gap:14px; align-items:center; font-size:12px; }
   main { padding:20px; max-width:1200px; margin:0 auto; }
   h2 { font-size:12px; text-transform:uppercase; letter-spacing:.08em;
        color:var(--muted); margin:24px 0 10px; font-weight:600; }
   .grid { display:grid; gap:12px; grid-template-columns:repeat(auto-fill,minmax(280px,1fr)); }
   .card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px; }
-  .card.alert { border-color:var(--unhealthy); }
+  /* .stale (a busy device whose worker has gone quiet past the 30s grace) is
+     a middle alarm tier: louder than a healthy card — thicker border, tinted
+     background, bold text — so an operator scanning many cards cannot
+     mistake a ghost lease for a live one, but visually weaker than .alert
+     (device confirmed unhealthy) so the strongest signal stays reserved for
+     the worst state. */
+  .card.stale { border:2px solid var(--stale); background:var(--stale-bg); }
+  .card.stale .state { color:var(--stale); }
+  .card.stale .meta { color:var(--stale); font-weight:700; }
+  .card.alert { border:2px solid var(--unhealthy); background:var(--unhealthy-bg);
+                box-shadow:0 0 0 1px var(--unhealthy); }
+  .card.alert .meta { color:var(--unhealthy); font-weight:700; }
   .dev { display:flex; justify-content:space-between; align-items:baseline; gap:8px; }
   .name { font-weight:600; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
   .state { font-size:12px; font-weight:600; }
   .ready{color:var(--ready)} .busy{color:var(--busy)}
   .unknown{color:var(--unknown)} .unhealthy{color:var(--unhealthy)}
   .meta { color:var(--muted); font-size:12px; margin-top:6px; }
+  #updated { color:var(--muted); }
+  #updated.warn { color:var(--warn); font-weight:600; }
+  #updated.stale { color:var(--unhealthy); font-weight:700; }
   .cmd { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px;
          margin-top:6px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   table { width:100%; border-collapse:collapse; }
@@ -53,7 +70,10 @@
 <body>
 <header>
   <h1>resource controller</h1>
-  <span id="err"></span>
+  <div class="hstat">
+    <span id="updated"></span>
+    <span id="err"></span>
+  </div>
 </header>
 
 <div id="gate">
@@ -90,6 +110,17 @@
   var gate = document.getElementById("gate");
   var app = document.getElementById("app");
   var err = document.getElementById("err");
+  var updated = document.getElementById("updated");
+
+  // pollTimer and es are the two "keep this page live" handles. Both must be
+  // torn down whenever the page returns to the gate (rejected token) and
+  // whenever start() runs again (a corrected token after a typo): without
+  // that, each failed attempt leaves its own interval running forever,
+  // hammering /v1/state with 401s that update nothing on screen.
+  var pollTimer = null;
+  var es = null;
+  var lastFetchAt = null;
+  var freshnessTimer = null;
 
   document.getElementById("gateForm").addEventListener("submit", function (e) {
     e.preventDefault();
@@ -100,13 +131,27 @@
 
   function fail(message) { err.textContent = message; }
 
+  // stopLive tears down every timer and connection that keeps the page
+  // updating on its own. Called before (re)starting and whenever the token
+  // is rejected, so nothing outlives the session that opened it.
+  function stopLive() {
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+    if (freshnessTimer) { clearInterval(freshnessTimer); freshnessTimer = null; }
+    if (es) { es.close(); es = null; }
+  }
+
+  function returnToGate() {
+    stopLive();
+    sessionStorage.removeItem("rc_token");
+    gate.classList.remove("hide");
+    app.classList.add("hide");
+  }
+
   function fetchState() {
     return fetch("/v1/state", { headers: { Authorization: "Bearer " + token } })
       .then(function (r) {
         if (r.status === 401 || r.status === 403) {
-          sessionStorage.removeItem("rc_token");
-          gate.classList.remove("hide");
-          app.classList.add("hide");
+          returnToGate();
           throw new Error("token rejected");
         }
         if (!r.ok) throw new Error("state: " + r.status);
@@ -126,8 +171,15 @@
     (views || []).forEach(function (v) {
       var d = v.device;
       var stale = v.heartbeat_age_seconds > 30;
+      // A stale heartbeat on a device nobody holds is quiet-worrying; a
+      // stale heartbeat on a device that still lists a holder is a ghost
+      // lease — the exact "who has gpu0 right now, and has it gone quiet"
+      // question this page exists to answer. That case gets the loud
+      // .stale tier; unhealthy (worker confirmed gone, see Sweep) stays the
+      // loudest tier of all.
+      var staleHeld = stale && !!v.holder;
       var card = document.createElement("div");
-      card.className = "card" + (d.state === "unhealthy" ? " alert" : "");
+      card.className = "card" + (d.state === "unhealthy" ? " alert" : staleHeld ? " stale" : "");
 
       var head = document.createElement("div");
       head.className = "dev";
@@ -144,7 +196,7 @@
       meta.className = "meta";
       var bits = [];
       if (v.holder) bits.push("held by " + v.holder + " for " + ago(v.elapsed_seconds));
-      if (stale) bits.push("no contact " + ago(v.heartbeat_age_seconds));
+      if (stale) bits.push((staleHeld ? "⚠ no contact " : "no contact ") + ago(v.heartbeat_age_seconds));
       meta.textContent = bits.join(" · ") || "idle";
       card.appendChild(meta);
 
@@ -179,6 +231,11 @@
 
   function render(state) {
     err.textContent = "";
+    // Only reachable after fetchState() has already succeeded, so this is
+    // also the point at which we know the token is good enough to open the
+    // event stream — see connectEvents's own comment for why that ordering
+    // matters.
+    connectEvents();
     renderDevices(state.devices);
     fillTable("queue", "queueEmpty", state.queued, function (j, i) {
       return [String(i + 1), j.id.slice(0, 8), j.device_id, j.submitter, (j.command || []).join(" ")];
@@ -188,22 +245,63 @@
     });
   }
 
-  function refresh() { fetchState().then(render).catch(function (e) { fail(e.message); }); }
+  // updateFreshness renders "updated Ns ago" from the last successful
+  // fetch, independent of whether the most recent poll succeeded — a
+  // controller that has gone unreachable must not leave the page looking
+  // current. It ticks on its own timer (see start()) so the age keeps
+  // climbing even between 5s polls, and degrades visually the longer the
+  // snapshot has sat unrefreshed: this is the other half of "who has gpu0
+  // right now" — the page must admit when "right now" isn't recent.
+  function updateFreshness() {
+    if (!lastFetchAt) { updated.textContent = ""; updated.className = ""; return; }
+    var age = Math.floor((Date.now() - lastFetchAt) / 1000);
+    updated.textContent = "updated " + ago(age) + " ago";
+    updated.className = age > 30 ? "stale" : (age > 10 ? "warn" : "");
+  }
+
+  function refresh() {
+    return fetchState()
+      .then(function (state) {
+        lastFetchAt = Date.now();
+        updateFreshness();
+        render(state);
+      })
+      .catch(function (e) { fail(e.message); });
+  }
+
+  // connectEvents opens the SSE nudge only after a fetchState() call has
+  // already proven the token works: opening it eagerly (as part of start(),
+  // before the first response lands) raced the stream's own auth failure
+  // against fetchState's, and whichever settled last clobbered the other's
+  // error message on screen. Deferring it to render() — which only ever
+  // runs after a successful fetch — removes the race outright rather than
+  // papering over it with a message priority check.
+  function connectEvents() {
+    if (es) return; // already connected
+    try {
+      es = new EventSource("/v1/events?token=" + encodeURIComponent(token));
+      es.onmessage = refresh;
+      // A rejected token already produced a more specific "token rejected"
+      // message via fetchState's catch and returned to the gate (which
+      // closes this stream). If err is still empty, nothing more specific
+      // has explained the drop, so this generic message is the right one.
+      es.onerror = function () {
+        if (!err.textContent) fail("event stream dropped; polling");
+      };
+    } catch (e) { /* polling remains the fallback */ }
+  }
 
   function start() {
+    stopLive(); // re-entrant: a corrected token after a rejected one must
+                // not stack a second poller/stream on top of a leftover one
     gate.classList.add("hide");
     app.classList.remove("hide");
-    refresh();
-
-    // SSE cannot carry an Authorization header, so the stream is only a
-    // nudge: every event triggers an authenticated refetch of /v1/state.
-    try {
-      var es = new EventSource("/v1/events?token=" + encodeURIComponent(token));
-      es.onmessage = refresh;
-      es.onerror = function () { fail("event stream dropped; polling"); };
-    } catch (e) { /* polling below is the fallback */ }
-
-    setInterval(refresh, 5000);
+    lastFetchAt = null;
+    updateFreshness();
+    refresh(); // connectEvents() runs from inside render(), i.e. only once
+               // this first call actually succeeds — see its comment
+    pollTimer = setInterval(refresh, 5000);
+    freshnessTimer = setInterval(updateFreshness, 1000);
   }
 
   if (token) start();
