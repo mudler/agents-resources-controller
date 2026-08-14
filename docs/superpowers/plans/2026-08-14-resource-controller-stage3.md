@@ -458,7 +458,6 @@ package store_test
 
 import (
 	"testing"
-	"time"
 
 	"github.com/mudler/agents-resources-controller/internal/model"
 	"github.com/stretchr/testify/require"
@@ -547,8 +546,6 @@ func TestLabelSnapshotCoversEveryDevice(t *testing.T) {
 	snap, err := s.LabelSnapshot()
 	require.NoError(t, err)
 	require.Contains(t, snap, "gpubox:gpu0")
-
-	_ = time.Second
 }
 ```
 
@@ -922,10 +919,13 @@ In `ScheduleOnce`, replace the single-device attempt with a candidate list:
 			}
 		}
 
-		// Someone ahead of us is holding one of these devices.
+		// Someone ahead of us is holding one of these devices. Note the
+		// existing `reserved` is a map[string]bool — each queued job is
+		// visited once per pass, so a job can never encounter its own
+		// reservation and no owner needs recording.
 		blocked := false
 		for _, deviceID := range candidates {
-			if holder, taken := reserved[deviceID]; taken && holder != job.ID {
+			if reserved[deviceID] {
 				blocked = true
 				break
 			}
@@ -959,7 +959,7 @@ In `ScheduleOnce`, replace the single-device attempt with a candidate list:
 		// Nothing free: hold every candidate for this job so later jobs
 		// cannot jump ahead of it.
 		for _, deviceID := range candidates {
-			reserved[deviceID] = job.ID
+			reserved[deviceID] = true
 			if err := s.reserve(job.ID, deviceID); err != nil {
 				return nil, err
 			}
@@ -1158,14 +1158,14 @@ package worker
 
 import "context"
 
-func (w *Worker) GatherLabelsForTest(ctx context.Context) probeResult {
+func (w *Worker) GatherLabelsForTest(ctx context.Context) ProbeResult {
 	return w.gatherLabels(ctx)
 }
 ```
 
-Note that `probeResult` must then be exported-shaped for the external test to
-read its fields — declare it as `ProbeResult` with exported `Host` and
-`Device` fields, and keep `gatherLabels` unexported.
+The type is `ProbeResult` with exported `Host` and `Device` fields, so the
+external test package can read them, while `gatherLabels` itself stays
+unexported — the production API gains nothing.
 
 - [ ] **Step 2: Run to verify failure**
 
