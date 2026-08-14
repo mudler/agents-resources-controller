@@ -75,7 +75,7 @@ func NewRunCmd() *cobra.Command {
 		Args:  cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if device == "" {
-				return errors.New("-d/--device is required in stage 1")
+				return errors.New("-d/--device is required (device selectors are not implemented yet)")
 			}
 			// A local copy: NewRunCmd's closures are shared by every RunE
 			// call on this *cobra.Command, so writing the computed default

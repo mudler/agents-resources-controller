@@ -62,7 +62,7 @@ func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.DeviceID == "" {
-		writeErr(w, http.StatusBadRequest, "bad_request", "device_id required (selectors arrive in stage 2)")
+		writeErr(w, http.StatusBadRequest, "bad_request", "device_id required (device selectors are not implemented yet; address a device by its exact ID)")
 		return
 	}
 	if req.Submitter == "" {

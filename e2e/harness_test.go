@@ -23,6 +23,17 @@ import (
 const (
 	fleetHost   = "testbox"
 	fleetDevice = "dev0"
+
+	// shutdownGraceMargin bounds how long newFleet's cleanup waits for the
+	// worker to report a clean shutdown. It must sit above
+	// internal/worker/worker.go's own shutdownGrace (45s — how long Start
+	// waits for an in-flight job to finish and report before abandoning it),
+	// with real margin on top for network round trips: a bound below that
+	// would make the harness itself time out — a false "did not shut down"
+	// failure — on a test that leaves a job legitimately still draining,
+	// rather than ever giving the worker's own documented grace period a
+	// chance to work as designed.
+	shutdownGraceMargin = 90 * time.Second
 )
 
 // newFleet wires a real store, a real controller (server.New over an
@@ -117,8 +128,8 @@ func newFleet(t *testing.T, deviceMaxRuntime time.Duration) (*client.Client, *st
 		case err := <-workerDone:
 			require.ErrorIs(t, err, context.Canceled,
 				"worker did not report ordinary shutdown as context.Canceled")
-		case <-time.After(10 * time.Second):
-			t.Error("worker did not shut down within 10s of context cancellation")
+		case <-time.After(shutdownGraceMargin):
+			t.Error("worker did not shut down within the shutdown-grace margin of context cancellation")
 		}
 	})
 

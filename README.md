@@ -168,15 +168,17 @@ has this worker ID down as `assigned` or `running` is marked `lost` and its
 lease released. What happens to the *device* next depends on whether the
 worker can prove the host actually rebooted:
 
-- **A worker process restart without a reboot quarantines the device
-  `unhealthy`.** The worker sends the same boot ID
-  (`/proc/sys/kernel/random/boot_id`) it always has, which proves nothing
-  about whatever the old process left running — an orphaned CUDA process
-  from a `kill -9`'d worker can still be pinning the GPU. The device is
-  never handed back to the pool on the strength of "the old process is gone
-  now"; it stays `unhealthy` until an operator clears it explicitly:
-  `POST /v1/devices/{id}/clear` (that call only succeeds when the device is
-  currently `unhealthy` **and** has no live lease).
+- **A worker process restart without a reboot quarantines `unhealthy` only
+  the devices that had a stranded `assigned`/`running` job on them — a
+  device that was idle when the worker died comes back `ready`, same as
+  before.** For a device that did have a live job, the worker sends the
+  same boot ID (`/proc/sys/kernel/random/boot_id`) it always has, which
+  proves nothing about whatever the old process left running — an orphaned
+  CUDA process from a `kill -9`'d worker can still be pinning that GPU. That
+  device is never handed back to the pool on the strength of "the old
+  process is gone now"; it stays `unhealthy` until an operator clears it
+  explicitly: `POST /v1/devices/{id}/clear` (that call only succeeds when
+  the device is currently `unhealthy` **and** has no live lease).
 - **A host that reboots gets its devices back `ready` automatically.** A
   changed boot ID at registration is proof the machine actually restarted,
   so nothing from before the reboot can still be running or holding VRAM —
@@ -287,11 +289,37 @@ the GPU".
 `rc kill` reaches further than Ctrl-C: it works from any terminal (not just
 the one that ran `rc run`) and it actually terminates a *running* job, not
 just a queued one — the controller flags it and the worker SIGTERMs the
-process group, the same path an ordinary shutdown uses:
+process group, the same path an ordinary shutdown uses.
+
+**But `rc kill` is not a free-for-all: only the job's own submitter, or an
+admin token, may kill it.** The controller checks the `submitter` on the
+kill request against the job's recorded submitter (`defaultSubmitter()`
+embeds `$USER@$HOSTNAME`, plus a session ID when run as an agent) and
+refuses everyone else with 403, even from a perfectly valid client token:
 
 ```
-$ rc kill 2480c0d1-2f89-43a9-bc9d-0703bdb4dd73
-rc: kill requested for 2480c0d1-2f89-43a9-bc9d-0703bdb4dd73
+$ rc kill 707b485b-8a91-4350-a327-d39df63250b3
+rc: not_job_owner: only the submitter or an admin may kill this job
+```
+
+That matters because the identity that submitted a job is very often not the
+operator who later needs to kill it — an agent submitted it under its own
+`--as` identity, or its session, and the human at the keyboard is neither.
+Two ways around it: assert the submitting identity with `--as` if you know
+it —
+
+```
+$ rc kill 707b485b-8a91-4350-a327-d39df63250b3 --as agent-x
+rc: kill requested for 707b485b-8a91-4350-a327-d39df63250b3
+```
+
+— or, the way an operator actually reaches for someone else's stuck job
+without knowing or spoofing their identity, use an admin token, which skips
+the ownership check entirely:
+
+```
+$ RC_TOKEN=<admin-token> rc kill 2ef79507-9cc7-49db-92b7-3ecfc8421d93
+rc: kill requested for 2ef79507-9cc7-49db-92b7-3ecfc8421d93
 ```
 
 The kill is asynchronous for a running job (the worker has to actually stop
@@ -365,16 +393,25 @@ from — still requires the header and rejects a query-string token.
   single allocation transaction — not by convention and not by a file in
   `/tmp`. A second `rc run`/submit against a held device never gets handed
   the device too: by default it joins the queue (see below); with
-  `--no-wait`/`NoWait`, it is refused outright with `no_device_available` at
-  allocation time, before any job is created.
+  `--no-wait`/`NoWait`, the job is still created (it gets a real ID and a
+  row in job history) but is immediately cancelled server-side and the
+  request answered with 409 `no_device_available` — so a `killed` job with
+  `kill_reason: "no-wait: device busy"` in history is expected and not a
+  sign anything went wrong; it just means a `--no-wait` submit found the
+  device taken.
 - Submitting onto a busy device queues it rather than failing, FIFO within a
-  priority tier (`--priority`, higher runs sooner). The controller schedules
-  a queued job onto its device the instant that device frees up — at submit
-  time if it's already free, and via a background scheduler loop (`rc
-  serve` runs one every second) once it frees up later — so a queued job
-  never waits longer than it takes the device ahead of it to finish. `rc
-  kill` on a still-queued job cancels it outright; nothing about the queue
-  requires the submitting client to still be connected.
+  priority tier (`--priority`, higher runs sooner) — but **not** FIFO
+  *across* tiers: a higher-priority job submitted later jumps ahead of an
+  already-queued lower-priority one for the same device, every scheduling
+  pass, for as long as higher-priority work keeps arriving. A low-priority
+  job behind a steady stream of higher-priority submits can be starved
+  indefinitely; there is no aging or fairness mechanism yet. Within its own
+  tier, though, the controller schedules a queued job onto its device the
+  instant that device frees up — at submit time if it's already free, and
+  via a background scheduler loop (`rc serve` runs one every second) once it
+  frees up later. `rc kill` on a still-queued job cancels it outright;
+  nothing about the queue requires the submitting client to still be
+  connected.
 - A device can declare a `max_runtime` ceiling in `worker.yaml`. A job that
   asks for more than the ceiling is rejected at submit time — never
   silently clamped down to fit. The worker enforces the resulting limit
