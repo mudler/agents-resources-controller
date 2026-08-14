@@ -2,6 +2,7 @@ package server_test
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -402,4 +403,46 @@ func TestNoWaitReturnsTheJobWhenItWinsTheRace(t *testing.T) {
 	require.Equal(t, model.JobAssigned, jobB.State,
 		"the caller must see the job exactly as it now stands: assigned, not hidden behind an error")
 	require.NotEqual(t, model.JobKilled, jobB.State)
+}
+
+// TestSubmitRejectsPriorityOutOfRange covers the minor that priority was
+// unbounded although the spec bounds it "to a small range so it stays a
+// nudge rather than a scheduling language". Out-of-range values are
+// rejected, not clamped — a caller who asked for 500 must not be quietly
+// given 10 — and the error names the range so the caller can fix it without
+// reading the source.
+func TestSubmitRejectsPriorityOutOfRange(t *testing.T) {
+	ts, st, _, _ := newServer(t)
+	registerWorker(t, ts)
+
+	for _, priority := range []int{server.MaxPriority + 1, server.MinPriority - 1, 1000} {
+		resp := post(t, ts, "ctok", "/v1/jobs", server.SubmitRequest{
+			DeviceID: "gpubox:gpu0", Command: []string{"./a"}, Submitter: "agent-a",
+			Priority: priority,
+		})
+		var body map[string]string
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
+		resp.Body.Close()
+
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode, "priority %d", priority)
+		require.Equal(t, "priority_out_of_range", body["error"])
+		require.Contains(t, body["message"], fmt.Sprintf("%d", server.MinPriority))
+		require.Contains(t, body["message"], fmt.Sprintf("%d", server.MaxPriority))
+	}
+
+	// Nothing was queued along the way: a rejected submit must not leave a
+	// job behind for the scheduler loop to pick up later.
+	queued, err := st.QueuedJobs()
+	require.NoError(t, err)
+	require.Empty(t, queued)
+
+	// The bounds themselves are accepted.
+	for _, priority := range []int{server.MinPriority, 0, server.MaxPriority} {
+		resp := post(t, ts, "ctok", "/v1/jobs", server.SubmitRequest{
+			DeviceID: "gpubox:gpu0", Command: []string{"./a"}, Submitter: "agent-a",
+			Priority: priority,
+		})
+		resp.Body.Close()
+		require.Equal(t, http.StatusCreated, resp.StatusCode, "priority %d", priority)
+	}
 }

@@ -53,6 +53,22 @@ var migrations = []struct {
 			`ALTER TABLE jobs ADD COLUMN kill_delivered_at INTEGER NOT NULL DEFAULT 0`,
 		},
 	},
+	{
+		name: "device quarantine reason",
+		stmts: []string{
+			// Why a device is unhealthy, which decides whether a proven host
+			// reboot may return it to the pool: a quarantine caused by a
+			// vanished process (worker loss, lease expiry, registration
+			// reconciliation) is answered by the reboot, a self-reported
+			// hardware fault is not. See quarantineReason in reaper.go.
+			//
+			// Existing unhealthy rows default to '' — cause unknown — and are
+			// deliberately NOT revived by a reboot: guessing "probably just a
+			// lost worker" about a device quarantined before this column
+			// existed is the one direction that can hand out bad hardware.
+			`ALTER TABLE devices ADD COLUMN quarantine_reason TEXT NOT NULL DEFAULT ''`,
+		},
+	},
 }
 
 // migrate brings the database up to len(migrations). It runs each pending

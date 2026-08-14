@@ -179,14 +179,21 @@ worker can prove the host actually rebooted:
   process is gone now"; it stays `unhealthy` until an operator clears it
   explicitly: `POST /v1/devices/{id}/clear` (that call only succeeds when
   the device is currently `unhealthy` **and** has no live lease).
-- **A host that reboots gets its devices back `ready` automatically.** A
-  changed boot ID at registration is proof the machine actually restarted,
-  so nothing from before the reboot can still be running or holding VRAM —
-  a reboot is the one event that positively proves a device is clean, not
-  just that a process went quiet. This does not resurrect a device that was
-  already `unhealthy` for an unrelated, self-reported fault before the
-  reboot; only devices the reap pass would otherwise have quarantined for
-  the *stranded job* come back automatically.
+- **A host that reboots gets its devices back `ready` automatically, however
+  long it was down.** A changed boot ID at registration is proof the machine
+  actually restarted, so nothing from before the reboot can still be running
+  or holding VRAM — a reboot is the one event that positively proves a device
+  is clean, not just that a process went quiet. This covers the ordinary
+  case of a box rebooted overnight or held down for maintenance, where the
+  reaper has long since quarantined every device on it: recovery is decided
+  by *why* each device was quarantined, not by whether a job was still in
+  flight when the host came back.
+  What a reboot does **not** do is resurrect a device that was quarantined by
+  a self-reported hardware fault. A reboot proves no process survived; it
+  proves nothing about the hardware. So a device the host itself reported
+  faulty stays `unhealthy` until a human clears it, and so does any device
+  quarantined before this bookkeeping existed (an upgrade from an older
+  database records no reason, and an unknown cause is never assumed benign).
 
 A worker with no boot ID at all (the `/proc` file unreadable, e.g. inside
 some containers) is treated the same as an unchanged one: no proof, so it
@@ -355,13 +362,16 @@ DEVICE       STATE  HOLDER                    ELAPSED  COMMAND
 gpubox:gpu0  busy   mudler@mudler-ubuntu-box  15s      sh -c sleep 15
 ```
 
-`rc ps` shows the same information job-first, for the currently
-assigned/running jobs:
+`rc ps` shows the same information job-first: the currently
+assigned/running jobs, then the queue behind them with each job's position
+in its own device's queue. Queued jobs are listed because their IDs are
+otherwise unobtainable, and `rc kill` needs one:
 
 ```
 $ rc ps
-JOB                                   DEVICE       STATE    SUBMITTER                 COMMAND
-25147ef7-7bf4-40b9-9034-31e294e5be1a  gpubox:gpu0  running  mudler@mudler-ubuntu-box  sh -c sleep 30
+JOB                                   DEVICE       STATE        SUBMITTER                 COMMAND
+25147ef7-7bf4-40b9-9034-31e294e5be1a  gpubox:gpu0  running      mudler@mudler-ubuntu-box  sh -c sleep 30
+9d1c8a44-0f7a-4a1e-9e2e-2b4f2c0a1a77  gpubox:gpu0  queued (#1)  agent-b@builder           ./train
 ```
 
 ## Dashboard
@@ -404,7 +414,9 @@ from — still requires the header and rejects a query-string token.
   sign anything went wrong; it just means a `--no-wait` submit found the
   device taken.
 - Submitting onto a busy device queues it rather than failing, FIFO within a
-  priority tier (`--priority`, higher runs sooner) — but **not** FIFO
+  priority tier (`--priority`, higher runs sooner, bounded to `-10..10` and
+  rejected with 400 `priority_out_of_range` outside it — it is a nudge
+  within one device's queue, not a scheduling language) — but **not** FIFO
   *across* tiers: a higher-priority job submitted later jumps ahead of an
   already-queued lower-priority one for the same device, every scheduling
   pass, for as long as higher-priority work keeps arriving. A low-priority

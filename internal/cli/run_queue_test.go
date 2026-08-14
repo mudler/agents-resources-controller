@@ -57,6 +57,15 @@ func TestRunQueuedShowsPositionsThenSucceeds(t *testing.T) {
 			switch {
 			case n >= 3:
 				view.Job.State = model.JobSucceeded
+				// started_at is set because the controller always sets it the
+				// moment a job is handed out (store.MarkRunning), so a
+				// succeeded job without one is a state the real system cannot
+				// produce — and rc run now distinguishes "left the queue by
+				// running" from "left the queue without ever starting"
+				// exactly on that field. See
+				// TestRunReportsAJobKilledWhileQueued.
+				started := time.Now()
+				view.Job.StartedAt = &started
 				view.QueuePosition = 0
 			case n == 2:
 				view.QueuePosition = 1
@@ -553,4 +562,64 @@ func TestRunDetachesFromRunningJobOnCtrlC(t *testing.T) {
 	require.Contains(t, out, "STILL RUNNING")
 	require.Contains(t, out, "rc ps")
 	require.False(t, killCalled.Load(), "Ctrl-C on a RUNNING job must only detach — it must never kill the job")
+}
+
+// TestRunReportsAJobKilledWhileQueued covers the minor that `rc run` used to
+// announce "rc: job X on gpubox:gpu0" for a job that left the queue by being
+// killed — someone else's `rc kill`, or an admin clearing the backlog — and
+// then streamed an empty log for it. WaitScheduled returns as soon as a job
+// stops being queued, which is not the same as it having been scheduled, so
+// rc run must look at what it got back and report what actually happened.
+func TestRunReportsAJobKilledWhileQueued(t *testing.T) {
+	job := model.Job{ID: "job1", DeviceID: "gpubox:gpu0", State: model.JobQueued}
+	var polls atomic.Int32
+	var streamed atomic.Bool
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/jobs":
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(job)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/jobs/job1":
+			view := server.JobView{Job: job, QueuePosition: 2}
+			if polls.Add(1) >= 2 {
+				// Killed while still queued: never assigned, never started,
+				// so started_at is nil — which is exactly how a job that
+				// never ran is distinguishable from one that ran and
+				// finished quickly.
+				view.Job.State = model.JobKilled
+				view.Job.KillReason = "killed by admin override"
+				view.QueuePosition = 0
+			}
+			_ = json.NewEncoder(w).Encode(view)
+		case r.URL.Path == "/v1/jobs/job1/logs":
+			streamed.Store(true)
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	t.Setenv("RC_CONTROLLER", ts.URL)
+	t.Setenv("RC_TOKEN", "tok")
+
+	cmd := cli.NewRunCmd()
+	cmd.SilenceUsage = true
+	cmd.SilenceErrors = true
+	stderr := &syncBuffer{}
+	cmd.SetErr(stderr)
+	cmd.SetArgs([]string{"-d", "gpubox:gpu0", "--as", "tester", "--", "true"})
+
+	err := cmd.Execute()
+
+	require.Error(t, err, "a job that was killed before it ran is not a successful run")
+	require.Contains(t, err.Error(), "killed")
+	require.Contains(t, err.Error(), "never started")
+	require.Contains(t, err.Error(), "killed by admin override",
+		"the recorded reason is the one thing that explains why")
+	require.NotContains(t, stderr.String(), "rc: job job1 on gpubox:gpu0",
+		"a job that never ran must not be announced as running on the device")
+	require.False(t, streamed.Load(),
+		"there is no output to stream for a job that never started")
 }

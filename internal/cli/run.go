@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/mudler/agents-resources-controller/internal/client"
 	"github.com/mudler/agents-resources-controller/internal/model"
+	"github.com/mudler/agents-resources-controller/internal/server"
 	"github.com/spf13/cobra"
 )
 
@@ -170,6 +171,24 @@ func NewRunCmd() *cobra.Command {
 						"lost track of job %s while it was queued (it may still be queued, or already running — check `rc ps`): %w",
 						job.ID, err)
 				}
+
+				// Leaving the queue is not the same as being scheduled: a job
+				// can also leave it by being killed — someone else's `rc
+				// kill`, an admin cancelling the backlog — and WaitScheduled
+				// returns on any state change, not just a happy one.
+				// Announcing "rc: job X on gpu0" and then streaming a log
+				// that will never have anything in it tells the user the
+				// opposite of what happened. A job that actually started
+				// (started_at set, however briefly) still goes down the
+				// normal path below, so a fast job's output is never skipped.
+				if job.State.Terminal() && job.StartedAt == nil {
+					reason := job.KillReason
+					if reason == "" {
+						reason = "no further detail available"
+					}
+					return fmt.Errorf("job %s was %s while queued and never started on %s: %s",
+						job.ID, job.State, job.DeviceID, reason)
+				}
 			}
 
 			fmt.Fprintf(stderr, "rc: job %s on %s\n", job.ID, job.DeviceID)
@@ -214,7 +233,9 @@ func NewRunCmd() *cobra.Command {
 	cmd.Flags().StringVarP(&device, "device", "d", "", "device ID, e.g. gpubox:gpu0")
 	cmd.Flags().StringVar(&cwd, "cwd", "", "working directory on the device host")
 	cmd.Flags().StringVar(&as, "as", "", "identity shown in rc ps (defaults to user@host/session)")
-	cmd.Flags().IntVar(&priority, "priority", 0, "queue priority; higher runs sooner")
+	cmd.Flags().IntVar(&priority, "priority", 0, fmt.Sprintf(
+		"queue priority, %d..%d; higher runs sooner within a device's queue",
+		server.MinPriority, server.MaxPriority))
 	cmd.Flags().DurationVar(&maxRuntime, "max-runtime", 0, "kill the job if it runs longer than this (0 = device default)")
 	cmd.Flags().DurationVar(&idleTimeout, "idle-timeout", 0, "kill the job if it produces no output for this long (0 = device default)")
 	cmd.Flags().DurationVar(&timeout, "timeout", 0, "give up waiting in the queue after this long and cancel the job (0 = wait forever)")

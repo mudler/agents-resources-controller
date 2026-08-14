@@ -18,6 +18,19 @@ import (
 // knob on the wire that silently did nothing was worse than not having the
 // knob; the internal column and default stay, ready for the stage that
 // actually enforces them.
+// MinPriority and MaxPriority bound SubmitRequest.Priority. The spec is
+// explicit that priority is "bounded to a small range so it stays a nudge
+// rather than a scheduling language": unbounded values invite callers to
+// encode a policy in the number (1000 for "production", 9999 for "really
+// production"), and since there is no preemption, a big number buys nothing
+// a small one does not — it only makes every later submitter bid higher.
+// Out-of-range submissions are rejected rather than clamped, so a caller who
+// asked for 500 is never quietly given 10 and left believing otherwise.
+const (
+	MinPriority = -10
+	MaxPriority = 10
+)
+
 type SubmitRequest struct {
 	DeviceID           string            `json:"device_id"`
 	Command            []string          `json:"command"`
@@ -69,6 +82,12 @@ func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 		// A blank holder on a busy device defeats the entire point of this
 		// system: answering "who has gpu0 right now".
 		writeErr(w, http.StatusBadRequest, "bad_request", "submitter required")
+		return
+	}
+	if req.Priority < MinPriority || req.Priority > MaxPriority {
+		writeErr(w, http.StatusBadRequest, "priority_out_of_range",
+			fmt.Sprintf("priority %d is out of range: it must be between %d and %d — priority is a nudge within one device's queue, not a scheduling language",
+				req.Priority, MinPriority, MaxPriority))
 		return
 	}
 
@@ -353,16 +372,26 @@ func (s *Server) handleClearDevice(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
+// logWriteTimeout bounds every write to a log stream, mirroring
+// eventWriteTimeout on the SSE side. A log reader that cannot accept a chunk
+// within this is wedged, not merely slow: the alternative to disconnecting it
+// is holding its subscriber, goroutine and fd open forever.
+//
+// A var, not a const, solely so an internal test can shrink it and prove the
+// bound is real without a ten-second test — the same trick, for the same
+// reason, as internal/worker's terminalReportAttemptTimeout.
+var logWriteTimeout = 10 * time.Second
+
 // handleStreamLogs streams a job's output as newline-delimited chunks and
 // ends when the job reaches a terminal state.
 func (s *Server) handleStreamLogs(w http.ResponseWriter, r *http.Request) {
 	jobID := r.PathValue("id")
 
-	flusher, ok := w.(http.Flusher)
-	if !ok {
+	if _, ok := w.(http.Flusher); !ok {
 		writeErr(w, http.StatusInternalServerError, "unsupported", "streaming unsupported")
 		return
 	}
+	rc := http.NewResponseController(w)
 
 	// The job must exist before anything is started: Follow would otherwise
 	// O_CREATE a log file for an unknown ID and the watcher below would spin
@@ -406,12 +435,36 @@ func (s *Server) handleStreamLogs(w http.ResponseWriter, r *http.Request) {
 	// buffers them. Without this a client blocks with no response at all
 	// until the first log chunk arrives, which may be never for a job that
 	// has not produced output yet.
-	flusher.Flush()
+	if !flushLogs(rc) {
+		return
+	}
 
 	for chunk := range chunks {
+		// Every write is bounded, for the same reason the SSE stream's are
+		// (see writeSSE): a wedged peer — a suspended laptop, a blackholed
+		// route — blocks w.Write forever, and r.Context().Done() cannot
+		// preempt a write already in flight. The handler would sit in that
+		// write for the life of the process, so the deferred unsubscribe in
+		// logstore never runs and the subscriber, its goroutine and its fd
+		// leak. `rc attach` makes long-lived log streams routine, so this is
+		// an ordinary case rather than an exotic one.
+		if err := rc.SetWriteDeadline(time.Now().Add(logWriteTimeout)); err != nil {
+			return
+		}
 		if _, err := w.Write(chunk); err != nil {
 			return
 		}
-		flusher.Flush()
+		if !flushLogs(rc) {
+			return
+		}
 	}
+}
+
+// flushLogs flushes under the same bounded deadline every log write gets, so
+// the header flush cannot wedge either.
+func flushLogs(rc *http.ResponseController) bool {
+	if err := rc.SetWriteDeadline(time.Now().Add(logWriteTimeout)); err != nil {
+		return false
+	}
+	return rc.Flush() == nil
 }

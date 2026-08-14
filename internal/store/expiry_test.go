@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/mudler/agents-resources-controller/internal/model"
+	"github.com/mudler/agents-resources-controller/internal/store"
 	"github.com/stretchr/testify/require"
 )
 
@@ -358,4 +359,179 @@ func TestFirstBootIDAfterUpgradeQuarantines(t *testing.T) {
 	devices, err := s.Devices()
 	require.NoError(t, err)
 	require.Equal(t, model.DeviceUnhealthy, devices[0].State)
+}
+
+// devicesByID returns the fleet keyed by device ID, so a test with more than
+// one device is not hostage to the order Devices() happens to return.
+func devicesByID(t *testing.T, s *store.Store) map[string]model.Device {
+	t.Helper()
+	devices, err := s.Devices()
+	require.NoError(t, err)
+	out := map[string]model.Device{}
+	for _, d := range devices {
+		out[d.ID] = d
+	}
+	return out
+}
+
+// registerTwoDeviceHost registers a host with a known prior boot ID and two
+// devices, which is the shape the reboot-recovery tests below need: a fleet
+// where the reaper has quarantined everything, not just the one device that
+// happened to be running a job.
+func registerTwoDeviceHost(t *testing.T, s *store.Store, at time.Time, bootID string) {
+	t.Helper()
+	require.NoError(t, s.UpsertWorker(
+		model.Worker{ID: "w1", Host: "gpubox", BootID: bootID, LastHeartbeatAt: at},
+		[]model.Device{
+			{ID: "gpubox:gpu0", Host: "gpubox", Name: "gpu0", WorkerID: "w1"},
+			{ID: "gpubox:gpu1", Host: "gpubox", Name: "gpu1", WorkerID: "w1"},
+		},
+	))
+}
+
+// The case boot-ID recovery was silently missing: a host that stays down
+// longer than the reaper's unhealthyAfter — a machine rebooted overnight, or
+// held down for maintenance, which is the common case rather than the exotic
+// one.
+//
+// By the time it comes back, the sweep has already marked its jobs lost and
+// quarantined every one of its devices, so there is no in-flight job left for
+// the registration reap to key off and the reboot branch used to match
+// nothing at all. The device state that survived was `unhealthy`, and the
+// operator was back to clearing by hand after every reboot — the exact habit
+// the boot ID exists to remove.
+func TestRebootAfterProlongedDowntimeReturnsDevicesToReady(t *testing.T) {
+	s, c := newStore(t)
+	registerTwoDeviceHost(t, s, c.Now(), "boot-1")
+
+	job, err := s.Allocate(req("agent-a"))
+	require.NoError(t, err)
+
+	// The host goes away for far longer than unhealthyAfter.
+	c.Advance(10 * time.Minute)
+	res, err := s.Sweep(30*time.Second, 5*time.Minute)
+	require.NoError(t, err)
+	require.ElementsMatch(t, []string{"gpubox:gpu0", "gpubox:gpu1"}, res.DevicesUnhealthy)
+	require.Equal(t, []string{job.ID}, res.JobsLost)
+
+	// It comes back rebooted.
+	c.Advance(time.Minute)
+	registerTwoDeviceHost(t, s, c.Now(), "boot-2")
+
+	devices := devicesByID(t, s)
+	require.Equal(t, model.DeviceReady, devices["gpubox:gpu0"].State,
+		"a proven reboot must return a device quarantined by worker loss to the pool")
+	require.Equal(t, model.DeviceReady, devices["gpubox:gpu1"].State,
+		"including devices that were never running anything")
+
+	// Ready means genuinely schedulable, not merely relabelled.
+	next, err := s.Allocate(req("agent-b"))
+	require.NoError(t, err)
+	require.Equal(t, "gpubox:gpu0", next.DeviceID)
+}
+
+// The constraint the fix above must respect: a reboot proves no process
+// survived, but proves nothing about the hardware. A device the host itself
+// reported faulty stays quarantined across the same prolonged downtime and
+// the same proven reboot — only a human may put that one back.
+func TestRebootAfterProlongedDowntimeKeepsFaultQuarantine(t *testing.T) {
+	s, c := newStore(t)
+	registerTwoDeviceHost(t, s, c.Now(), "boot-1")
+
+	// gpu1 is reported faulty by the host itself; gpu0 is fine.
+	require.NoError(t, s.SetDeviceState("gpubox:gpu1", model.DeviceUnhealthy, c.Now()))
+
+	c.Advance(10 * time.Minute)
+	_, err := s.Sweep(30*time.Second, 5*time.Minute)
+	require.NoError(t, err)
+
+	c.Advance(time.Minute)
+	registerTwoDeviceHost(t, s, c.Now(), "boot-2")
+
+	devices := devicesByID(t, s)
+	require.Equal(t, model.DeviceReady, devices["gpubox:gpu0"].State,
+		"the healthy device is recovered by the reboot")
+	require.Equal(t, model.DeviceUnhealthy, devices["gpubox:gpu1"].State,
+		"a power cycle does not settle a reported hardware fault")
+}
+
+// The same prolonged downtime with no proof of a reboot must change nothing:
+// an orphaned process from before may still be pinning the device.
+func TestProlongedDowntimeWithoutRebootProofKeepsQuarantine(t *testing.T) {
+	for _, tc := range []struct{ name, returningBootID string }{
+		{"same boot id", "boot-1"},
+		{"empty boot id", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, c := newStore(t)
+			registerTwoDeviceHost(t, s, c.Now(), "boot-1")
+
+			_, err := s.Allocate(req("agent-a"))
+			require.NoError(t, err)
+
+			c.Advance(10 * time.Minute)
+			_, err = s.Sweep(30*time.Second, 5*time.Minute)
+			require.NoError(t, err)
+
+			c.Advance(time.Minute)
+			registerTwoDeviceHost(t, s, c.Now(), tc.returningBootID)
+
+			devices := devicesByID(t, s)
+			require.Equal(t, model.DeviceUnhealthy, devices["gpubox:gpu0"].State)
+			require.Equal(t, model.DeviceUnhealthy, devices["gpubox:gpu1"].State)
+
+			_, err = s.Allocate(req("agent-b"))
+			require.ErrorIs(t, err, store.ErrNoDevice)
+		})
+	}
+}
+
+// A device quarantined by lease expiry — the backstop path, where a job's
+// holder stopped renewing but the worker itself kept reporting — is also a
+// "we could not prove nothing is on it" quarantine, so a proven reboot
+// answers it too.
+func TestRebootRecoversADeviceQuarantinedByLeaseExpiry(t *testing.T) {
+	s, c := newStore(t)
+	registerTwoDeviceHost(t, s, c.Now(), "boot-1")
+
+	job, err := s.Allocate(req("agent-a")) // req()'s LeaseTTL is one minute
+	require.NoError(t, err)
+	require.NoError(t, s.MarkRunning(job.ID, c.Now()))
+
+	// The worker keeps heartbeating but never claims the job: its lease
+	// lapses and the device is quarantined (see
+	// TestHeartbeatDoesNotRenewAnUnclaimedJobLease).
+	c.Advance(2 * time.Minute)
+	require.NoError(t, s.RecordHeartbeat("w1", c.Now(), nil))
+	res, err := s.Sweep(30*time.Second, 5*time.Minute)
+	require.NoError(t, err)
+	require.Equal(t, []string{job.ID}, res.LeasesExpired)
+	require.Equal(t, model.DeviceUnhealthy, devicesByID(t, s)["gpubox:gpu0"].State)
+
+	registerTwoDeviceHost(t, s, c.Now(), "boot-2")
+
+	require.Equal(t, model.DeviceReady, devicesByID(t, s)["gpubox:gpu0"].State,
+		"a reboot proves the process behind the expired lease is gone")
+}
+
+// A device an operator cleared and a device a reboot recovered must be
+// indistinguishable afterwards: if the recovery left the old quarantine
+// reason behind, the NEXT quarantine on that device could be mislabelled and
+// a future reboot could revive a genuine fault.
+func TestRecoveredDeviceQuarantinesFreshlyAfterwards(t *testing.T) {
+	s, c := newStore(t)
+	registerTwoDeviceHost(t, s, c.Now(), "boot-1")
+
+	c.Advance(10 * time.Minute)
+	_, err := s.Sweep(30*time.Second, 5*time.Minute) // quarantined: worker lost
+	require.NoError(t, err)
+	registerTwoDeviceHost(t, s, c.Now(), "boot-2") // recovered by the reboot
+	require.Equal(t, model.DeviceReady, devicesByID(t, s)["gpubox:gpu0"].State)
+
+	// Now the host reports a real fault on it, and reboots again.
+	require.NoError(t, s.SetDeviceState("gpubox:gpu0", model.DeviceUnhealthy, c.Now()))
+	registerTwoDeviceHost(t, s, c.Now(), "boot-3")
+
+	require.Equal(t, model.DeviceUnhealthy, devicesByID(t, s)["gpubox:gpu0"].State,
+		"a fault reported after a recovery must still outlive the next reboot")
 }

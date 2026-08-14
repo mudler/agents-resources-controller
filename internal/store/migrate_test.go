@@ -55,6 +55,7 @@ func TestOpenMigratesAStageOneDatabase(t *testing.T) {
 		{"workers", "boot_id"},
 		{"jobs", "kill_requested"},
 		{"jobs", "kill_delivered_at"},
+		{"devices", "quarantine_reason"},
 	} {
 		var count int
 		require.NoError(t, check.QueryRow(

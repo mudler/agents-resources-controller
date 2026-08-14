@@ -175,6 +175,14 @@ const (
 // WaitScheduled polls until the job leaves the queue, calling onPosition each
 // time its position changes so the caller can show progress.
 //
+// "Leaves the queue" is exactly what it returns on, which is NOT the same as
+// "was scheduled": a queued job can also be killed or cancelled, and that
+// too ends the wait and is returned with no error. Callers must look at the
+// state they get back before announcing a job as running — see
+// cli.NewRunCmd, which reports a job that left the queue without ever
+// starting as what it is rather than printing "job X on gpu0" and then
+// streaming a log that will never have anything in it.
+//
 // Like WaitTerminal, it tolerates a bounded run of consecutive poll
 // failures — a dropped connection, a controller restarting for a couple of
 // seconds — with a fixed retry interval, resetting the count on every
