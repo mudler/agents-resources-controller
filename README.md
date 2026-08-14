@@ -56,6 +56,14 @@ a free device is assigned immediately without waiting for that sweep — every
 submit makes its own scheduling pass too — but it is the periodic loop that
 notices a device freeing up *later* and hands the next queued job to it.
 
+**Upgrade the controller and all workers together — they are not
+independently upgradeable.** A stale worker speaking the old wire format
+fails to poll a newer controller right away, and any jobs it still had in
+flight get marked `lost`, quarantining their devices `unhealthy` until an
+admin clears each one. Nothing is double-allocated in the meantime — an
+`unhealthy` device is unschedulable — so recovery is just one
+`POST /v1/devices/{id}/clear` per affected device.
+
 ### Running the controller in Docker
 
 The controller is the piece worth keeping always-on, and it is cgo-free, so
