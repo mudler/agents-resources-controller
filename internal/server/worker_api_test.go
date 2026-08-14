@@ -158,6 +158,39 @@ func TestRegisterAppliesDeviceRuntimeCeilings(t *testing.T) {
 		"a submit within the declared ceiling must be accepted")
 }
 
+// TestRegistrationClearsARemovedCeiling guards the fix for the review
+// finding that a ceiling could be set but never removed: worker.yaml is the
+// declaration of intent, so a registration that omits max_runtime for a
+// device it previously declared one for must actually clear it, not merely
+// leave the old value in place forever. An operator who deletes
+// `max_runtime: 1h` and restarts the worker must get a device with no limit.
+func TestRegistrationClearsARemovedCeiling(t *testing.T) {
+	ts, _, _, _ := newServer(t)
+
+	resp := post(t, ts, "wtok", "/v1/workers/register",
+		server.RegisterRequest{Host: "gpubox", Devices: []server.DeviceSpec{
+			{Name: "gpu0", MaxRuntimeSeconds: 3600},
+		}})
+	resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	// The worker restarts with max_runtime dropped from worker.yaml.
+	resp2 := post(t, ts, "wtok", "/v1/workers/register",
+		server.RegisterRequest{Host: "gpubox", Devices: []server.DeviceSpec{
+			{Name: "gpu0"},
+		}})
+	resp2.Body.Close()
+	require.Equal(t, http.StatusOK, resp2.StatusCode)
+
+	submit := post(t, ts, "ctok", "/v1/jobs", server.SubmitRequest{
+		DeviceID: "gpubox:gpu0", Command: []string{"./bench"}, Submitter: "agent-a",
+		MaxRuntimeSeconds: 7200,
+	})
+	defer submit.Body.Close()
+	require.Equal(t, http.StatusCreated, submit.StatusCode,
+		"a ceiling removed from worker.yaml and re-registered must not still cap the job")
+}
+
 // TestAssignmentsEnvelopeCarriesKillRequests guards the wire change this task
 // makes: a kill must reach the worker through the same long-poll response an
 // assignment does, not a separate channel, and it alone (with no new

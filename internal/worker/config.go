@@ -67,6 +67,17 @@ func LoadConfig(path string) (Config, error) {
 		if d.Name == "" {
 			return Config{}, fmt.Errorf("device entry needs a name in %s", path)
 		}
+		// The wire ceiling and the devices.max_runtime column are both
+		// seconds; a positive but sub-second value would truncate to 0 at
+		// the server and be silently treated as "no ceiling" rather than
+		// the tiny one written here. Reject it now, at the one point that
+		// can still name what the operator actually wrote, instead of
+		// letting it round away into a limit that never enforces.
+		if d.MaxRuntime > 0 && d.MaxRuntime < time.Second {
+			return Config{}, fmt.Errorf(
+				"device %q: max_runtime %s is below the one-second granularity runtime ceilings are enforced at, in %s",
+				d.Name, d.MaxRuntime, path)
+		}
 	}
 	if c.HeartbeatInterval <= 0 {
 		c.HeartbeatInterval = 10 * time.Second

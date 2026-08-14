@@ -227,19 +227,48 @@ func (w *Worker) pollLoop(ctx context.Context) {
 			continue
 		}
 
-		// A kill acts on a job already tracked in w.running (registered
-		// synchronously below, same as an assignment), so cancelling here is
-		// safe even before this iteration's own assignments are started.
+		// A kill for a job already tracked in w.running (registration happens
+		// inside execute(), in the goroutine spawned below, NOT synchronously
+		// here) reaches it via cancelRunning. But a job can also arrive with
+		// a kill for its OWN job ID in this very same response — e.g. `rc
+		// kill` landing between ScheduleOnce assigning it and this poll —
+		// and at that moment it is not in w.running yet: nothing has spawned
+		// it. cancelRunning alone would silently no-op and the assignment
+		// loop below would start it anyway. killSet lets the assignment loop
+		// recognise and drop that case before it ever calls execute().
+		killSet := make(map[string]struct{}, len(resp.Kills))
 		for _, jobID := range resp.Kills {
+			killSet[jobID] = struct{}{}
 			w.cancelRunning(jobID)
 		}
 
-		if len(resp.Assignments) == 0 {
-			// Whether this poll carried only kills or nothing at all, there is
-			// no new work to start locally: any kill just delivered was
-			// already actioned above (idempotently, if re-delivered), so the
-			// same floor applies as the empty case — no reason to hammer the
-			// controller faster than that.
+		var toStart []assignment
+		for _, a := range resp.Assignments {
+			if _, killed := killSet[a.JobID]; killed {
+				// The controller has already been told to kill this job:
+				// starting it now would allocate VRAM on a device someone
+				// may already be waiting for, and the user who typed
+				// `rc kill` has every reason to believe nothing ran. Report
+				// it terminally instead of spawning it, so the controller
+				// frees the device and the waiting client learns the
+				// outcome rather than watching the job sit assigned.
+				w.wg.Add(1)
+				go func(jobID string) {
+					defer w.wg.Done()
+					w.reportPreKilled(ctx, jobID)
+				}(a.JobID)
+				continue
+			}
+			toStart = append(toStart, a)
+		}
+
+		if len(toStart) == 0 {
+			// Whether this poll carried only kills (delivered on their own,
+			// or dropped above alongside their own assignment), or nothing
+			// at all, there is no new work to start locally: any kill just
+			// delivered was already actioned above (idempotently, if
+			// re-delivered), so the same floor applies as the empty case —
+			// no reason to hammer the controller faster than that.
 			select {
 			case <-ctx.Done():
 				return
@@ -247,12 +276,14 @@ func (w *Worker) pollLoop(ctx context.Context) {
 			}
 			continue
 		}
-		for _, a := range resp.Assignments {
+		for _, a := range toStart {
 			// Registered here, synchronously in the poll loop, so that by the
 			// time pollLoop returns (ctx already done) every goroutine it has
 			// ever started is already accounted for in wg — Start's shutdown
 			// wait can never race a wg.Add happening after it started
-			// wg.Wait().
+			// wg.Wait(). (w.running itself is only populated once execute()
+			// runs, inside the spawned goroutine below — see the killSet
+			// comment above for why that distinction matters.)
 			w.wg.Add(1)
 			go func(a assignment) {
 				defer w.wg.Done()
@@ -297,6 +328,35 @@ func (w *Worker) cancelRunning(jobID string) {
 	if ok {
 		cancel()
 	}
+}
+
+// reportPreKilled handles a job that arrived in the same poll response as a
+// kill request for its own job ID: it must never be spawned, but it still
+// needs a terminal report — otherwise the controller leaves its device
+// leased and a client waiting on it never learns the outcome. w.started
+// marks it the same way execute() does, so this worker process never later
+// starts it either (e.g. if the same job is re-delivered on a subsequent
+// poll before the controller's own state catches up) and a re-delivered
+// kill for it here is a harmless no-op.
+func (w *Worker) reportPreKilled(ctx context.Context, jobID string) {
+	w.mu.Lock()
+	if _, done := w.started[jobID]; done {
+		w.mu.Unlock()
+		return
+	}
+	w.started[jobID] = struct{}{}
+	w.mu.Unlock()
+
+	// Detached from ctx for the same reason execute()'s reportCtx is: a
+	// shutdown racing this must not silently drop the report a client may be
+	// waiting on.
+	reportCtx := context.WithoutCancel(ctx)
+	body := map[string]any{
+		"state":     model.JobKilled,
+		"worker_id": w.workerID,
+		"reason":    "killed before this worker started it",
+	}
+	w.reportTerminalWithRetry(reportCtx, jobID, body)
 }
 
 func (w *Worker) execute(ctx context.Context, a assignment) {

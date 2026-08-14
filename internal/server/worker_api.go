@@ -91,16 +91,21 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 
 	// UpsertWorker creates/updates the device rows themselves but does not
 	// touch their runtime ceiling; that is set here, once each device row is
-	// known to exist, for every device that declared one. A device with no
-	// ceiling in this registration is left as it was — an operator dropping
-	// max_runtime from worker.yaml does not implicitly clear a ceiling set by
-	// an earlier registration; that's out of scope here.
+	// known to exist. worker.yaml is the declaration of intent, so
+	// registration must make the stored ceiling match it exactly — including
+	// when the declaration is "no ceiling": a device that previously
+	// declared max_runtime and now omits it must actually be cleared, or an
+	// operator who deletes it and restarts sees no change and can only fix
+	// it by hand-editing the database. Every device in this registration
+	// gets its ceiling written, zero included, not just the ones with a
+	// positive value.
 	for _, dev := range req.Devices {
-		if dev.MaxRuntimeSeconds <= 0 {
-			continue
+		sec := dev.MaxRuntimeSeconds
+		if sec < 0 {
+			sec = 0
 		}
 		id := req.Host + ":" + dev.Name
-		if err := s.cfg.Store.SetDeviceMaxRuntime(id, time.Duration(dev.MaxRuntimeSeconds)*time.Second); err != nil {
+		if err := s.cfg.Store.SetDeviceMaxRuntime(id, time.Duration(sec)*time.Second); err != nil {
 			writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
 			return
 		}

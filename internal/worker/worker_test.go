@@ -164,6 +164,104 @@ func TestAssignmentIsDeliveredOnlyOnce(t *testing.T) {
 		"job1 must be executed exactly once even though the controller keeps re-delivering it")
 }
 
+// TestKilledJobIsNotStartedWhenDeliveredWithItsAssignment guards against a
+// job whose kill was requested between ScheduleOnce assigning it and the
+// worker's poll landing: both the assignment and the kill for the same job
+// ID can arrive in the very same poll response. A job the controller has
+// already been told to kill must never be spawned — starting it anyway
+// allocates VRAM on a device someone may already be waiting for, and the
+// user who typed `rc kill` has every reason to believe nothing ran. The
+// marker file records an execution the same way TestAssignmentIsDeliveredOnlyOnce
+// does; here it must never exist at all.
+func TestKilledJobIsNotStartedWhenDeliveredWithItsAssignment(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "ran")
+
+	var (
+		mu     sync.Mutex
+		served bool
+		states []string
+		wids   []string
+	)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/v1/workers/register":
+			json.NewEncoder(w).Encode(map[string]string{"worker_id": "w1"})
+
+		case r.URL.Path == "/v1/workers/w1/assignments":
+			mu.Lock()
+			first := !served
+			served = true
+			mu.Unlock()
+			if !first {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			// job1 arrives as a fresh assignment AND as an already-flagged
+			// kill in the same response — exactly what the controller sends
+			// when `rc kill` lands in the window between assignment and poll.
+			json.NewEncoder(w).Encode(map[string]any{
+				"assignments": []map[string]any{{
+					"job_id":    "job1",
+					"device_id": "gpubox:gpu0",
+					"command":   []string{"sh", "-c", "echo run >> " + marker},
+				}},
+				"kills": []string{"job1"},
+			})
+
+		case r.URL.Path == "/v1/workers/w1/heartbeat":
+			w.WriteHeader(http.StatusOK)
+
+		case r.URL.Path == "/v1/jobs/job1/status":
+			var body struct {
+				State    string `json:"state"`
+				WorkerID string `json:"worker_id"`
+			}
+			json.NewDecoder(r.Body).Decode(&body)
+			mu.Lock()
+			states = append(states, body.State)
+			wids = append(wids, body.WorkerID)
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	wk := worker.New(worker.Config{
+		ControllerURL:     ts.URL,
+		Host:              "gpubox",
+		Devices:           []worker.DeviceConfig{{Name: "gpu0"}},
+		HeartbeatInterval: 500 * time.Millisecond,
+		PollWait:          50 * time.Millisecond,
+	})
+	go func() { _ = wk.Start(ctx) }()
+
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(states) == 1
+	}, 5*time.Second, 50*time.Millisecond,
+		"a job killed before it ever started must still get a terminal report, not be left sitting assigned")
+
+	// Give the bug every reasonable chance to manifest before asserting it
+	// never does: the command must never actually execute.
+	time.Sleep(300 * time.Millisecond)
+	_, err := os.Stat(marker)
+	require.True(t, os.IsNotExist(err),
+		"the command must never run once its own delivery also carries a kill for the same job ID")
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Equal(t, []string{"killed"}, states)
+	require.Equal(t, []string{"w1"}, wids)
+}
+
 // TestShutdownWaitsForRunningJobAndReportsTerminalState asserts that
 // cancelling Start's context does not abandon a job that is still running:
 // Start must not return until the job has actually finished, and the

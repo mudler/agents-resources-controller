@@ -62,3 +62,23 @@ devices:
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "name")
 }
+
+// TestLoadConfigRejectsSubSecondMaxRuntime guards the fix for the review
+// finding that int(d.MaxRuntime.Seconds()) truncates a sub-second ceiling
+// (e.g. 500ms) to 0, which the server then silently treats as "no ceiling"
+// declared at all rather than the sub-second one the operator wrote. The
+// column is seconds by design, so this must be rejected at config load, not
+// silently rounded away, and the error must name the offending device.
+func TestLoadConfigRejectsSubSecondMaxRuntime(t *testing.T) {
+	_, err := worker.LoadConfig(writeConfig(t, `
+controller_url: http://c:8080
+token: t
+host: box
+devices:
+  - name: gpu0
+    max_runtime: 500ms
+`))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "gpu0")
+	require.Contains(t, err.Error(), "second")
+}
