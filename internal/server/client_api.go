@@ -32,7 +32,11 @@ const (
 )
 
 type SubmitRequest struct {
-	DeviceID           string            `json:"device_id"`
+	DeviceID string `json:"device_id,omitempty"`
+	// Selector picks a device by its labels instead of by exact ID — give
+	// exactly one of DeviceID or Selector, never both. See
+	// store.MatchingDevices for the matching rules.
+	Selector           string            `json:"selector,omitempty"`
 	Command            []string          `json:"command"`
 	Cwd                string            `json:"cwd,omitempty"`
 	Env                map[string]string `json:"env,omitempty"`
@@ -65,6 +69,176 @@ type StateResponse struct {
 	Queued  []model.Job  `json:"queued"`
 }
 
+// describeRecentJobs bounds how much job history `rc describe` shows: five
+// is enough to tell "this box just failed the last three runs" from "this
+// box is fine", without turning describe into a second `rc ps`.
+const describeRecentJobs = 5
+
+// DescribeResponse is everything an agent needs to trust (or distrust) a
+// device before writing commands for it: what it is, who holds it now, every
+// label with its provenance and age, the humans' own usage notes and how
+// stale THEY are, and its recent job history.
+type DescribeResponse struct {
+	Device              model.Device  `json:"device"`
+	Holder              string        `json:"holder,omitempty"`
+	JobID               string        `json:"job_id,omitempty"`
+	ElapsedSeconds      int           `json:"elapsed_seconds"`
+	HeartbeatAgeSeconds int           `json:"heartbeat_age_seconds"`
+	Labels              []model.Label `json:"labels,omitempty"`
+	Sheet               string        `json:"sheet,omitempty"`
+	SheetUpdatedAt      time.Time     `json:"sheet_updated_at,omitempty"`
+	RecentJobs          []model.Job   `json:"recent_jobs,omitempty"`
+}
+
+// ExplainResponse answers "if I submitted this selector right now, what
+// would happen" without actually submitting anything: which devices match,
+// which of those are free this instant, and how backed up the ones that
+// aren't free already are.
+type ExplainResponse struct {
+	Selector   string   `json:"selector"`
+	Matching   []string `json:"matching"`
+	Free       []string `json:"free"`
+	QueueDepth int      `json:"queue_depth"`
+}
+
+// handleDescribe answers `rc describe`: everything the routes above answer
+// piecemeal (device state, labels, sheet, history), joined for one device so
+// an agent can learn what a box is before it writes commands for it.
+func (s *Server) handleDescribe(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+
+	views, err := s.deviceViews()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
+		return
+	}
+	var view *DeviceView
+	for i := range views {
+		if views[i].Device.ID == id {
+			view = &views[i]
+			break
+		}
+	}
+	if view == nil {
+		writeErr(w, http.StatusNotFound, "not_found", "device not found")
+		return
+	}
+
+	labels, err := s.cfg.Store.LabelsFor(id)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
+		return
+	}
+
+	// Prefer the device's own sheet; a device with none of its own still
+	// gets the host-wide one, so describe never goes silent about
+	// documentation that exists just because it lives one level up.
+	sheet, sheetAt, err := s.cfg.Store.HostDoc(view.Device.Host, id)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
+		return
+	}
+	if sheet == "" && sheetAt.IsZero() {
+		sheet, sheetAt, err = s.cfg.Store.HostDoc(view.Device.Host, "")
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
+			return
+		}
+	}
+
+	recent, err := s.cfg.Store.RecentJobsForDevice(id, describeRecentJobs)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, DescribeResponse{
+		Device:              view.Device,
+		Holder:              view.Holder,
+		JobID:               view.JobID,
+		ElapsedSeconds:      view.ElapsedSeconds,
+		HeartbeatAgeSeconds: view.HeartbeatAgeSeconds,
+		Labels:              labels,
+		Sheet:               sheet,
+		SheetUpdatedAt:      sheetAt,
+		RecentJobs:          recent,
+	})
+}
+
+// handleExplain answers `rc run --explain`: it runs exactly the matching
+// logic a real submit would (store.MatchingDevices — the same function
+// Enqueue and ScheduleOnce use, so explain can never disagree with what
+// actually happens), then reports device state and queue backlog, and
+// submits nothing.
+func (s *Server) handleExplain(w http.ResponseWriter, r *http.Request) {
+	sel := r.URL.Query().Get("selector")
+	if sel == "" {
+		writeErr(w, http.StatusBadRequest, "bad_request", "selector query parameter required")
+		return
+	}
+
+	matching, err := s.cfg.Store.MatchingDevices(sel)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "bad_selector", err.Error())
+		return
+	}
+
+	devices, err := s.cfg.Store.Devices()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
+		return
+	}
+	stateByID := make(map[string]model.DeviceState, len(devices))
+	for _, d := range devices {
+		stateByID[d.ID] = d.State
+	}
+
+	matchSet := make(map[string]bool, len(matching))
+	free := make([]string, 0, len(matching))
+	for _, id := range matching {
+		matchSet[id] = true
+		if stateByID[id] == model.DeviceReady {
+			free = append(free, id)
+		}
+	}
+
+	queued, err := s.cfg.Store.QueuedJobs()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
+		return
+	}
+	depth := 0
+	for _, j := range queued {
+		if j.DeviceID != "" {
+			if matchSet[j.DeviceID] {
+				depth++
+			}
+			continue
+		}
+		if j.Selector == "" {
+			continue
+		}
+		// A queued selector job could land on any of ITS candidates; it
+		// counts against this explain's depth if the two candidate sets
+		// overlap at all — reusing MatchingDevices again rather than a
+		// second notion of "could this land here".
+		candidates, err := s.cfg.Store.MatchingDevices(j.Selector)
+		if err != nil {
+			continue
+		}
+		for _, c := range candidates {
+			if matchSet[c] {
+				depth++
+				break
+			}
+		}
+	}
+
+	writeJSON(w, http.StatusOK, ExplainResponse{
+		Selector: sel, Matching: matching, Free: free, QueueDepth: depth,
+	})
+}
+
 func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 	var req SubmitRequest
 	if !decode(w, r, &req) {
@@ -74,8 +248,12 @@ func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "bad_request", "command required")
 		return
 	}
-	if req.DeviceID == "" {
-		writeErr(w, http.StatusBadRequest, "bad_request", "device_id required (device selectors are not implemented yet; address a device by its exact ID)")
+	switch {
+	case req.DeviceID != "" && req.Selector != "":
+		writeErr(w, http.StatusBadRequest, "bad_request", "give either device_id or selector, not both")
+		return
+	case req.DeviceID == "" && req.Selector == "":
+		writeErr(w, http.StatusBadRequest, "bad_request", "device_id or selector required")
 		return
 	}
 	if req.Submitter == "" {
@@ -95,7 +273,7 @@ func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 	// device changes hands, so there is no check-then-act race between
 	// "is this device free?" and grabbing it.
 	job, err := s.cfg.Store.Enqueue(store.EnqueueRequest{
-		DeviceID: req.DeviceID, Command: req.Command, Cwd: req.Cwd, Env: req.Env,
+		DeviceID: req.DeviceID, Selector: req.Selector, Command: req.Command, Cwd: req.Cwd, Env: req.Env,
 		Submitter: req.Submitter, IdempotencyKey: req.IdempotencyKey,
 		Priority:    req.Priority,
 		MaxRuntime:  time.Duration(req.MaxRuntimeSeconds) * time.Second,
@@ -107,6 +285,10 @@ func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 	}
 	if errors.Is(err, store.ErrUnknownDevice) {
 		writeErr(w, http.StatusBadRequest, "unknown_device", err.Error())
+		return
+	}
+	if errors.Is(err, store.ErrNoMatchingDevice) {
+		writeErr(w, http.StatusBadRequest, "no_matching_device", err.Error())
 		return
 	}
 	if err != nil {

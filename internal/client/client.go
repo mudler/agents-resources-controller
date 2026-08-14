@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/mudler/agents-resources-controller/internal/model"
@@ -45,7 +46,10 @@ func New(baseURL, token string) *Client {
 }
 
 type SubmitOptions struct {
-	DeviceID       string
+	DeviceID string
+	// Selector picks a device by its labels instead of by exact ID. Give
+	// exactly one of DeviceID or Selector.
+	Selector       string
 	Command        []string
 	Cwd            string
 	Env            map[string]string
@@ -89,7 +93,7 @@ func (c *Client) Submit(ctx context.Context, opts SubmitOptions) (*model.Job, er
 			"idle_timeout %s is below the one-second granularity runtime ceilings are enforced at", opts.IdleTimeout)
 	}
 	payload, err := json.Marshal(server.SubmitRequest{
-		DeviceID: opts.DeviceID, Command: opts.Command, Cwd: opts.Cwd, Env: opts.Env,
+		DeviceID: opts.DeviceID, Selector: opts.Selector, Command: opts.Command, Cwd: opts.Cwd, Env: opts.Env,
 		Submitter: opts.Submitter, IdempotencyKey: opts.IdempotencyKey,
 		Priority:           opts.Priority,
 		MaxRuntimeSeconds:  int(opts.MaxRuntime.Seconds()),
@@ -286,6 +290,44 @@ func (c *Client) StreamLogs(ctx context.Context, id string, out io.Writer) error
 	}
 	_, err = io.Copy(out, resp.Body)
 	return err
+}
+
+// Describe fetches everything `rc describe` shows about one device: its
+// state and holder, every label with its provenance and age, the usage
+// sheet and when it was last written, and recent job history.
+func (c *Client) Describe(ctx context.Context, deviceID string) (*server.DescribeResponse, error) {
+	resp, err := c.do(ctx, http.MethodGet, "/v1/devices/"+deviceID+"/describe", nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, apiError(resp)
+	}
+	var out server.DescribeResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// Explain answers "if I submitted this selector right now, what would
+// happen" without submitting anything: which devices match, which of those
+// are free, and how deep the queue already is behind the ones that aren't.
+func (c *Client) Explain(ctx context.Context, selector string) (*server.ExplainResponse, error) {
+	resp, err := c.do(ctx, http.MethodGet, "/v1/explain?selector="+url.QueryEscape(selector), nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, apiError(resp)
+	}
+	var out server.ExplainResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return &out, nil
 }
 
 func (c *Client) State(ctx context.Context) (*server.StateResponse, error) {
