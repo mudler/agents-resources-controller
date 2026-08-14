@@ -367,6 +367,47 @@ func (s *Store) Leases() ([]model.Lease, error) {
 	return out, rows.Err()
 }
 
+// RecentJobsForDevice returns up to limit jobs that have run (or are
+// running) on this device, most recent submission first — the history
+// `rc describe` shows so an agent can see what a box has actually been
+// doing, not just what it's doing right now. A device with no history, or
+// one this controller has never heard of, yields an empty slice rather than
+// an error: a freshly registered device legitimately has nothing to show.
+func (s *Store) RecentJobsForDevice(deviceID string, limit int) ([]model.Job, error) {
+	rows, err := s.db.Query(
+		`SELECT id FROM jobs WHERE device_id = ? ORDER BY submitted_at DESC, rowid DESC LIMIT ?`,
+		deviceID, limit)
+	if err != nil {
+		return nil, err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// Rows are fully drained above before Job() issues its own query: the
+	// pool is capped at one connection, so a write or read with the cursor
+	// still open would deadlock.
+	out := make([]model.Job, 0, len(ids))
+	for _, id := range ids {
+		j, err := s.Job(id)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *j)
+	}
+	return out, nil
+}
+
 // AssignedJobsFor returns jobs handed to a worker that it has not started yet.
 func (s *Store) AssignedJobsFor(workerID string) ([]model.Job, error) {
 	rows, err := s.db.Query(
