@@ -24,6 +24,9 @@ type assignment struct {
 	Env                map[string]string `json:"env"`
 	MaxRuntimeSeconds  int               `json:"max_runtime_seconds,omitempty"`
 	IdleTimeoutSeconds int               `json:"idle_timeout_seconds,omitempty"`
+	// Submitter identifies who submitted this job, so a lifecycle hook's
+	// RC_SUBMITTER can name them.
+	Submitter string `json:"submitter,omitempty"`
 }
 
 // deviceSpec is what this worker declares about one of its devices at
@@ -60,14 +63,34 @@ type Worker struct {
 	started map[string]struct{}           // every job ID this process has ever started; never deleted
 
 	wg sync.WaitGroup // one entry per in-flight job goroutine; Start waits on this before returning
+
+	// hooks is this worker's resolved lifecycle-hook configuration, keyed
+	// by full device ID ("host:name"), built once at New() from cfg.
+	hooks map[string]hookSpec
+	// hooksMu guards deviceHooks (map insert/lookup only); each entry's own
+	// mutex guards everything else about that one device's held/linger
+	// state, so devices never contend with each other.
+	hooksMu     sync.Mutex
+	deviceHooks map[string]*deviceHookState
 }
 
 func New(cfg Config) *Worker {
+	hooks := make(map[string]hookSpec, len(cfg.Devices))
+	for _, d := range cfg.Devices {
+		hooks[cfg.Host+":"+d.Name] = hookSpec{
+			onAcquire:     d.OnAcquire,
+			onRelease:     d.OnRelease,
+			timeout:       d.HookTimeout,
+			releaseLinger: d.ReleaseLinger,
+		}
+	}
 	return &Worker{
-		cfg:     cfg,
-		http:    &http.Client{Timeout: 2 * time.Minute},
-		running: map[string]context.CancelFunc{},
-		started: map[string]struct{}{},
+		cfg:         cfg,
+		http:        &http.Client{Timeout: 2 * time.Minute},
+		running:     map[string]context.CancelFunc{},
+		started:     map[string]struct{}{},
+		hooks:       hooks,
+		deviceHooks: map[string]*deviceHookState{},
 	}
 }
 
@@ -90,6 +113,16 @@ func (w *Worker) Start(ctx context.Context) error {
 	if err := w.register(ctx); err != nil {
 		return err
 	}
+	// Before this worker ever polls for work, run the release hook of every
+	// device it declares one for. A worker that crashed (kill -9, an OOM,
+	// a crashed host) never got to run its normal release-on-idle path for
+	// whatever device it last held, and a clean shutdown followed by a
+	// restart lands here too — so this single pass, run unconditionally on
+	// every start, heals both cases without needing to tell them apart.
+	// This is exactly why the README requires the operator's release hook
+	// to be idempotent: this call has no idea whether the service it
+	// targets is already stopped.
+	w.runStartupReleaseHooks(ctx)
 	go w.heartbeatLoop(ctx)
 	w.pollLoop(ctx)
 
@@ -187,6 +220,54 @@ func (w *Worker) register(ctx context.Context) error {
 	w.workerID = out.WorkerID
 	slog.Info("registered", "worker_id", w.workerID, "host", w.cfg.Host, "devices", w.cfg.Devices)
 	return nil
+}
+
+// runStartupReleaseHooks runs the on_release hook of every device this
+// worker declares one for, sequentially, before Start's first poll. It
+// carries no job identity — RC_JOB_ID and RC_SUBMITTER are empty, exactly as
+// they are for any release this worker did not itself trigger — and it does
+// not touch this device's held state either way: a fresh process has never
+// held anything, and the whole point of this pass is to be safe to run
+// whether or not the previous process's job actually still had it acquired.
+// A failure here is logged the same way any other release-hook failure is:
+// loudly, but never as a reason to refuse to start.
+func (w *Worker) runStartupReleaseHooks(ctx context.Context) {
+	for deviceID, spec := range w.hooks {
+		if spec.onRelease == "" {
+			continue
+		}
+		out, err := w.runHook(ctx, spec.onRelease, "release", deviceID, "", "", spec.timeout)
+		if err != nil {
+			slog.Error("startup release hook failed", "device", deviceID, "err", err, "output_tail", tailOutput(out))
+			continue
+		}
+		slog.Info("startup release hook ran", "device", deviceID)
+	}
+}
+
+// reportFault tells the controller a device's on_acquire hook failed, so it
+// quarantines the device unhealthy with quarantine reason "fault" — the one
+// kind a proven reboot does not clear, because a reboot proves no process
+// survived but nothing about the hardware (or, here, the service the hook
+// couldn't stop). Unlike the terminal job report, this is not retried: it is
+// a best-effort nudge, not the call the device's lease depends on, and a
+// worker must never let an HTTP failure make it hold up or abandon anything
+// it is actually supervising.
+func (w *Worker) reportFault(ctx context.Context, deviceID, reason string) {
+	payload, err := json.Marshal(map[string]string{"reason": reason})
+	if err != nil {
+		slog.Error("marshal fault report", "device", deviceID, "err", err)
+		return
+	}
+	resp, err := w.do(ctx, http.MethodPost, "/v1/devices/"+deviceID+"/fault", bytes.NewReader(payload))
+	if err != nil {
+		slog.Error("report device fault failed", "device", deviceID, "err", err)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		slog.Error("report device fault rejected", "device", deviceID, "status", resp.Status)
+	}
 }
 
 // supervisedJobIDs is what this worker tells the controller it is actually
@@ -425,6 +506,29 @@ func (w *Worker) execute(ctx context.Context, a assignment) {
 	// covers shutdown too.
 	reportCtx := context.WithoutCancel(ctx)
 
+	// Ensure the device is held — running its on_acquire hook, unless an
+	// earlier job in this same back-to-back run already did and the device
+	// was never released — before this job ever touches it. spec is looked
+	// up once here and reused below for scheduleRelease, so both halves of
+	// this job's hook lifecycle agree on the same timeout/linger.
+	spec := w.hooks[a.DeviceID]
+	if acq := w.acquireDevice(ctx, a.DeviceID, spec, a.JobID, a.Submitter); acq.err != nil {
+		// The acquire hook failed (non-zero exit or timeout): the job never
+		// runs at all, it is reported failed with the hook's own output as
+		// the reason so the operator sees why from `rc ps`, and the device
+		// is quarantined as a fault rather than handed out again next poll.
+		slog.Error("acquire hook failed; job will not run", "job", a.JobID, "device", a.DeviceID, "err", acq.err)
+		reason := "acquire hook failed: " + acq.err.Error()
+		if tail := tailOutput(acq.output); tail != "" {
+			reason += "\n" + tail
+		}
+		w.reportTerminalWithRetry(reportCtx, a.JobID, map[string]any{
+			"state": model.JobFailed, "worker_id": w.workerID, "reason": reason,
+		})
+		w.reportFault(reportCtx, a.DeviceID, reason)
+		return
+	}
+
 	// worker_id is required: the controller rejects a status report for a job
 	// it did not assign to this worker, so one worker cannot free another's
 	// device out from under a running process. (The controller already
@@ -481,6 +585,13 @@ func (w *Worker) execute(ctx context.Context, a assignment) {
 	// the "running" report above, dropping it strands the device until the
 	// reaper notices, so it gets retried.
 	w.reportTerminalWithRetry(reportCtx, a.JobID, body)
+
+	// The job ended — success, failure, watchdog, kill, or shutdown, it
+	// makes no difference here. Arm the release linger; if another
+	// assignment for this device arrives before it fires, acquireDevice
+	// cancels it and this job's release never runs at all, which is exactly
+	// the point: the device was never actually idle in between.
+	w.scheduleRelease(a.DeviceID, spec, a.JobID, a.Submitter)
 }
 
 // terminalReportAttempts bounds how many times reportTerminalWithRetry will
