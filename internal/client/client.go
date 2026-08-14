@@ -84,6 +84,10 @@ func (c *Client) Submit(ctx context.Context, opts SubmitOptions) (*model.Job, er
 		return nil, fmt.Errorf(
 			"max_runtime %s is below the one-second granularity runtime ceilings are enforced at", opts.MaxRuntime)
 	}
+	if opts.IdleTimeout > 0 && opts.IdleTimeout < time.Second {
+		return nil, fmt.Errorf(
+			"idle_timeout %s is below the one-second granularity runtime ceilings are enforced at", opts.IdleTimeout)
+	}
 	payload, err := json.Marshal(server.SubmitRequest{
 		DeviceID: opts.DeviceID, Command: opts.Command, Cwd: opts.Cwd, Env: opts.Env,
 		Submitter: opts.Submitter, IdempotencyKey: opts.IdempotencyKey,
@@ -139,29 +143,65 @@ func (c *Client) JobView(ctx context.Context, id string) (*server.JobView, error
 	return &view, nil
 }
 
+const (
+	// scheduledPollInterval, scheduledPollTimeout and
+	// maxScheduledPollFailures are WaitScheduled's own retry budget —
+	// deliberately separate from WaitTerminal's pollTimeout/pollInterval/
+	// maxPollFailures below, and tuned differently. WaitTerminal's 10s
+	// per-poll bound would take well over a minute to give up on a
+	// genuinely hung controller here (each of maxPollFailures+1 attempts
+	// blocking for the full 10s) — too slow to be a reasonable
+	// human-facing wait, and (before this was split out) the reason a
+	// test covering that exact scenario was impractical to write.
+	//
+	// Instant-failing polls (connection refused, a 500 during a restart)
+	// are tolerated for roughly maxScheduledPollFailures *
+	// scheduledPollInterval = 16 * 500ms = 8s of wall clock — comfortably
+	// more than the couple of seconds an ordinary controller restart
+	// takes.
+	//
+	// A hung connection (accepted, never answered — exactly a wedged
+	// controller) is bounded per attempt by scheduledPollTimeout and
+	// detected within roughly (maxScheduledPollFailures+1) *
+	// scheduledPollTimeout + maxScheduledPollFailures *
+	// scheduledPollInterval ≈ 17s + 8s = 25s worst case — bounded well
+	// under a minute, in production as well as in the test that exercises
+	// it.
+	scheduledPollInterval    = 500 * time.Millisecond
+	scheduledPollTimeout     = 1 * time.Second
+	maxScheduledPollFailures = 16
+)
+
 // WaitScheduled polls until the job leaves the queue, calling onPosition each
 // time its position changes so the caller can show progress.
 //
 // Like WaitTerminal, it tolerates a bounded run of consecutive poll
 // failures — a dropped connection, a controller restarting for a couple of
 // seconds — with a fixed retry interval, resetting the count on every
-// success, rather than giving up on the very first one. This distinction
-// matters more here than in WaitTerminal: a caller (rc run) that sees
+// success, rather than giving up on the very first one (see the constants
+// above for the resulting wall-clock budgets). This distinction matters
+// more here than in WaitTerminal: a caller (rc run) that sees
 // WaitScheduled give up may go on to cancel the job, since nothing is
 // running yet and there is no lease to protect — but only if the job is
 // actually still queued. A transient network blip must never be
 // indistinguishable from "genuinely done waiting", or a brief controller
 // hiccup can end up cancelling — or, worse, if the job was scheduled
 // during the blip, flagging for kill — a job that was never in trouble.
-// The giveup error is deliberately not context.DeadlineExceeded: callers
-// use that specific sentinel to recognize a real, caller-requested
-// deadline (e.g. --timeout) as opposed to an error this function does not
-// understand.
+//
+// The giveup error, when the retry budget above is exhausted, is NOT
+// distinguished from an ordinary error by its type or content — deciding
+// "the caller's own bound elapsed" by unwrapping context.DeadlineExceeded
+// from this error is unsound: each poll already runs under its own
+// scheduledPollTimeout-bounded context, so a hung controller produces
+// exactly that same error, with no caller deadline in sight at all.
+// Callers must instead check their own context's Err() directly (see
+// cli.NewRunCmd's waitCtx) to tell a real, caller-requested deadline
+// apart from this function simply giving up.
 func (c *Client) WaitScheduled(ctx context.Context, id string, onPosition func(int)) (*model.Job, error) {
 	last := -1
 	failures := 0
 	for {
-		pollCtx, cancel := context.WithTimeout(ctx, pollTimeout)
+		pollCtx, cancel := context.WithTimeout(ctx, scheduledPollTimeout)
 		view, err := c.JobView(pollCtx, id)
 		cancel()
 
@@ -173,7 +213,7 @@ func (c *Client) WaitScheduled(ctx context.Context, id string, onPosition func(i
 				return nil, ctx.Err()
 			}
 			failures++
-			if failures > maxPollFailures {
+			if failures > maxScheduledPollFailures {
 				return nil, fmt.Errorf(
 					"giving up waiting for job %s to be scheduled after %d consecutive poll failures: %w",
 					id, failures, err)
@@ -194,7 +234,7 @@ func (c *Client) WaitScheduled(ctx context.Context, id string, onPosition func(i
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-time.After(pollInterval):
+		case <-time.After(scheduledPollInterval):
 		}
 	}
 }

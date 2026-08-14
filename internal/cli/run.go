@@ -140,16 +140,28 @@ func NewRunCmd() *cobra.Command {
 					// running yet, so there is no lease to protect.
 					cancelQueuedJob(c, stop, stderr, job, submitter)
 					return exitCodeError{code: sigintExitCode}
-				case errors.Is(err, context.DeadlineExceeded):
-					// A genuine --timeout expiry: same reasoning as
-					// Ctrl-C above, nothing is running yet.
+				case waitCtx.Err() != nil:
+					// The caller's own --timeout bound elapsed. This is
+					// deliberately checked against waitCtx's own Err()
+					// directly, NOT by inspecting err for a wrapped
+					// context.DeadlineExceeded: WaitScheduled bounds each
+					// individual poll with its own per-request timeout, so
+					// a hung controller (accepted connection, never
+					// answered) produces that exact same error with no
+					// caller deadline in sight at all — unwrapping it here
+					// would kill a job whose only crime was that the
+					// controller went quiet, which is precisely the bug
+					// this switch exists to prevent. waitCtx's own Err()
+					// is only ever non-nil here because its deadline
+					// genuinely passed (when timeout<=0, waitCtx is ctx
+					// itself, already ruled out by the case above).
 					cancelQueuedJob(c, stop, stderr, job, submitter)
 					return fmt.Errorf("gave up waiting for %s: %w", device, err)
 				default:
-					// An error WaitScheduled itself gave up on (e.g. a run
-					// of transient poll failures surviving past its own
-					// retry budget) is NOT license to kill: by the time
-					// this surfaces, the job may already have been
+					// Any other error — most notably WaitScheduled
+					// exhausting its own retry budget against a wedged or
+					// erroring controller — is NOT license to kill: by the
+					// time this surfaces, the job may already have been
 					// scheduled and be running on real hardware. A
 					// client-side network blip must cost the caller
 					// patience, never someone else's GPU job. Report the

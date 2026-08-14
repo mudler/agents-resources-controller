@@ -420,8 +420,72 @@ func TestRunTransientPollErrorsDoNotKillJob(t *testing.T) {
 
 	var coded interface{ ExitCode() int }
 	require.False(t, errors.As(err, &coded), "an error rc run doesn't understand must not carry a job exit code")
-	require.False(t, errors.Is(err, context.DeadlineExceeded))
 	require.False(t, killCalled.Load(), "a run of poll failures must never be treated as license to kill the job")
+}
+
+// TestRunNeverKillsOnHungControllerWithoutTimeout is the regression test
+// for the second round of the Critical finding: checking
+// errors.Is(err, context.DeadlineExceeded) is NOT a reliable way to detect
+// "the caller's own --timeout elapsed", because WaitScheduled bounds each
+// individual poll with its own per-request timeout — so a controller that
+// accepts connections but never answers (a genuine wedge, not an
+// instantly-failing one) produces exactly that same wrapped error, with no
+// caller deadline in sight at all. With no --timeout flag, rc run must
+// never take the "genuine timeout" branch here; it may only kill when the
+// caller actually asked for a bound and that bound elapsed.
+//
+// This must run against a real hang (never respond), not an instant
+// failure (see TestRunTransientPollErrorsDoNotKillJob) — the earlier test
+// cannot reach this bug, since a 500 returned immediately never exercises
+// WaitScheduled's per-request context timeout at all.
+func TestRunNeverKillsOnHungControllerWithoutTimeout(t *testing.T) {
+	job := model.Job{ID: "job1", DeviceID: "gpubox:gpu0", State: model.JobQueued}
+	var killCalled atomic.Bool
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/jobs":
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(job)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/jobs/job1":
+			// Accept the connection, never answer it — a genuine wedge,
+			// not an instantly-failing error. Each poll times out against
+			// its own per-request context, which is exactly the trap:
+			// that per-request timeout also produces
+			// context.DeadlineExceeded, indistinguishable from a real
+			// --timeout expiry if the caller inspects the error's wrapped
+			// content instead of its own context.
+			<-r.Context().Done()
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/jobs/job1/kill":
+			killCalled.Store(true)
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	t.Setenv("RC_CONTROLLER", ts.URL)
+	t.Setenv("RC_TOKEN", "tok")
+
+	cmd := cli.NewRunCmd()
+	cmd.SilenceUsage = true
+	cmd.SilenceErrors = true
+	cmd.SetErr(&syncBuffer{})
+	// Deliberately no --timeout: the caller asked to wait indefinitely.
+	cmd.SetArgs([]string{"-d", "gpubox:gpu0", "--as", "tester", "--", "true"})
+
+	err := cmd.Execute()
+	require.Error(t, err)
+
+	var coded interface{ ExitCode() int }
+	require.False(t, errors.As(err, &coded), "an error rc run doesn't understand must not carry a job exit code")
+	require.Contains(t, err.Error(), "job1")
+	require.Contains(t, err.Error(), "lost track",
+		"a hung controller with no --timeout must be reported as lost track, not as a timeout giveup")
+	require.NotContains(t, err.Error(), "gave up waiting",
+		"must not be reported using the --timeout giveup wording when the caller never asked for a bound")
+	require.False(t, killCalled.Load(), "a hung controller must never be treated as license to kill the job when no --timeout was given")
 }
 
 // TestRunDetachesFromRunningJobOnCtrlC pins Stage 1's behaviour, which this
