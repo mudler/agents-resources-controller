@@ -3,6 +3,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -12,6 +13,12 @@ import (
 	"github.com/mudler/agents-resources-controller/internal/logstore"
 	"github.com/mudler/agents-resources-controller/internal/store"
 )
+
+// contextKey is an unexported type so values this package stores on a
+// request context can never collide with a key set by another package.
+type contextKey int
+
+const roleContextKey contextKey = iota
 
 type Config struct {
 	Store  *store.Store
@@ -40,6 +47,7 @@ func (s *Server) Handler() http.Handler {
 
 	mux.Handle("POST /v1/jobs", s.require("client", s.handleSubmit))
 	mux.Handle("GET /v1/jobs/{id}", s.require("client", s.handleGetJob))
+	mux.Handle("POST /v1/jobs/{id}/kill", s.require("client", s.handleKill))
 	mux.Handle("GET /v1/jobs/{id}/logs", s.require("client", s.handleStreamLogs))
 	mux.Handle("GET /v1/devices", s.require("client", s.handleDevices))
 	mux.Handle("GET /v1/state", s.require("client", s.handleState))
@@ -65,6 +73,7 @@ func (s *Server) require(role string, h http.HandlerFunc) http.Handler {
 			writeErr(w, http.StatusForbidden, "forbidden", "token role "+got+" may not call a "+role+" route")
 			return
 		}
+		r = r.WithContext(context.WithValue(r.Context(), roleContextKey, got))
 		h(w, r)
 	})
 }
@@ -75,6 +84,20 @@ func allows(have, want string) bool {
 	}
 	return false
 }
+
+// isAdmin reports whether the token that authenticated this request resolved
+// to the admin role. require stores that role on the request context, so a
+// handler that needs to distinguish "the owner" from "an operator overriding
+// on someone else's behalf" can read it here rather than re-deriving it.
+func isAdmin(r *http.Request) bool {
+	role, _ := r.Context().Value(roleContextKey).(string)
+	return role == "admin"
+}
+
+// Poke wakes a worker's assignment long-poll immediately. Exported so callers
+// outside this package (the scheduler loop in `rc serve`) can nudge a worker
+// without reaching into unexported state.
+func (s *Server) Poke(workerID string) { s.notify.poke(workerID) }
 
 type errorBody struct {
 	Error   string `json:"error"`

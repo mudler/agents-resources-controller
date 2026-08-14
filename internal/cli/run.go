@@ -92,7 +92,11 @@ func NewRunCmd() *cobra.Command {
 				IdempotencyKey: uuid.NewString(),
 			})
 			if errors.Is(err, client.ErrNoDevice) {
-				return fmt.Errorf("%s is busy (stage 1 has no queue — retry or pick another device)", device)
+				// rc run does not set NoWait, so a plain busy device queues
+				// rather than reaching this branch; it stays here as the
+				// correct response if that ever changes (e.g. a future
+				// --no-wait flag).
+				return fmt.Errorf("%s is busy and could not be queued", device)
 			}
 			if err != nil {
 				return err

@@ -53,6 +53,16 @@ func post(t *testing.T, ts *httptest.Server, token, path string, body any) *http
 	return resp
 }
 
+func get(t *testing.T, ts *httptest.Server, token, path string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, ts.URL+path, nil)
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := ts.Client().Do(req)
+	require.NoError(t, err)
+	return resp
+}
+
 // postRaw sends a raw byte body without JSON-encoding it, and lets the
 // caller set the Authorization header verbatim (no automatic "Bearer "
 // prefixing), so tests can exercise malformed auth headers and oversized

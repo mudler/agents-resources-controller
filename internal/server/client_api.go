@@ -19,12 +19,22 @@ import (
 // knob; the internal column and default stay, ready for the stage that
 // actually enforces them.
 type SubmitRequest struct {
-	DeviceID       string            `json:"device_id"`
-	Command        []string          `json:"command"`
-	Cwd            string            `json:"cwd,omitempty"`
-	Env            map[string]string `json:"env,omitempty"`
-	Submitter      string            `json:"submitter"`
-	IdempotencyKey string            `json:"idempotency_key,omitempty"`
+	DeviceID           string            `json:"device_id"`
+	Command            []string          `json:"command"`
+	Cwd                string            `json:"cwd,omitempty"`
+	Env                map[string]string `json:"env,omitempty"`
+	Submitter          string            `json:"submitter"`
+	IdempotencyKey     string            `json:"idempotency_key,omitempty"`
+	Priority           int               `json:"priority,omitempty"`
+	MaxRuntimeSeconds  int               `json:"max_runtime_seconds,omitempty"`
+	IdleTimeoutSeconds int               `json:"idle_timeout_seconds,omitempty"`
+	NoWait             bool              `json:"no_wait,omitempty"`
+}
+
+// JobView is a job plus the queue position a client needs to show progress.
+type JobView struct {
+	Job           model.Job `json:"job"`
+	QueuePosition int       `json:"queue_position,omitempty"`
 }
 
 type DeviceView struct {
@@ -39,6 +49,7 @@ type DeviceView struct {
 type StateResponse struct {
 	Devices []DeviceView `json:"devices"`
 	Jobs    []model.Job  `json:"jobs"`
+	Queued  []model.Job  `json:"queued"`
 }
 
 func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
@@ -61,26 +72,54 @@ func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// LeaseTTL is left zero: Allocate applies its own internal default (see
-	// store.AllocateRequest.LeaseTTL). Stage 1 has no expiry enforcement, so
-	// there is nothing for a client-supplied value to control yet.
-	job, err := s.cfg.Store.Allocate(store.AllocateRequest{
+	// Submitting always enqueues: ScheduleOnce below is the only place a
+	// device changes hands, so there is no check-then-act race between
+	// "is this device free?" and grabbing it.
+	job, err := s.cfg.Store.Enqueue(store.EnqueueRequest{
 		DeviceID: req.DeviceID, Command: req.Command, Cwd: req.Cwd, Env: req.Env,
 		Submitter: req.Submitter, IdempotencyKey: req.IdempotencyKey,
+		Priority:    req.Priority,
+		MaxRuntime:  time.Duration(req.MaxRuntimeSeconds) * time.Second,
+		IdleTimeout: time.Duration(req.IdleTimeoutSeconds) * time.Second,
 	})
-	if errors.Is(err, store.ErrNoDevice) {
-		// No queue in stage 1: say so immediately rather than block.
+	if errors.Is(err, store.ErrRuntimeAboveCeiling) {
+		writeErr(w, http.StatusBadRequest, "runtime_above_ceiling", err.Error())
+		return
+	}
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "store_error", "could not queue job")
+		return
+	}
+
+	// Make one scheduling pass so a free device starts immediately rather
+	// than waiting for the loop's next tick.
+	assigned, err := s.cfg.Store.ScheduleOnce()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "store_error", "could not schedule")
+		return
+	}
+	for _, a := range assigned {
+		s.notify.poke(a.WorkerID)
+	}
+
+	current, err := s.cfg.Store.Job(job.ID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "store_error", "could not read job")
+		return
+	}
+
+	// --no-wait keeps stage 1's behaviour: never sit in a queue.
+	if req.NoWait && current.State == model.JobQueued {
+		if _, err := s.cfg.Store.CancelQueued(current.ID, "no-wait: device busy"); err != nil {
+			writeErr(w, http.StatusInternalServerError, "store_error", "could not cancel")
+			return
+		}
 		writeErr(w, http.StatusConflict, "no_device_available",
 			fmt.Sprintf("%s is not free", req.DeviceID))
 		return
 	}
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
-		return
-	}
 
-	s.notify.poke(job.WorkerID)
-	writeJSON(w, http.StatusCreated, job)
+	writeJSON(w, http.StatusCreated, current)
 }
 
 func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {
@@ -89,7 +128,62 @@ func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {
 		writeJobLookupError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, job)
+	pos, err := s.cfg.Store.QueuePosition(job.ID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "store_error", "could not read queue position")
+		return
+	}
+	writeJSON(w, http.StatusOK, JobView{Job: *job, QueuePosition: pos})
+}
+
+type KillRequest struct {
+	Submitter string `json:"submitter"`
+}
+
+// handleKill cancels a queued job outright, or asks the worker to terminate a
+// running one by flagging it and letting the worker's poll observe the kill
+// flag (task 5). Ownership is checked against the submitter unless the caller
+// holds an admin token.
+func (s *Server) handleKill(w http.ResponseWriter, r *http.Request) {
+	var req KillRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	jobID := r.PathValue("id")
+
+	job, err := s.cfg.Store.Job(jobID)
+	if err != nil {
+		writeJobLookupError(w, err)
+		return
+	}
+	if !isAdmin(r) && job.Submitter != req.Submitter {
+		writeErr(w, http.StatusForbidden, "not_job_owner",
+			"only the submitter or an admin may kill this job")
+		return
+	}
+
+	switch job.State {
+	case model.JobQueued:
+		ok, err := s.cfg.Store.CancelQueued(jobID, "killed by "+req.Submitter)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, "store_error", "could not cancel")
+			return
+		}
+		if !ok {
+			writeErr(w, http.StatusConflict, "not_cancellable", "job already started")
+			return
+		}
+	case model.JobAssigned, model.JobRunning:
+		if err := s.cfg.Store.RequestKill(jobID); err != nil {
+			writeErr(w, http.StatusInternalServerError, "store_error", "could not request kill")
+			return
+		}
+		s.notify.poke(job.WorkerID)
+	default:
+		writeErr(w, http.StatusConflict, "not_cancellable", "job already finished")
+		return
+	}
+	w.WriteHeader(http.StatusOK)
 }
 
 // writeJobLookupError maps a Store.Job error to the right client-facing
@@ -127,7 +221,12 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, StateResponse{Devices: views, Jobs: jobs})
+	queued, err := s.cfg.Store.QueuedJobs()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, StateResponse{Devices: views, Jobs: jobs, Queued: queued})
 }
 
 // deviceViews joins devices to their live lease so a caller sees who holds

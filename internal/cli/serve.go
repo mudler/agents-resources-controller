@@ -94,11 +94,45 @@ func NewServeCmd() *cobra.Command {
 					}
 				}
 			}()
+			// The scheduler: assigns queued jobs to devices as they free up.
+			// handleSubmit already makes one scheduling pass at submit time so
+			// a free device starts immediately; this loop is what notices a
+			// device freeing up later (a job finishing, a worker
+			// re-registering) and hands the next queued job to it. It runs on
+			// the same reaperCtx and is joined the same way, for the same
+			// reason: reaperCtx.Done() is guaranteed to fire on every return
+			// path, and the store must not be touched after st.Close() runs
+			// below.
+			var schedulerWG sync.WaitGroup
+			schedulerWG.Add(1)
+			go func() {
+				defer schedulerWG.Done()
+				t := time.NewTicker(time.Second)
+				defer t.Stop()
+				for {
+					select {
+					case <-reaperCtx.Done():
+						return
+					case <-t.C:
+						assigned, err := st.ScheduleOnce()
+						if err != nil {
+							slog.Error("schedule", "err", err)
+							continue
+						}
+						for _, job := range assigned {
+							srv.Poke(job.WorkerID)
+						}
+					}
+				}
+			}()
+
 			// Deferred in this order so Go's LIFO unwind runs them
-			// cancelReaper -> reaperWG.Wait -> st.Close: stop the reaper first
-			// (works even if cmd.Context() is still live), then wait for it to
-			// actually exit, then close the store it was using.
+			// cancelReaper -> reaperWG.Wait -> schedulerWG.Wait -> st.Close:
+			// stop both loops first (works even if cmd.Context() is still
+			// live), then wait for them to actually exit, then close the
+			// store they were using.
 			defer reaperWG.Wait()
+			defer schedulerWG.Wait()
 			defer cancelReaper()
 
 			httpSrv := &http.Server{Addr: addr, Handler: srv.Handler()}

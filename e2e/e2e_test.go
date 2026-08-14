@@ -85,14 +85,17 @@ func TestEndToEndClaimRunRelease(t *testing.T) {
 	require.Equal(t, "testbox:dev0", job.DeviceID)
 
 	// 3. THE CORE INVARIANT: while that job holds the device, a second submit
-	// for the same device must be refused, not queued and not silently
-	// accepted onto a second worker slot. This is the entire reason the
-	// project exists — two jobs must never hold one GPU.
+	// for the same device must never be handed the device too — not silently
+	// accepted onto a second worker slot. Stage 2 queues a busy device by
+	// default rather than refusing outright, so this uses NoWait to assert
+	// the sharper claim: even opting out of the queue, the device does not
+	// change hands. This is the entire reason the project exists — two jobs
+	// must never hold one GPU.
 	_, err = cl.Submit(ctx, client.SubmitOptions{
-		DeviceID: "testbox:dev0", Command: []string{"true"}, Submitter: "agent-b",
+		DeviceID: "testbox:dev0", Command: []string{"true"}, Submitter: "agent-b", NoWait: true,
 	})
 	require.ErrorIs(t, err, client.ErrNoDevice,
-		"a second submit for a held device must be refused with ErrNoDevice, not accepted or queued")
+		"a second submit for a held device must be refused with ErrNoDevice, not accepted")
 
 	// Confirm the state view agrees: the device is busy and held by agent-a,
 	// not just that the second Submit call happened to fail.
@@ -233,9 +236,12 @@ func TestWorkerRestartQuarantinesDeviceInsteadOfFalselyReady(t *testing.T) {
 	require.Equal(t, model.JobLost, final.State)
 
 	// And the invariant holds end to end: nothing can claim the quarantined
-	// device until an operator clears it.
+	// device until an operator clears it. NoWait for the same reason as
+	// above: a quarantined device is never free, so even the queue-opt-out
+	// path must fail rather than park a job behind a device that will never
+	// become schedulable again on its own.
 	_, err = cl.Submit(ctx, client.SubmitOptions{
-		DeviceID: "restartbox:dev0", Command: []string{"true"}, Submitter: "agent-b",
+		DeviceID: "restartbox:dev0", Command: []string{"true"}, Submitter: "agent-b", NoWait: true,
 	})
 	require.ErrorIs(t, err, client.ErrNoDevice,
 		"a quarantined device must refuse a new claim, not silently hand out a GPU nobody has proven is clean")

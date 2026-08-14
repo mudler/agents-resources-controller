@@ -35,6 +35,12 @@ var migrations = []struct {
 			   ON jobs(state, priority DESC, queued_at)`,
 		},
 	},
+	{
+		name: "kill requests",
+		stmts: []string{
+			`ALTER TABLE jobs ADD COLUMN kill_requested INTEGER NOT NULL DEFAULT 0`,
+		},
+	},
 }
 
 // migrate brings the database up to len(migrations). It runs each pending

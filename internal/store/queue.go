@@ -272,6 +272,38 @@ func (s *Store) CancelQueued(jobID, reason string) (bool, error) {
 	return true, err
 }
 
+// RequestKill flags a running job for termination. The worker sees the flag on
+// its next poll and terminates the process group; the terminal report then
+// arrives through the normal path, so there is exactly one place where a job
+// ends.
+func (s *Store) RequestKill(jobID string) error {
+	_, err := s.db.Exec(
+		`UPDATE jobs SET kill_requested = 1 WHERE id = ? AND state IN (?, ?)`,
+		jobID, string(model.JobAssigned), string(model.JobRunning))
+	return err
+}
+
+// KillRequestedFor lists jobs on a worker that have been flagged for kill.
+func (s *Store) KillRequestedFor(workerID string) ([]string, error) {
+	rows, err := s.db.Query(
+		`SELECT id FROM jobs WHERE worker_id = ? AND kill_requested = 1 AND state IN (?, ?)`,
+		workerID, string(model.JobAssigned), string(model.JobRunning))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) reserve(jobID, deviceID string) error {
 	_, err := s.db.Exec(
 		`INSERT OR REPLACE INTO reservations (job_id, device_id, created_at) VALUES (?, ?, ?)`,

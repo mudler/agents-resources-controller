@@ -46,18 +46,23 @@ func TestSubmitAllocatesDeviceAndReturnsJob(t *testing.T) {
 	require.Equal(t, "gpubox:gpu0", job.DeviceID)
 }
 
-// Stage 1 has no queue: a busy device is refused immediately, not parked.
+// Stage 2 queues a busy device by default (see TestSubmitQueuesWhenDeviceIsBusy
+// in queue_api_test.go); this test now covers what it was actually testing —
+// a caller that opts out of the queue with NoWait still gets an immediate
+// 409, not a parked job.
 func TestSubmitOnBusyDeviceReturns409(t *testing.T) {
-	ts, _, _, _ := newServer(t)
+	ts, st, _, _ := newServer(t)
 	registerWorker(t, ts)
 
 	first := post(t, ts, "ctok", "/v1/jobs", server.SubmitRequest{
 		DeviceID: "gpubox:gpu0", Command: []string{"./bench"}, Submitter: "agent-a",
 	})
 	first.Body.Close()
+	_, err := st.ScheduleOnce()
+	require.NoError(t, err)
 
 	second := post(t, ts, "ctok", "/v1/jobs", server.SubmitRequest{
-		DeviceID: "gpubox:gpu0", Command: []string{"./bench"}, Submitter: "agent-b",
+		DeviceID: "gpubox:gpu0", Command: []string{"./bench"}, Submitter: "agent-b", NoWait: true,
 	})
 	defer second.Body.Close()
 	require.Equal(t, http.StatusConflict, second.StatusCode)

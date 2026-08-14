@@ -15,8 +15,9 @@ import (
 	"github.com/mudler/agents-resources-controller/internal/server"
 )
 
-// ErrNoDevice mirrors the controller's 409: nothing free right now. Stage 1
-// has no queue, so the caller decides whether to retry.
+// ErrNoDevice mirrors the controller's 409: nothing free right now. A plain
+// Submit queues instead of returning this; it only surfaces when the caller
+// passes NoWait, opting out of the queue in favor of an immediate answer.
 var ErrNoDevice = errors.New("no device available")
 
 type Client struct {
@@ -41,6 +42,9 @@ type SubmitOptions struct {
 	Env            map[string]string
 	Submitter      string
 	IdempotencyKey string
+	// NoWait opts out of stage 2's queue: a busy device fails fast with
+	// ErrNoDevice instead of the job sitting queued behind it.
+	NoWait bool
 }
 
 func (c *Client) do(ctx context.Context, method, path string, body io.Reader) (*http.Response, error) {
@@ -57,6 +61,7 @@ func (c *Client) Submit(ctx context.Context, opts SubmitOptions) (*model.Job, er
 	payload, err := json.Marshal(server.SubmitRequest{
 		DeviceID: opts.DeviceID, Command: opts.Command, Cwd: opts.Cwd, Env: opts.Env,
 		Submitter: opts.Submitter, IdempotencyKey: opts.IdempotencyKey,
+		NoWait: opts.NoWait,
 	})
 	if err != nil {
 		return nil, err
@@ -89,11 +94,11 @@ func (c *Client) Job(ctx context.Context, id string) (*model.Job, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, apiError(resp)
 	}
-	var job model.Job
-	if err := json.NewDecoder(resp.Body).Decode(&job); err != nil {
+	var view server.JobView
+	if err := json.NewDecoder(resp.Body).Decode(&view); err != nil {
 		return nil, err
 	}
-	return &job, nil
+	return &view.Job, nil
 }
 
 // StreamLogs copies the job's output to out until the job finishes.
