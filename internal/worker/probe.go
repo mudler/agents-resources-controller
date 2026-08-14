@@ -27,6 +27,20 @@ type ProbeResult struct {
 	Device map[string]map[string]string
 }
 
+// probePassBudget bounds the WHOLE gatherLabels pass — every built-in call
+// and every drop-in probe together, not each one's own per-probe timeout
+// summed. Without this, N probes each capped at ProbeTimeout still
+// serialise to N*ProbeTimeout: 20 drop-ins at the 5s default is 100s,
+// comfortably past the worker's heartbeat interval (default 10s). Whatever
+// the budget cuts short is simply skipped for this pass — gatherLabels runs
+// again on ProbeInterval, so a probe that lost its turn gets another one
+// soon, and nothing here is "lost" the way a startup hook's crash-recovery
+// pass would be.
+//
+// A var, not a const, so a test can shrink it without waiting out a real
+// 30s budget.
+var probePassBudget = 30 * time.Second
+
 // gatherLabels discovers this host's device facts: the built-ins (CPU count,
 // memory, disk, kernel, and — when nvidia-smi is on PATH — GPU facts), then
 // every executable in cfg.ProbeDir, run in name order.
@@ -40,6 +54,9 @@ type ProbeResult struct {
 // Later probes overwrite earlier keys for the same fact: 20-x.sh wins over
 // 10-x.sh, and drop-in probes win over the built-ins that ran before them.
 func (w *Worker) gatherLabels(ctx context.Context) ProbeResult {
+	ctx, cancel := context.WithTimeout(ctx, probePassBudget)
+	defer cancel()
+
 	deviceNames := make(map[string]struct{}, len(w.cfg.Devices))
 	res := ProbeResult{Host: map[string]string{}, Device: map[string]map[string]string{}}
 	for _, d := range w.cfg.Devices {
@@ -47,12 +64,12 @@ func (w *Worker) gatherLabels(ctx context.Context) ProbeResult {
 		res.Device[d.Name] = map[string]string{}
 	}
 
-	merge := func(facts map[string]string) {
-		mergeProbeFacts(&res, facts, deviceNames)
+	merge := func(source string, facts map[string]string) {
+		mergeProbeFacts(&res, facts, deviceNames, source)
 	}
 
-	merge(builtinLabels())
-	merge(nvidiaLabels(ctx, w.cfg.ProbeTimeout))
+	merge("builtin", builtinLabels())
+	merge("nvidia-smi", nvidiaLabels(ctx, w.cfg.ProbeTimeout))
 
 	entries, err := os.ReadDir(w.cfg.ProbeDir)
 	if err != nil {
@@ -74,6 +91,12 @@ func (w *Worker) gatherLabels(ctx context.Context) ProbeResult {
 	sort.Strings(names) // execution order is name order, so "20-x" overwrites "10-x"
 
 	for _, name := range names {
+		if err := ctx.Err(); err != nil {
+			slog.Warn("probe pass exceeded its budget; remaining probes skipped",
+				"dir", w.cfg.ProbeDir, "budget", probePassBudget)
+			break
+		}
+
 		path := filepath.Join(w.cfg.ProbeDir, name)
 		info, err := os.Stat(path)
 		if err != nil {
@@ -89,54 +112,142 @@ func (w *Worker) gatherLabels(ctx context.Context) ProbeResult {
 			slog.Warn("probe failed; skipped", "probe", path, "err", err)
 			continue
 		}
-		merge(facts)
+		merge(path, facts)
 	}
 	return res
 }
 
-// mergeProbeFacts applies one probe's flat fact map into res. A key of the
-// form "<device-name>.<label>" — where <device-name> matches one of this
-// host's configured devices — is a device fact; every other key, dotted or
-// not, is a host fact applied to every device.
-func mergeProbeFacts(res *ProbeResult, facts map[string]string, deviceNames map[string]struct{}) {
+// keyKind is what mergeProbeFacts decided one probe-emitted key is.
+type keyKind int
+
+const (
+	keyHost keyKind = iota
+	keyDevice
+	keyInvalid
+)
+
+// classifyKey decides where one flat-JSON key belongs. A key with no dot is
+// a host fact, applied to every device. A key with a dot names a device it
+// targets — the substring before the first dot — so it is a fact for that
+// device ONLY if this host actually declares a device by that name;
+// otherwise it is dropped, not promoted to a host fact. Promoting an
+// unrecognised device-scoped key to Host used to mean a probe emitting
+// "gpu0.model"/"gpu1.model" on a host whose devices are actually named
+// "a100-0"/"rtx-0" silently applied BOTH GPUs' models to EVERY device —
+// exactly the kind of wrong-card scheduling this whole mechanism exists to
+// prevent. A malformed dotted key (empty prefix or suffix — ".lead",
+// "trail.") or an empty key ("") is dropped the same way: it was never a
+// valid host key or a valid device key.
+func classifyKey(key string, deviceNames map[string]struct{}) (kind keyKind, dev, label string) {
+	if key == "" {
+		return keyInvalid, "", ""
+	}
+	i := strings.Index(key, ".")
+	if i < 0 {
+		return keyHost, "", key
+	}
+	if i == 0 || i == len(key)-1 {
+		return keyInvalid, "", ""
+	}
+	prefix := key[:i]
+	if _, known := deviceNames[prefix]; !known {
+		return keyInvalid, "", ""
+	}
+	return keyDevice, prefix, key[i+1:]
+}
+
+// mergeProbeFacts applies one probe's flat fact map into res, classifying
+// every key via classifyKey. source names where these facts came from
+// ("builtin", "nvidia-smi", or a probe's path) purely for the warning
+// logged when a key is dropped.
+func mergeProbeFacts(res *ProbeResult, facts map[string]string, deviceNames map[string]struct{}, source string) {
 	for k, v := range facts {
-		if dev, label, ok := splitDeviceKey(k, deviceNames); ok {
+		switch kind, dev, label := classifyKey(k, deviceNames); kind {
+		case keyHost:
+			res.Host[k] = v
+		case keyDevice:
 			if res.Device[dev] == nil {
 				res.Device[dev] = map[string]string{}
 			}
 			res.Device[dev][label] = v
-			continue
+		default: // keyInvalid
+			slog.Warn("probe key names no known device or is malformed; dropped", "source", source, "key", k)
 		}
-		res.Host[k] = v
 	}
 }
 
-// splitDeviceKey reports whether key targets one specific device: the
-// substring before its first "." must name a device this host actually
-// declares, otherwise the key is left whole as a host fact. This is what
-// keeps an incidental dot in a host-scoped key (say, a probe that ever
-// emitted "os.kernel") from being misread as aimed at a device called "os".
-func splitDeviceKey(key string, deviceNames map[string]struct{}) (dev, label string, ok bool) {
-	i := strings.Index(key, ".")
-	if i <= 0 || i == len(key)-1 {
-		return "", "", false
+// maxProbeOutputBytes bounds how much of a probe's stdout (and, separately,
+// its stderr) is retained before that stream is judged pathological. A
+// label set is a handful of short strings; a probe still producing output
+// past this is misbehaving, not merely verbose. Measured: a probe emitting
+// 200MB was fully buffered in 1.57s — well inside any sane timeout, so a
+// slow timeout alone does not bound memory here; only a hard cap on what's
+// kept does.
+const maxProbeOutputBytes = 64 * 1024
+
+// boundedBuffer accepts every byte written to it — so the writer (a pipe
+// copier inside os/exec) never blocks or errors on a full buffer, and a
+// chatty child always gets to finish or hit its own MaxRuntime — but keeps
+// at most limit bytes of it. Anything past that is read and discarded, and
+// truncated is set so the caller can tell "this stream was capped" apart
+// from "this stream just happened to be short".
+type boundedBuffer struct {
+	limit     int
+	buf       bytes.Buffer
+	truncated bool
+}
+
+func (b *boundedBuffer) Write(p []byte) (int, error) {
+	if !b.truncated {
+		room := b.limit - b.buf.Len()
+		if room > len(p) {
+			room = len(p)
+		}
+		if room > 0 {
+			b.buf.Write(p[:room])
+		}
+		if room < len(p) {
+			b.truncated = true
+		}
 	}
-	prefix := key[:i]
-	if _, known := deviceNames[prefix]; !known {
-		return "", "", false
+	return len(p), nil
+}
+
+// stderrNote renders a short, single-line summary of a probe's stderr for
+// inclusion in a warning log line — enough to show why a probe failed
+// without shipping unbounded text into a log message.
+func stderrNote(stderr *boundedBuffer) string {
+	s := strings.TrimSpace(stderr.buf.String())
+	if s == "" {
+		return ""
 	}
-	return prefix, key[i+1:], true
+	if len(s) > 200 {
+		s = s[:200] + "...(truncated)"
+	}
+	if stderr.truncated {
+		s += " (stderr itself was truncated)"
+	}
+	return "; stderr: " + s
 }
 
 // runProbe executes one probe under the same process-group supervision a job
 // or a lifecycle hook gets (Run, in exec.go): its own process group, killed
 // whole on timeout, so a wedged probe never leaks a process nor stalls the
-// pass past its own budget. A non-zero exit, a kill (timeout or otherwise),
-// or output that doesn't parse as a single flat JSON object is reported as
-// an error; the caller logs it and moves on to the next probe.
+// pass past its own budget. Stdout and stderr are captured SEPARATELY (via
+// JobSpec.Stderr) specifically so a probe that writes a warning to stderr
+// and still exits 0 with valid JSON on stdout does not lose every label it
+// produced — merging the two into one buffer, as jobs and hooks
+// deliberately do, would make stderr output indistinguishable from
+// corruption of the JSON this function has to parse.
+//
+// A non-zero exit, a kill (timeout or otherwise), oversized output, or
+// output that doesn't parse as a single flat JSON object is reported as an
+// error; the caller logs it and moves on to the next probe.
 func runProbe(ctx context.Context, path string, timeout time.Duration) (map[string]string, error) {
-	var buf bytes.Buffer
-	res := Run(ctx, JobSpec{Command: []string{path}, MaxRuntime: timeout}, &buf)
+	stdout := &boundedBuffer{limit: maxProbeOutputBytes}
+	stderr := &boundedBuffer{limit: maxProbeOutputBytes}
+	res := Run(ctx, JobSpec{Command: []string{path}, MaxRuntime: timeout, Stderr: stderr}, stdout)
+
 	if res.Err != nil {
 		return nil, fmt.Errorf("run: %w", res.Err)
 	}
@@ -145,12 +256,15 @@ func runProbe(ctx context.Context, path string, timeout time.Duration) (map[stri
 		if reason == "" {
 			reason = "killed"
 		}
-		return nil, fmt.Errorf("killed: %s", reason)
+		return nil, fmt.Errorf("killed: %s%s", reason, stderrNote(stderr))
 	}
 	if res.ExitCode != 0 {
-		return nil, fmt.Errorf("exited %d", res.ExitCode)
+		return nil, fmt.Errorf("exited %d%s", res.ExitCode, stderrNote(stderr))
 	}
-	return parseProbeOutput(path, buf.Bytes())
+	if stdout.truncated {
+		return nil, fmt.Errorf("stdout exceeded %d bytes; probe misbehaving", maxProbeOutputBytes)
+	}
+	return parseProbeOutput(path, stdout.buf.Bytes())
 }
 
 // parseProbeOutput turns one probe's stdout into a flat string map. Values
@@ -274,45 +388,69 @@ func kernelRelease() (string, bool) {
 
 // nvidiaLabels reports GPU facts from nvidia-smi when it is on PATH; when it
 // is absent, this returns nil and that is not an error — a box with no
-// NVIDIA GPUs has no GPU labels, full stop. When present, it is still run
-// under a bounded timeout: a wedged driver making nvidia-smi hang is a real
-// failure mode this must survive exactly like any drop-in probe would.
+// NVIDIA GPUs simply has no GPU labels.
+//
+// nvidia-smi is run through the SAME Run() process-group supervision every
+// other spawned process in this package gets: its own process group,
+// bounded by timeout, killed as a group (not just its immediate pid) if it
+// doesn't finish in time. An earlier version of this function shelled out
+// via exec.CommandContext directly with a comment claiming it ran "in its
+// own process group" — that was false: CommandContext with no
+// SysProcAttr.Setpgid starts the process in THIS worker's process group,
+// so context cancellation reaches only the leader pid via os.Process.Kill,
+// not any child it spawns, and cmd.Output() still blocks on copying the
+// stdout pipe to completion regardless. A wedged driver leaving nvidia-smi
+// in uninterruptible sleep — or any grandchild inheriting the stdout pipe —
+// would hang gatherLabels forever. Run closes that gap the same way it's
+// closed for every drop-in probe; there is no separate, weaker mechanism
+// for this one built-in.
 //
 // Facts are named "gpu<N>.<label>" where N is nvidia-smi's own device index
-// (its listing order), NOT the configured device name — mergeProbeFacts
-// only treats a key as device-scoped when its prefix matches a name this
-// host actually declared, so on a host whose devices aren't literally named
-// "gpu0", "gpu1", ... these land as host facts instead. That is a deliberate
-// simplification for this built-in, not a bug: an operator who wants GPU
-// facts attributed to a differently-named device can do so with a drop-in
-// probe that knows the mapping.
+// (its listing order), NOT the configured device name — classifyKey only
+// treats a key as device-scoped when its prefix matches a name this host
+// actually declared, so on a host whose devices aren't literally named
+// "gpu0", "gpu1", ... these facts are dropped (with a warning), never
+// silently promoted to host-wide facts misattributed to every device. An
+// operator who wants GPU facts attributed to a differently-named device can
+// do so with a drop-in probe that knows the mapping.
 func nvidiaLabels(ctx context.Context, timeout time.Duration) map[string]string {
 	smi, err := exec.LookPath("nvidia-smi")
 	if err != nil {
 		return nil
 	}
 
-	runCtx := ctx
-	if timeout > 0 {
-		var cancel context.CancelFunc
-		runCtx, cancel = context.WithTimeout(ctx, timeout)
-		defer cancel()
-	}
+	stdout := &boundedBuffer{limit: maxProbeOutputBytes}
+	stderr := &boundedBuffer{limit: maxProbeOutputBytes}
+	res := Run(ctx, JobSpec{
+		Command: []string{smi,
+			"--query-gpu=name,memory.total,driver_version", "--format=csv,noheader,nounits"},
+		MaxRuntime: timeout,
+		Stderr:     stderr,
+	}, stdout)
 
-	cmd := exec.CommandContext(runCtx, smi,
-		"--query-gpu=name,memory.total,driver_version", "--format=csv,noheader,nounits")
-	// Its own process group, same as everything else this file runs — a
-	// context-cancel kills the group leader via CommandContext's default
-	// Cancel, which is sufficient here since nvidia-smi itself doesn't fork
-	// long-lived children the way a hook or job might.
-	out, err := cmd.Output()
-	if err != nil {
-		slog.Warn("nvidia-smi failed; no GPU labels reported", "err", err)
+	switch {
+	case res.Err != nil:
+		slog.Warn("nvidia-smi failed; no GPU labels reported", "err", res.Err)
+		return nil
+	case res.Killed:
+		reason := res.Reason
+		if reason == "" {
+			reason = "killed"
+		}
+		slog.Warn("nvidia-smi timed out; no GPU labels reported", "reason", reason)
+		return nil
+	case res.ExitCode != 0:
+		slog.Warn("nvidia-smi exited non-zero; no GPU labels reported",
+			"exit_code", res.ExitCode, "stderr", strings.TrimSpace(stderr.buf.String()))
+		return nil
+	case stdout.truncated:
+		slog.Warn("nvidia-smi output exceeded the size cap; no GPU labels reported",
+			"limit", maxProbeOutputBytes)
 		return nil
 	}
 
 	facts := map[string]string{}
-	for i, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+	for i, line := range strings.Split(strings.TrimSpace(stdout.buf.String()), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
@@ -329,7 +467,17 @@ func nvidiaLabels(ctx context.Context, timeout time.Duration) map[string]string 
 		prefix := fmt.Sprintf("gpu%d", i)
 		facts[prefix+".vendor"] = "nvidia"
 		facts[prefix+".model"] = model
-		facts[prefix+".vram"] = vram + "MiB" // memory.total, --format=nounits: a bare MiB count
+		// memory.total under --format=nounits is a bare MiB count. Emit it
+		// suffixed ("M") in the form internal/selector's parseQuantity
+		// actually understands (K/M/G/T), not "MiB": a trailing "B" is not
+		// one of those suffixes, so "24576MiB" fails to parse as a
+		// quantity and Match silently falls back to comparing it as a
+		// STRING against the selector's value. That is not a cosmetic
+		// difference — "vram>=40G" then compares "9000MiB" against "40G"
+		// lexicographically ('9' > '4'), matching a 9GB card against a 40GB
+		// request. See probe_nvidia_internal_test.go for the regression
+		// test against the real selector package.
+		facts[prefix+".vram"] = vram + "M"
 		facts[prefix+".driver"] = driver
 	}
 	return facts
