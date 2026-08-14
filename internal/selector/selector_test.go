@@ -49,7 +49,7 @@ func TestStringComparisonWhenNotNumeric(t *testing.T) {
 }
 
 func TestParseRejectsGarbage(t *testing.T) {
-	for _, in := range []string{"", "   ", "vendor", "=nvidia", "vendor=", ",", "a=b,,c=d"} {
+	for _, in := range []string{"", "   ", "vendor", "=nvidia", "vendor=", ",", "a=b,,c=d", "a>=b>=c", "a=b=c", "a<=b<=c", "a!=b!=c"} {
 		_, err := selector.Parse(in)
 		require.Error(t, err, "input %q should not parse", in)
 	}

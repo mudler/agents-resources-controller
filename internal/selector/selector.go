@@ -67,9 +67,23 @@ func parseTerm(part string) (term, error) {
 		if key == "" || value == "" {
 			return term{}, fmt.Errorf("term %q needs a key and a value", part)
 		}
+		// Reject keys or values containing operator characters to catch typos like "a=b=c"
+		if containsOperatorChar(key) || containsOperatorChar(value) {
+			return term{}, fmt.Errorf("term %q contains embedded operator characters", part)
+		}
 		return term{key: key, op: o, value: value}, nil
 	}
 	return term{}, fmt.Errorf("term %q has no operator (expected one of =, !=, >=, <=)", part)
+}
+
+// containsOperatorChar reports whether s contains any operator character: =, !, <, >
+func containsOperatorChar(s string) bool {
+	for _, ch := range s {
+		if ch == '=' || ch == '!' || ch == '<' || ch == '>' {
+			return true
+		}
+	}
+	return false
 }
 
 func (s Selector) String() string {
