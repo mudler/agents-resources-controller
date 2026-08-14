@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"syscall"
@@ -36,6 +37,16 @@ const sigintExitCode = 130
 // forever if that assumption is ever violated — e.g. a job stuck in
 // "assigned" because no worker ever attached to the device.
 const waitTerminalTimeout = 5 * time.Minute
+
+// killTimeout bounds the kill request rc run issues when it gives up on a
+// still-queued job (Ctrl-C, or --timeout). The client's http.Client
+// deliberately has no global timeout (see client.New — log streaming has
+// to run as long as the job does), so without a bound here a wedged
+// controller connection would hang this specific call indefinitely. It is
+// called only after stop() has already unregistered signal interception,
+// so a hang here is a bounded annoyance, not a process a second Ctrl-C
+// can't get out of.
+const killTimeout = 10 * time.Second
 
 func defaultSubmitter() string {
 	user := os.Getenv("USER")
@@ -76,6 +87,7 @@ func NewRunCmd() *cobra.Command {
 			}
 
 			c := client.New(controllerURL(), controllerToken())
+			stderr := cmd.ErrOrStderr()
 
 			// ctx carries SIGINT/SIGTERM so Ctrl-C interrupts log streaming
 			// promptly. It does NOT cancel the job: the worker, not this
@@ -118,40 +130,48 @@ func NewRunCmd() *cobra.Command {
 				}
 
 				scheduled, err := c.WaitScheduled(waitCtx, job.ID, func(pos int) {
-					fmt.Fprintf(os.Stderr, "rc: queued at position %d for %s\n", pos, device)
+					fmt.Fprintf(stderr, "rc: queued at position %d for %s\n", pos, device)
 				})
 				switch {
 				case err == nil:
 					job = scheduled
 				case ctx.Err() != nil:
 					// Ctrl-C while queued cancels outright: nothing is
-					// running, so there is no lease to protect.
-					if killErr := c.Kill(context.Background(), job.ID, submitter); killErr != nil {
-						fmt.Fprintf(os.Stderr, "rc: could not cancel queued job %s: %v\n", job.ID, killErr)
-					} else {
-						fmt.Fprintf(os.Stderr, "rc: cancelled queued job %s\n", job.ID)
-					}
+					// running yet, so there is no lease to protect.
+					cancelQueuedJob(c, stop, stderr, job, submitter)
 					return exitCodeError{code: sigintExitCode}
-				default:
-					if killErr := c.Kill(context.Background(), job.ID, submitter); killErr != nil {
-						fmt.Fprintf(os.Stderr, "rc: could not cancel queued job %s: %v\n", job.ID, killErr)
-					}
+				case errors.Is(err, context.DeadlineExceeded):
+					// A genuine --timeout expiry: same reasoning as
+					// Ctrl-C above, nothing is running yet.
+					cancelQueuedJob(c, stop, stderr, job, submitter)
 					return fmt.Errorf("gave up waiting for %s: %w", device, err)
+				default:
+					// An error WaitScheduled itself gave up on (e.g. a run
+					// of transient poll failures surviving past its own
+					// retry budget) is NOT license to kill: by the time
+					// this surfaces, the job may already have been
+					// scheduled and be running on real hardware. A
+					// client-side network blip must cost the caller
+					// patience, never someone else's GPU job. Report the
+					// error and leave the job alone.
+					return fmt.Errorf(
+						"lost track of job %s while it was queued (it may still be queued, or already running — check `rc ps`): %w",
+						job.ID, err)
 				}
 			}
 
-			fmt.Fprintf(os.Stderr, "rc: job %s on %s\n", job.ID, job.DeviceID)
+			fmt.Fprintf(stderr, "rc: job %s on %s\n", job.ID, job.DeviceID)
 
 			streamErr := c.StreamLogs(ctx, job.ID, os.Stdout)
-			if derr := detachIfInterrupted(ctx, stop, job); derr != nil {
+			if derr := detachIfInterrupted(ctx, stop, stderr, job); derr != nil {
 				return derr
 			}
 			if streamErr != nil {
-				fmt.Fprintf(os.Stderr, "rc: log stream ended: %v\n", streamErr)
+				fmt.Fprintf(stderr, "rc: log stream ended: %v\n", streamErr)
 			}
 
 			final, err := c.WaitTerminal(ctx, job.ID, waitTerminalTimeout)
-			if derr := detachIfInterrupted(ctx, stop, job); derr != nil {
+			if derr := detachIfInterrupted(ctx, stop, stderr, job); derr != nil {
 				return derr
 			}
 			if err != nil {
@@ -164,7 +184,7 @@ func NewRunCmd() *cobra.Command {
 				// output wouldn't have said that either, so tell the user
 				// here rather than leaving a bare non-zero exit.
 				if final.KillReason != "" {
-					fmt.Fprintf(os.Stderr, "rc: job %s: %s\n", final.ID, final.KillReason)
+					fmt.Fprintf(stderr, "rc: job %s: %s\n", final.ID, final.KillReason)
 				}
 				return exitCodeError{code: safeExitCode(*final.ExitCode)}
 			}
@@ -199,15 +219,93 @@ func NewRunCmd() *cobra.Command {
 // conventional SIGINT exit status. There is nothing left to wait for on
 // this path: the job is not cancelled, so blocking further would just mean
 // waiting for as long as the job keeps running.
-func detachIfInterrupted(ctx context.Context, stop context.CancelFunc, job *model.Job) error {
+func detachIfInterrupted(ctx context.Context, stop context.CancelFunc, stderr io.Writer, job *model.Job) error {
 	if ctx.Err() == nil {
 		return nil
 	}
 	stop()
-	fmt.Fprintf(os.Stderr,
+	fmt.Fprintf(stderr,
 		"rc: detached from job %s — it is STILL RUNNING on %s and holds it until it finishes. Watch it with: rc ps\n",
 		job.ID, job.DeviceID)
 	return exitCodeError{code: sigintExitCode}
+}
+
+// cancelQueuedJob is called when rc run has given up waiting for a still-
+// queued job — via Ctrl-C or --timeout — and needs to cancel it. There is
+// no lease yet at this point, so cancelling is always safe to attempt; the
+// one thing that can go wrong is the job having started running in the
+// tiny window since the last poll, which the controller reports back as a
+// 409 (client.ErrNotCancellable). That must NOT be reported as an ordinary
+// "could not cancel": the job may now actually be consuming a device with
+// no client watching it, and the user needs Stage 1's honest "STILL
+// RUNNING" warning, not a bland failure message — see
+// reportUncancellableQueuedJob.
+//
+// stop is called first, before any network call: a second Ctrl-C (or the
+// SIGTERM that typically follows it in CI) must kill rc outright rather
+// than appear to hang while this call is in flight — the same reasoning
+// detachIfInterrupted already applies to the running-job detach path. The
+// kill request itself is bounded by killTimeout for the same reason: the
+// client's http.Client deliberately has no global timeout.
+func cancelQueuedJob(c *client.Client, stop context.CancelFunc, stderr io.Writer, job *model.Job, submitter string) {
+	stop()
+	ctx, cancel := context.WithTimeout(context.Background(), killTimeout)
+	defer cancel()
+
+	err := c.Kill(ctx, job.ID, submitter)
+	switch {
+	case err == nil:
+		reportCancelledQueuedJob(ctx, c, stderr, job)
+	case errors.Is(err, client.ErrNotCancellable):
+		reportUncancellableQueuedJob(ctx, c, stderr, job)
+	default:
+		fmt.Fprintf(stderr, "rc: could not cancel queued job %s: %v\n", job.ID, err)
+	}
+}
+
+// reportCancelledQueuedJob is called after a successful kill of a job that
+// was last seen queued. A successful kill does not by itself say whether
+// the job was cancelled outright (it was still queued: see
+// store.CancelQueued, which finishes it synchronously) or whether it had
+// already started running in the meantime and was instead flagged for the
+// worker to terminate (store.RequestKill, asynchronous — see
+// server.handleKill). Re-fetching and reporting the actual outcome avoids
+// unconditionally claiming "cancelled queued job" when what really
+// happened is a running job was just flagged for kill and has not stopped
+// yet.
+func reportCancelledQueuedJob(ctx context.Context, c *client.Client, stderr io.Writer, job *model.Job) {
+	current, err := c.Job(ctx, job.ID)
+	if err != nil {
+		// Best effort only — the kill call itself already succeeded.
+		fmt.Fprintf(stderr, "rc: kill requested for job %s\n", job.ID)
+		return
+	}
+	switch current.State {
+	case model.JobAssigned, model.JobRunning:
+		fmt.Fprintf(stderr,
+			"rc: job %s started running on %s just as it was being cancelled; a kill was requested and it is being terminated now\n",
+			current.ID, current.DeviceID)
+	default:
+		fmt.Fprintf(stderr, "rc: cancelled queued job %s\n", job.ID)
+	}
+}
+
+// reportUncancellableQueuedJob is called when the controller refuses to
+// cancel a job rc run last saw queued (409 not_cancellable): the job raced
+// onto a different state between the last poll and this kill attempt. That
+// can mean two very different things — it started running (and is now
+// consuming a device with nobody watching it), or it simply finished on
+// its own — so this re-fetches the job to tell them apart rather than
+// reporting a bland "could not cancel" for both.
+func reportUncancellableQueuedJob(ctx context.Context, c *client.Client, stderr io.Writer, job *model.Job) {
+	current, err := c.Job(ctx, job.ID)
+	if err == nil && (current.State == model.JobAssigned || current.State == model.JobRunning) {
+		fmt.Fprintf(stderr,
+			"rc: could not cancel job %s — it is STILL RUNNING on %s and holds it until it finishes. Watch it with: rc ps\n",
+			current.ID, current.DeviceID)
+		return
+	}
+	fmt.Fprintf(stderr, "rc: job %s finished before it could be cancelled\n", job.ID)
 }
 
 // safeExitCode guards against os.Exit's mod-256 wraparound on Unix: a
