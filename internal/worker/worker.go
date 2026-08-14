@@ -17,11 +17,29 @@ import (
 )
 
 type assignment struct {
-	JobID    string            `json:"job_id"`
-	DeviceID string            `json:"device_id"`
-	Command  []string          `json:"command"`
-	Cwd      string            `json:"cwd"`
-	Env      map[string]string `json:"env"`
+	JobID              string            `json:"job_id"`
+	DeviceID           string            `json:"device_id"`
+	Command            []string          `json:"command"`
+	Cwd                string            `json:"cwd"`
+	Env                map[string]string `json:"env"`
+	MaxRuntimeSeconds  int               `json:"max_runtime_seconds,omitempty"`
+	IdleTimeoutSeconds int               `json:"idle_timeout_seconds,omitempty"`
+}
+
+// deviceSpec is what this worker declares about one of its devices at
+// registration: its name and, if the operator configured one, the runtime
+// ceiling the controller should enforce against any job scheduled onto it.
+type deviceSpec struct {
+	Name              string `json:"name"`
+	MaxRuntimeSeconds int    `json:"max_runtime_seconds,omitempty"`
+}
+
+// pollResponse mirrors server.PollResponse: an envelope carrying both new
+// work and kill requests, so a kill reaches the worker as fast as an
+// assignment does rather than waiting on a separate channel.
+type pollResponse struct {
+	Assignments []assignment `json:"assignments"`
+	Kills       []string     `json:"kills,omitempty"`
 }
 
 type Worker struct {
@@ -129,7 +147,18 @@ func (w *Worker) do(ctx context.Context, method, path string, body io.Reader) (*
 }
 
 func (w *Worker) register(ctx context.Context) error {
-	payload, err := json.Marshal(map[string]any{"host": w.cfg.Host, "devices": w.cfg.Devices})
+	devices := make([]deviceSpec, 0, len(w.cfg.Devices))
+	for _, d := range w.cfg.Devices {
+		devices = append(devices, deviceSpec{
+			Name:              d.Name,
+			MaxRuntimeSeconds: int(d.MaxRuntime.Seconds()),
+		})
+	}
+	payload, err := json.Marshal(map[string]any{
+		"host":    w.cfg.Host,
+		"boot_id": BootID(),
+		"devices": devices,
+	})
 	if err != nil {
 		return err
 	}
@@ -187,7 +216,7 @@ func (w *Worker) pollLoop(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		assignments, err := w.poll(ctx)
+		resp, err := w.poll(ctx)
 		if err != nil {
 			slog.Warn("poll failed", "err", err)
 			select {
@@ -197,7 +226,20 @@ func (w *Worker) pollLoop(ctx context.Context) {
 			}
 			continue
 		}
-		if len(assignments) == 0 {
+
+		// A kill acts on a job already tracked in w.running (registered
+		// synchronously below, same as an assignment), so cancelling here is
+		// safe even before this iteration's own assignments are started.
+		for _, jobID := range resp.Kills {
+			w.cancelRunning(jobID)
+		}
+
+		if len(resp.Assignments) == 0 {
+			// Whether this poll carried only kills or nothing at all, there is
+			// no new work to start locally: any kill just delivered was
+			// already actioned above (idempotently, if re-delivered), so the
+			// same floor applies as the empty case — no reason to hammer the
+			// controller faster than that.
 			select {
 			case <-ctx.Done():
 				return
@@ -205,7 +247,7 @@ func (w *Worker) pollLoop(ctx context.Context) {
 			}
 			continue
 		}
-		for _, a := range assignments {
+		for _, a := range resp.Assignments {
 			// Registered here, synchronously in the poll loop, so that by the
 			// time pollLoop returns (ctx already done) every goroutine it has
 			// ever started is already accounted for in wg — Start's shutdown
@@ -220,25 +262,41 @@ func (w *Worker) pollLoop(ctx context.Context) {
 	}
 }
 
-func (w *Worker) poll(ctx context.Context) ([]assignment, error) {
+func (w *Worker) poll(ctx context.Context) (pollResponse, error) {
 	path := fmt.Sprintf("/v1/workers/%s/assignments?wait=%s", w.workerID, w.cfg.PollWait)
 	resp, err := w.do(ctx, http.MethodGet, path, nil)
 	if err != nil {
-		return nil, err
+		return pollResponse{}, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNoContent {
-		return nil, nil
+		return pollResponse{}, nil
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("controller returned %s", resp.Status)
+		return pollResponse{}, fmt.Errorf("controller returned %s", resp.Status)
 	}
-	var out []assignment
+	var out pollResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return nil, err
+		return pollResponse{}, err
 	}
 	return out, nil
+}
+
+// cancelRunning cancels the context backing a job this worker currently has
+// running, so Run's existing SIGTERM -> grace -> SIGKILL path tears down its
+// process group — the same path a shutdown or the job's own watchdog uses,
+// not a second one. A job ID this worker is not (or no longer) running is
+// silently ignored: a kill flag with nothing local left to act on is not an
+// error, and calling an already-fired CancelFunc again is a harmless no-op,
+// so a kill request re-delivered on a later poll costs nothing.
+func (w *Worker) cancelRunning(jobID string) {
+	w.mu.Lock()
+	cancel, ok := w.running[jobID]
+	w.mu.Unlock()
+	if ok {
+		cancel()
+	}
 }
 
 func (w *Worker) execute(ctx context.Context, a assignment) {
@@ -301,7 +359,13 @@ func (w *Worker) execute(ctx context.Context, a assignment) {
 	}
 
 	sink := &logSink{w: w, jobID: a.JobID, ctx: reportCtx}
-	res := Run(jobCtx, JobSpec{Command: a.Command, Cwd: a.Cwd, Env: env}, sink)
+	res := Run(jobCtx, JobSpec{
+		Command:     a.Command,
+		Cwd:         a.Cwd,
+		Env:         env,
+		MaxRuntime:  time.Duration(a.MaxRuntimeSeconds) * time.Second,
+		IdleTimeout: time.Duration(a.IdleTimeoutSeconds) * time.Second,
+	}, sink)
 	sink.Flush()
 
 	state := model.JobSucceeded

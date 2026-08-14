@@ -40,11 +40,11 @@ func TestWorkerRegistersRunsAssignmentAndReportsResult(t *testing.T) {
 				w.WriteHeader(http.StatusNoContent)
 				return
 			}
-			json.NewEncoder(w).Encode([]map[string]any{{
+			json.NewEncoder(w).Encode(map[string]any{"assignments": []map[string]any{{
 				"job_id":    "job1",
 				"device_id": "gpubox:gpu0",
 				"command":   []string{"sh", "-c", "echo hello; exit 7"},
-			}})
+			}}})
 
 		case r.URL.Path == "/v1/workers/w1/heartbeat":
 			w.WriteHeader(http.StatusOK)
@@ -84,7 +84,7 @@ func TestWorkerRegistersRunsAssignmentAndReportsResult(t *testing.T) {
 		ControllerURL:     ts.URL,
 		Token:             "wtok",
 		Host:              "gpubox",
-		Devices:           []string{"gpu0"},
+		Devices:           []worker.DeviceConfig{{Name: "gpu0"}},
 		HeartbeatInterval: 50 * time.Millisecond,
 		PollWait:          100 * time.Millisecond,
 	})
@@ -122,11 +122,11 @@ func TestAssignmentIsDeliveredOnlyOnce(t *testing.T) {
 			// Always hands out job1 again, never advancing it — the worst
 			// case for a worker that relies solely on the controller to stop
 			// re-delivering completed work.
-			json.NewEncoder(w).Encode([]map[string]any{{
+			json.NewEncoder(w).Encode(map[string]any{"assignments": []map[string]any{{
 				"job_id":    "job1",
 				"device_id": "gpubox:gpu0",
 				"command":   []string{"sh", "-c", "echo run >> " + marker},
-			}})
+			}}})
 
 		case r.URL.Path == "/v1/workers/w1/heartbeat":
 			w.WriteHeader(http.StatusOK)
@@ -149,7 +149,7 @@ func TestAssignmentIsDeliveredOnlyOnce(t *testing.T) {
 	wk := worker.New(worker.Config{
 		ControllerURL:     ts.URL,
 		Host:              "gpubox",
-		Devices:           []string{"gpu0"},
+		Devices:           []worker.DeviceConfig{{Name: "gpu0"}},
 		HeartbeatInterval: 500 * time.Millisecond,
 		PollWait:          20 * time.Millisecond,
 	})
@@ -191,11 +191,11 @@ func TestShutdownWaitsForRunningJobAndReportsTerminalState(t *testing.T) {
 				w.WriteHeader(http.StatusNoContent)
 				return
 			}
-			json.NewEncoder(w).Encode([]map[string]any{{
+			json.NewEncoder(w).Encode(map[string]any{"assignments": []map[string]any{{
 				"job_id":    "job1",
 				"device_id": "gpubox:gpu0",
 				"command":   []string{"sleep", "5"},
-			}})
+			}}})
 
 		case r.URL.Path == "/v1/workers/w1/heartbeat":
 			w.WriteHeader(http.StatusOK)
@@ -230,7 +230,7 @@ func TestShutdownWaitsForRunningJobAndReportsTerminalState(t *testing.T) {
 	wk := worker.New(worker.Config{
 		ControllerURL:     ts.URL,
 		Host:              "gpubox",
-		Devices:           []string{"gpu0"},
+		Devices:           []worker.DeviceConfig{{Name: "gpu0"}},
 		HeartbeatInterval: 500 * time.Millisecond,
 		PollWait:          50 * time.Millisecond,
 	})
@@ -262,6 +262,108 @@ func TestShutdownWaitsForRunningJobAndReportsTerminalState(t *testing.T) {
 	require.Equal(t, []string{"w1", "w1"}, wids)
 }
 
+// TestWorkerKillsJobWhenControllerRequestsIt proves the other end of the wire
+// change this task makes: a job ID arriving in the poll envelope's "kills"
+// must actually reach the running process, not just get acknowledged. The
+// job here ignores nothing special — an ordinary "sleep 30" that would run
+// long past the test's timeout on its own — so a "killed" terminal report
+// only shows up if the kill was actually delivered through Run's existing
+// SIGTERM path via the running map, not merely logged.
+func TestWorkerKillsJobWhenControllerRequestsIt(t *testing.T) {
+	var (
+		mu           sync.Mutex
+		served       bool
+		sendKill     bool
+		states       []string
+		exitReported bool
+	)
+	runningSeen := make(chan struct{})
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/v1/workers/register":
+			json.NewEncoder(w).Encode(map[string]string{"worker_id": "w1"})
+
+		case r.URL.Path == "/v1/workers/w1/assignments":
+			mu.Lock()
+			first := !served
+			served = true
+			shouldKill := sendKill && !exitReported
+			mu.Unlock()
+			if first {
+				json.NewEncoder(w).Encode(map[string]any{"assignments": []map[string]any{{
+					"job_id":    "job1",
+					"device_id": "gpubox:gpu0",
+					"command":   []string{"sleep", "30"},
+				}}})
+				return
+			}
+			if shouldKill {
+				json.NewEncoder(w).Encode(map[string]any{"kills": []string{"job1"}})
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+
+		case r.URL.Path == "/v1/workers/w1/heartbeat":
+			w.WriteHeader(http.StatusOK)
+
+		case r.URL.Path == "/v1/jobs/job1/logs":
+			w.WriteHeader(http.StatusOK)
+
+		case r.URL.Path == "/v1/jobs/job1/status":
+			var body struct {
+				State string `json:"state"`
+			}
+			json.NewDecoder(r.Body).Decode(&body)
+			mu.Lock()
+			states = append(states, body.State)
+			if body.State == "running" {
+				sendKill = true
+				close(runningSeen)
+			}
+			if body.State != "running" {
+				exitReported = true
+			}
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	wk := worker.New(worker.Config{
+		ControllerURL:     ts.URL,
+		Host:              "gpubox",
+		Devices:           []worker.DeviceConfig{{Name: "gpu0"}},
+		HeartbeatInterval: 500 * time.Millisecond,
+		PollWait:          50 * time.Millisecond,
+	})
+	go func() { _ = wk.Start(ctx) }()
+
+	select {
+	case <-runningSeen:
+	case <-time.After(10 * time.Second):
+		t.Fatal("job never reported running")
+	}
+
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(states) == 2
+	}, 15*time.Second, 50*time.Millisecond,
+		"a kill delivered through the poll envelope must terminate the running job")
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Equal(t, []string{"running", "killed"}, states,
+		"the job that was still sleeping must be reported killed, not left to finish or reported some other way")
+}
+
 // TestTerminalReportIsRetriedOnServerError asserts that a terminal status
 // report is retried after a transient server error: it is the call that
 // frees the device's lease, so silently giving up after one failed attempt
@@ -287,11 +389,11 @@ func TestTerminalReportIsRetriedOnServerError(t *testing.T) {
 				w.WriteHeader(http.StatusNoContent)
 				return
 			}
-			json.NewEncoder(w).Encode([]map[string]any{{
+			json.NewEncoder(w).Encode(map[string]any{"assignments": []map[string]any{{
 				"job_id":    "job1",
 				"device_id": "gpubox:gpu0",
 				"command":   []string{"true"},
-			}})
+			}}})
 
 		case r.URL.Path == "/v1/workers/w1/heartbeat":
 			w.WriteHeader(http.StatusOK)
@@ -328,7 +430,7 @@ func TestTerminalReportIsRetriedOnServerError(t *testing.T) {
 	wk := worker.New(worker.Config{
 		ControllerURL:     ts.URL,
 		Host:              "gpubox",
-		Devices:           []string{"gpu0"},
+		Devices:           []worker.DeviceConfig{{Name: "gpu0"}},
 		HeartbeatInterval: 500 * time.Millisecond,
 		PollWait:          50 * time.Millisecond,
 	})
@@ -408,7 +510,7 @@ func TestCUDAVisibleDevicesIsSetFromTheDeviceName(t *testing.T) {
 					if len(tc.jobEnv) > 0 {
 						out["env"] = tc.jobEnv
 					}
-					json.NewEncoder(w).Encode([]map[string]any{out})
+					json.NewEncoder(w).Encode(map[string]any{"assignments": []map[string]any{out}})
 
 				case r.URL.Path == "/v1/workers/w1/heartbeat":
 					w.WriteHeader(http.StatusOK)
@@ -436,7 +538,7 @@ func TestCUDAVisibleDevicesIsSetFromTheDeviceName(t *testing.T) {
 			wk := worker.New(worker.Config{
 				ControllerURL:     ts.URL,
 				Host:              "gpubox",
-				Devices:           []string{"gpu0"},
+				Devices:           []worker.DeviceConfig{{Name: "gpu0"}},
 				HeartbeatInterval: 500 * time.Millisecond,
 				PollWait:          50 * time.Millisecond,
 			})
@@ -481,7 +583,7 @@ func TestPollLoopFloorsDelayAgainstMisbehavingController(t *testing.T) {
 			// Misbehaving: ignores wait= and answers empty-handed instantly,
 			// the way a non-conforming controller or an interfering proxy
 			// might.
-			json.NewEncoder(w).Encode([]map[string]any{})
+			json.NewEncoder(w).Encode(map[string]any{"assignments": []map[string]any{}})
 
 		case r.URL.Path == "/v1/workers/w1/heartbeat":
 			w.WriteHeader(http.StatusOK)
@@ -499,7 +601,7 @@ func TestPollLoopFloorsDelayAgainstMisbehavingController(t *testing.T) {
 	wk := worker.New(worker.Config{
 		ControllerURL:     ts.URL,
 		Host:              "gpubox",
-		Devices:           []string{"gpu0"},
+		Devices:           []worker.DeviceConfig{{Name: "gpu0"}},
 		HeartbeatInterval: time.Second,
 		PollWait:          10 * time.Millisecond, // irrelevant: the fake controller ignores it anyway
 	})
@@ -546,11 +648,11 @@ func TestStatusReportsIncludeWorkerID(t *testing.T) {
 				w.WriteHeader(http.StatusNoContent)
 				return
 			}
-			json.NewEncoder(w).Encode([]map[string]any{{
+			json.NewEncoder(w).Encode(map[string]any{"assignments": []map[string]any{{
 				"job_id":    "job1",
 				"device_id": "gpubox:gpu0",
 				"command":   []string{"true"},
-			}})
+			}}})
 
 		case r.URL.Path == "/v1/workers/w1/heartbeat":
 			w.WriteHeader(http.StatusOK)
@@ -580,7 +682,7 @@ func TestStatusReportsIncludeWorkerID(t *testing.T) {
 	wk := worker.New(worker.Config{
 		ControllerURL:     ts.URL,
 		Host:              "gpubox",
-		Devices:           []string{"gpu0"},
+		Devices:           []worker.DeviceConfig{{Name: "gpu0"}},
 		HeartbeatInterval: 500 * time.Millisecond,
 		PollWait:          50 * time.Millisecond,
 	})

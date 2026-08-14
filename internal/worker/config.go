@@ -9,12 +9,35 @@ import (
 )
 
 type Config struct {
-	ControllerURL     string        `yaml:"controller_url"`
-	Token             string        `yaml:"token"`
-	Host              string        `yaml:"host"`
-	Devices           []string      `yaml:"devices"`
-	HeartbeatInterval time.Duration `yaml:"heartbeat_interval"`
-	PollWait          time.Duration `yaml:"poll_wait"`
+	ControllerURL     string         `yaml:"controller_url"`
+	Token             string         `yaml:"token"`
+	Host              string         `yaml:"host"`
+	Devices           []DeviceConfig `yaml:"devices"`
+	HeartbeatInterval time.Duration  `yaml:"heartbeat_interval"`
+	PollWait          time.Duration  `yaml:"poll_wait"`
+}
+
+// DeviceConfig is one device this host offers. It accepts either a bare name
+// (stage 1 style) or an object with a runtime ceiling.
+type DeviceConfig struct {
+	Name       string        `yaml:"name"`
+	MaxRuntime time.Duration `yaml:"max_runtime"`
+}
+
+func (d *DeviceConfig) UnmarshalYAML(value *yaml.Node) error {
+	if value.Kind == yaml.ScalarNode {
+		return value.Decode(&d.Name)
+	}
+	type plain DeviceConfig // avoid recursing into this method
+	var p plain
+	if err := value.Decode(&p); err != nil {
+		return err
+	}
+	*d = DeviceConfig(p)
+	if d.Name == "" {
+		return fmt.Errorf("device entry needs a name")
+	}
+	return nil
 }
 
 // LoadConfig reads /etc/rc/worker.yaml (or another path) and applies defaults.
@@ -39,6 +62,11 @@ func LoadConfig(path string) (Config, error) {
 	}
 	if len(c.Devices) == 0 {
 		return Config{}, fmt.Errorf("at least one device required in %s", path)
+	}
+	for _, d := range c.Devices {
+		if d.Name == "" {
+			return Config{}, fmt.Errorf("device entry needs a name in %s", path)
+		}
 	}
 	if c.HeartbeatInterval <= 0 {
 		c.HeartbeatInterval = 10 * time.Second

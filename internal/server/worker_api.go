@@ -16,9 +16,18 @@ import (
 // a job's output would lose data without telling anyone.
 const maxLogChunk = 1 << 20
 
+// DeviceSpec is one device a worker declares at registration: its name and,
+// if the operator configured one, the runtime ceiling the controller should
+// enforce against any job scheduled onto it.
+type DeviceSpec struct {
+	Name              string `json:"name"`
+	MaxRuntimeSeconds int    `json:"max_runtime_seconds,omitempty"`
+}
+
 type RegisterRequest struct {
-	Host    string   `json:"host"`
-	Devices []string `json:"devices"`
+	Host    string       `json:"host"`
+	BootID  string       `json:"boot_id,omitempty"`
+	Devices []DeviceSpec `json:"devices"`
 }
 
 type RegisterResponse struct {
@@ -26,11 +35,22 @@ type RegisterResponse struct {
 }
 
 type Assignment struct {
-	JobID    string            `json:"job_id"`
-	DeviceID string            `json:"device_id"`
-	Command  []string          `json:"command"`
-	Cwd      string            `json:"cwd,omitempty"`
-	Env      map[string]string `json:"env,omitempty"`
+	JobID              string            `json:"job_id"`
+	DeviceID           string            `json:"device_id"`
+	Command            []string          `json:"command"`
+	Cwd                string            `json:"cwd,omitempty"`
+	Env                map[string]string `json:"env,omitempty"`
+	MaxRuntimeSeconds  int               `json:"max_runtime_seconds,omitempty"`
+	IdleTimeoutSeconds int               `json:"idle_timeout_seconds,omitempty"`
+}
+
+// PollResponse is the envelope handleAssignments answers a long-poll with: it
+// carries both newly handed-out assignments and job IDs the controller wants
+// killed, so a kill reaches the worker as fast as an assignment does rather
+// than waiting on a separate channel.
+type PollResponse struct {
+	Assignments []Assignment `json:"assignments"`
+	Kills       []string     `json:"kills,omitempty"`
 }
 
 type StatusRequest struct {
@@ -56,17 +76,34 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	workerID := uuid.NewSHA1(uuid.NameSpaceDNS, []byte(req.Host)).String()
 
 	devices := make([]model.Device, 0, len(req.Devices))
-	for _, name := range req.Devices {
+	for _, dev := range req.Devices {
 		devices = append(devices, model.Device{
-			ID: req.Host + ":" + name, Host: req.Host, Name: name,
+			ID: req.Host + ":" + dev.Name, Host: req.Host, Name: dev.Name,
 			WorkerID: workerID, State: model.DeviceReady, LastHeartbeatAt: now,
 		})
 	}
 
 	if err := s.cfg.Store.UpsertWorker(
-		model.Worker{ID: workerID, Host: req.Host, LastHeartbeatAt: now}, devices); err != nil {
+		model.Worker{ID: workerID, Host: req.Host, BootID: req.BootID, LastHeartbeatAt: now}, devices); err != nil {
 		writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
 		return
+	}
+
+	// UpsertWorker creates/updates the device rows themselves but does not
+	// touch their runtime ceiling; that is set here, once each device row is
+	// known to exist, for every device that declared one. A device with no
+	// ceiling in this registration is left as it was — an operator dropping
+	// max_runtime from worker.yaml does not implicitly clear a ceiling set by
+	// an earlier registration; that's out of scope here.
+	for _, dev := range req.Devices {
+		if dev.MaxRuntimeSeconds <= 0 {
+			continue
+		}
+		id := req.Host + ":" + dev.Name
+		if err := s.cfg.Store.SetDeviceMaxRuntime(id, time.Duration(dev.MaxRuntimeSeconds)*time.Second); err != nil {
+			writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
+			return
+		}
 	}
 	writeJSON(w, http.StatusOK, RegisterResponse{WorkerID: workerID})
 }
@@ -103,7 +140,15 @@ func (s *Server) handleAssignments(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
 			return
 		}
-		if len(jobs) > 0 {
+		// A kill must reach the worker as fast as an assignment does, so it
+		// rides the same long-poll response rather than a separate channel:
+		// checked on every wake, and on its own enough to end the wait.
+		kills, err := s.cfg.Store.KillRequestedFor(workerID)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
+			return
+		}
+		if len(jobs) > 0 || len(kills) > 0 {
 			// Handing out an assignment is a state transition, not just a
 			// query: mark each job running immediately, before it is ever
 			// written to the response. Otherwise the job stays "assigned"
@@ -129,9 +174,10 @@ func (s *Server) handleAssignments(w http.ResponseWriter, r *http.Request) {
 				}
 				out = append(out, Assignment{
 					JobID: j.ID, DeviceID: j.DeviceID, Command: j.Command, Cwd: j.Cwd, Env: j.Env,
+					MaxRuntimeSeconds: j.MaxRuntimeSeconds, IdleTimeoutSeconds: j.IdleTimeoutSeconds,
 				})
 			}
-			writeJSON(w, http.StatusOK, out)
+			writeJSON(w, http.StatusOK, PollResponse{Assignments: out, Kills: kills})
 			return
 		}
 		select {

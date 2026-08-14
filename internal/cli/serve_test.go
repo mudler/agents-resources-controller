@@ -131,7 +131,11 @@ func TestSchedulerLoopAssignsQueuedJobWhenDeviceFrees(t *testing.T) {
 
 func registerRawWorker(t *testing.T, baseURL, token, host string, devices []string) string {
 	t.Helper()
-	payload, err := json.Marshal(server.RegisterRequest{Host: host, Devices: devices})
+	specs := make([]server.DeviceSpec, 0, len(devices))
+	for _, name := range devices {
+		specs = append(specs, server.DeviceSpec{Name: name})
+	}
+	payload, err := json.Marshal(server.RegisterRequest{Host: host, Devices: specs})
 	require.NoError(t, err)
 	req, err := http.NewRequest(http.MethodPost, baseURL+"/v1/workers/register", bytes.NewReader(payload))
 	require.NoError(t, err)

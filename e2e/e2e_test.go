@@ -56,7 +56,7 @@ func TestEndToEndClaimRunRelease(t *testing.T) {
 	defer cancel()
 
 	wk := worker.New(worker.Config{
-		ControllerURL: ts.URL, Token: "wtok", Host: "testbox", Devices: []string{"dev0"},
+		ControllerURL: ts.URL, Token: "wtok", Host: "testbox", Devices: []worker.DeviceConfig{{Name: "dev0"}},
 		HeartbeatInterval: time.Second, PollWait: time.Second,
 	})
 	workerDone := make(chan error, 1)
@@ -186,7 +186,7 @@ func TestWorkerRestartQuarantinesDeviceInsteadOfFalselyReady(t *testing.T) {
 	defer cancelWk()
 
 	wk := worker.New(worker.Config{
-		ControllerURL: ts.URL, Token: "wtok", Host: "restartbox", Devices: []string{"dev0"},
+		ControllerURL: ts.URL, Token: "wtok", Host: "restartbox", Devices: []worker.DeviceConfig{{Name: "dev0"}},
 		HeartbeatInterval: time.Second, PollWait: time.Second,
 	})
 	go func() { _ = wk.Start(wkCtx) }()
@@ -254,7 +254,11 @@ func TestWorkerRestartQuarantinesDeviceInsteadOfFalselyReady(t *testing.T) {
 // local job.
 func registerRestart(t *testing.T, baseURL, token, host string, devices []string) {
 	t.Helper()
-	payload, err := json.Marshal(map[string]any{"host": host, "devices": devices})
+	specs := make([]server.DeviceSpec, 0, len(devices))
+	for _, name := range devices {
+		specs = append(specs, server.DeviceSpec{Name: name})
+	}
+	payload, err := json.Marshal(server.RegisterRequest{Host: host, Devices: specs})
 	require.NoError(t, err)
 	req, err := http.NewRequest(http.MethodPost, baseURL+"/v1/workers/register", bytes.NewReader(payload))
 	require.NoError(t, err)

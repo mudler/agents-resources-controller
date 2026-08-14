@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -18,6 +19,8 @@ type JobSpec struct {
 	Cwd          string
 	Env          map[string]string
 	GraceCeiling time.Duration // SIGTERM -> SIGKILL window; default 10s
+	MaxRuntime   time.Duration // total wall-clock ceiling; 0 means no limit
+	IdleTimeout  time.Duration // max gap with no stdout/stderr output; 0 means no limit
 }
 
 type Result struct {
@@ -44,20 +47,63 @@ func Run(ctx context.Context, spec JobSpec, sink io.Writer) Result {
 		grace = 10 * time.Second
 	}
 
+	wd := newWatchdogWriter(sink, time.Now())
+
 	cmd := exec.Command(spec.Command[0], spec.Command[1:]...)
 	cmd.Dir = spec.Cwd
 	cmd.Env = os.Environ()
 	for k, v := range spec.Env {
 		cmd.Env = append(cmd.Env, k+"="+v)
 	}
-	cmd.Stdout = sink
-	cmd.Stderr = sink
+	cmd.Stdout = wd
+	cmd.Stderr = wd
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	if err := cmd.Start(); err != nil {
 		return Result{ExitCode: -1, Err: fmt.Errorf("start: %w", err)}
 	}
 	pgid := cmd.Process.Pid // Setpgid makes the child its own group leader.
+
+	// runCtx is what actually drives cancellation below: ctx cancelling is one
+	// way to trip it, but the watchdogs below are a second, internal way to
+	// trip the same context without the caller ever cancelling ctx itself.
+	// This reuses the existing SIGTERM -> grace -> SIGKILL path unchanged;
+	// nothing here duplicates signal handling.
+	runCtx, tripped := context.WithCancel(ctx)
+	defer tripped()
+
+	var (
+		tripMu     sync.Mutex
+		tripReason string
+	)
+	if spec.MaxRuntime > 0 || spec.IdleTimeout > 0 {
+		go func() {
+			t := time.NewTicker(100 * time.Millisecond)
+			defer t.Stop()
+			deadline := time.Now().Add(spec.MaxRuntime)
+			for {
+				select {
+				case <-runCtx.Done():
+					return
+				case <-t.C:
+					var reason string
+					switch {
+					case spec.MaxRuntime > 0 && time.Now().After(deadline):
+						reason = "max_runtime exceeded (" + spec.MaxRuntime.String() + ")"
+					case spec.IdleTimeout > 0 && wd.idleFor() > spec.IdleTimeout:
+						reason = "idle: no output for " + spec.IdleTimeout.String()
+					default:
+						continue
+					}
+					tripMu.Lock()
+					tripReason = reason
+					tripMu.Unlock()
+					tripped()
+					return
+				}
+			}
+		}()
+	}
 
 	waitErr := make(chan error, 1)
 	go func() { waitErr <- cmd.Wait() }()
@@ -70,7 +116,7 @@ func Run(ctx context.Context, spec JobSpec, sink io.Writer) Result {
 	select {
 	case err := <-waitErr:
 		return finish(err)
-	case <-ctx.Done():
+	case <-runCtx.Done():
 		// select picks randomly when both cases are simultaneously ready, so
 		// a job that finished in the same instant we observed cancellation
 		// could otherwise be mislabelled as killed. Whatever cmd.Wait() sent
@@ -145,6 +191,17 @@ func Run(ctx context.Context, spec JobSpec, sink io.Writer) Result {
 		// Otherwise the process had already exited by the time the signal
 		// went out and nothing in the group was left to reach: report the
 		// real outcome rather than a cancellation that never landed.
+
+		// A watchdog trip is a more specific — and more useful — label than
+		// the generic "cancelled": it says WHICH limit fired, not just that
+		// something external asked for the process to stop.
+		tripMu.Lock()
+		if tripReason != "" {
+			res.Killed = true
+			res.Reason = tripReason
+		}
+		tripMu.Unlock()
+
 		return res
 	}
 }

@@ -23,7 +23,7 @@ import (
 func registerWorker(t *testing.T, ts *httptest.Server) string {
 	t.Helper()
 	resp := post(t, ts, "wtok", "/v1/workers/register",
-		server.RegisterRequest{Host: "gpubox", Devices: []string{"gpu0"}})
+		server.RegisterRequest{Host: "gpubox", Devices: []server.DeviceSpec{{Name: "gpu0"}}})
 	defer resp.Body.Close()
 	var reg server.RegisterResponse
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&reg))
@@ -291,10 +291,10 @@ func TestSubmitWakesWaitingWorkerLongPoll(t *testing.T) {
 		require.Less(t, r.dur, 2*time.Second,
 			"poke should wake the long-poll well before the 10s wait window elapses")
 
-		var assignments []server.Assignment
-		require.NoError(t, json.NewDecoder(r.resp.Body).Decode(&assignments))
-		require.Len(t, assignments, 1)
-		require.Equal(t, "gpubox:gpu0", assignments[0].DeviceID)
+		var poll server.PollResponse
+		require.NoError(t, json.NewDecoder(r.resp.Body).Decode(&poll))
+		require.Len(t, poll.Assignments, 1)
+		require.Equal(t, "gpubox:gpu0", poll.Assignments[0].DeviceID)
 	case <-time.After(5 * time.Second):
 		t.Fatal("long-poll did not return after submit poked the worker")
 	}

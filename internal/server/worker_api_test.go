@@ -106,7 +106,7 @@ func TestRegisterCreatesDevices(t *testing.T) {
 	ts, st, _, _ := newServer(t)
 
 	resp := post(t, ts, "wtok", "/v1/workers/register",
-		server.RegisterRequest{Host: "gpubox", Devices: []string{"gpu0", "gpu1"}})
+		server.RegisterRequest{Host: "gpubox", Devices: []server.DeviceSpec{{Name: "gpu0"}, {Name: "gpu1"}}})
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
@@ -121,11 +121,94 @@ func TestRegisterCreatesDevices(t *testing.T) {
 	require.Equal(t, model.DeviceReady, devices[0].State)
 }
 
+// TestRegisterAppliesDeviceRuntimeCeilings guards the production caller
+// SetDeviceMaxRuntime never had before this task: a device declared with
+// max_runtime_seconds at registration must actually end up with that
+// ceiling recorded, not just accepted and dropped. Devices() does not
+// surface the ceiling column, so this proves it indirectly through the
+// effect the ceiling has: a submit asking for more runtime than declared is
+// rejected, and one asking for less (or none) is accepted.
+func TestRegisterAppliesDeviceRuntimeCeilings(t *testing.T) {
+	ts, _, _, _ := newServer(t)
+
+	resp := post(t, ts, "wtok", "/v1/workers/register",
+		server.RegisterRequest{Host: "gpubox", Devices: []server.DeviceSpec{
+			{Name: "gpu0", MaxRuntimeSeconds: 3600},
+		}})
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	over := post(t, ts, "ctok", "/v1/jobs", server.SubmitRequest{
+		DeviceID: "gpubox:gpu0", Command: []string{"./bench"}, Submitter: "agent-a",
+		MaxRuntimeSeconds: 7200,
+	})
+	defer over.Body.Close()
+	require.Equal(t, http.StatusBadRequest, over.StatusCode,
+		"a submit above the declared ceiling must be rejected, proving the ceiling actually landed")
+	var body map[string]string
+	require.NoError(t, json.NewDecoder(over.Body).Decode(&body))
+	require.Equal(t, "runtime_above_ceiling", body["error"])
+
+	under := post(t, ts, "ctok", "/v1/jobs", server.SubmitRequest{
+		DeviceID: "gpubox:gpu0", Command: []string{"./bench"}, Submitter: "agent-a",
+		MaxRuntimeSeconds: 1800,
+	})
+	defer under.Body.Close()
+	require.Equal(t, http.StatusCreated, under.StatusCode,
+		"a submit within the declared ceiling must be accepted")
+}
+
+// TestAssignmentsEnvelopeCarriesKillRequests guards the wire change this task
+// makes: a kill must reach the worker through the same long-poll response an
+// assignment does, not a separate channel, and it alone (with no new
+// assignment) must be enough to end the 204 idle path.
+func TestAssignmentsEnvelopeCarriesKillRequests(t *testing.T) {
+	ts, st, _, _ := newServer(t)
+	workerID := registerWorker(t, ts)
+
+	a := post(t, ts, "ctok", "/v1/jobs", server.SubmitRequest{
+		DeviceID: "gpubox:gpu0", Command: []string{"./a"}, Submitter: "agent-a",
+	})
+	var job model.Job
+	require.NoError(t, json.NewDecoder(a.Body).Decode(&job))
+	a.Body.Close()
+	require.Equal(t, model.JobAssigned, job.State)
+
+	// Drain the assignment itself first, exactly as a worker's first poll
+	// would, so the job is "running" and only the kill is left to observe.
+	req, err := http.NewRequest(http.MethodGet,
+		ts.URL+"/v1/workers/"+workerID+"/assignments?wait=50ms", nil)
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer wtok")
+	firstResp, err := ts.Client().Do(req)
+	require.NoError(t, err)
+	firstResp.Body.Close()
+
+	flagged, err := st.RequestKill(job.ID)
+	require.NoError(t, err)
+	require.True(t, flagged)
+
+	req2, err := http.NewRequest(http.MethodGet,
+		ts.URL+"/v1/workers/"+workerID+"/assignments?wait=2s", nil)
+	require.NoError(t, err)
+	req2.Header.Set("Authorization", "Bearer wtok")
+	resp2, err := ts.Client().Do(req2)
+	require.NoError(t, err)
+	defer resp2.Body.Close()
+	require.Equal(t, http.StatusOK, resp2.StatusCode,
+		"a kill with no new assignment must still end the long-poll with 200, not 204")
+
+	var poll server.PollResponse
+	require.NoError(t, json.NewDecoder(resp2.Body).Decode(&poll))
+	require.Empty(t, poll.Assignments)
+	require.Contains(t, poll.Kills, job.ID)
+}
+
 func TestAssignmentsLongPollReturns204WhenIdle(t *testing.T) {
 	ts, _, _, _ := newServer(t)
 
 	resp := post(t, ts, "wtok", "/v1/workers/register",
-		server.RegisterRequest{Host: "gpubox", Devices: []string{"gpu0"}})
+		server.RegisterRequest{Host: "gpubox", Devices: []server.DeviceSpec{{Name: "gpu0"}}})
 	var reg server.RegisterResponse
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&reg))
 	resp.Body.Close()
@@ -145,7 +228,7 @@ func TestWorkerReportingTerminalStatusFreesDevice(t *testing.T) {
 	ts, st, _, _ := newServer(t)
 
 	resp := post(t, ts, "wtok", "/v1/workers/register",
-		server.RegisterRequest{Host: "gpubox", Devices: []string{"gpu0"}})
+		server.RegisterRequest{Host: "gpubox", Devices: []server.DeviceSpec{{Name: "gpu0"}}})
 	var reg server.RegisterResponse
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&reg))
 	resp.Body.Close()
@@ -170,13 +253,13 @@ func TestWorkerCannotReportStatusForAnotherWorkersJob(t *testing.T) {
 	ts, st, _, _ := newServer(t)
 
 	resp1 := post(t, ts, "wtok", "/v1/workers/register",
-		server.RegisterRequest{Host: "gpubox", Devices: []string{"gpu0"}})
+		server.RegisterRequest{Host: "gpubox", Devices: []server.DeviceSpec{{Name: "gpu0"}}})
 	var reg1 server.RegisterResponse
 	require.NoError(t, json.NewDecoder(resp1.Body).Decode(&reg1))
 	resp1.Body.Close()
 
 	resp2 := post(t, ts, "wtok", "/v1/workers/register",
-		server.RegisterRequest{Host: "gpubox2", Devices: []string{"gpu0"}})
+		server.RegisterRequest{Host: "gpubox2", Devices: []server.DeviceSpec{{Name: "gpu0"}}})
 	var reg2 server.RegisterResponse
 	require.NoError(t, json.NewDecoder(resp2.Body).Decode(&reg2))
 	resp2.Body.Close()
@@ -238,9 +321,9 @@ func TestAssignmentIsHandedOutOnlyOnce(t *testing.T) {
 			return nil
 		}
 		require.Equal(t, http.StatusOK, resp.StatusCode)
-		var out []server.Assignment
+		var out server.PollResponse
 		require.NoError(t, json.NewDecoder(resp.Body).Decode(&out))
-		return out
+		return out.Assignments
 	}
 
 	first := poll()
@@ -269,7 +352,7 @@ func TestReRegistrationCannotLeaveADeviceReadyWithALiveLease(t *testing.T) {
 	ts, st, _, c := newServer(t)
 
 	resp := post(t, ts, "wtok", "/v1/workers/register",
-		server.RegisterRequest{Host: "gpubox", Devices: []string{"gpu0"}})
+		server.RegisterRequest{Host: "gpubox", Devices: []server.DeviceSpec{{Name: "gpu0"}}})
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	resp.Body.Close()
 
@@ -287,7 +370,7 @@ func TestReRegistrationCannotLeaveADeviceReadyWithALiveLease(t *testing.T) {
 	// host-derived worker ID while the controller still believes the job is
 	// running on it.
 	resp2 := post(t, ts, "wtok", "/v1/workers/register",
-		server.RegisterRequest{Host: "gpubox", Devices: []string{"gpu0"}})
+		server.RegisterRequest{Host: "gpubox", Devices: []server.DeviceSpec{{Name: "gpu0"}}})
 	defer resp2.Body.Close()
 	require.Equal(t, http.StatusOK, resp2.StatusCode)
 
@@ -312,7 +395,7 @@ func TestJobStatusForUnknownJobReturns404(t *testing.T) {
 	ts, _, _, _ := newServer(t)
 
 	resp := post(t, ts, "wtok", "/v1/workers/register",
-		server.RegisterRequest{Host: "gpubox", Devices: []string{"gpu0"}})
+		server.RegisterRequest{Host: "gpubox", Devices: []server.DeviceSpec{{Name: "gpu0"}}})
 	var reg server.RegisterResponse
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&reg))
 	resp.Body.Close()
