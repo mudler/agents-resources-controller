@@ -25,6 +25,27 @@ import (
 type ProbeResult struct {
 	Host   map[string]string
 	Device map[string]map[string]string
+
+	// Failed reports whether at least one probe CAPABLE of producing
+	// device-scoped facts actually ran and failed this pass: nvidia-smi
+	// found on PATH but erroring, timing out, or emitting something that
+	// doesn't parse, or a drop-in probe doing the same. It is deliberately
+	// left false when nvidia-smi is simply not found on PATH (see
+	// nvidiaLabels' own doc comment: that is ordinary absence, not
+	// failure, unchanged from Task 5) and false when ProbeDir has no
+	// entries at all.
+	//
+	// This is what lets a caller (see labelsPayload) tell "this device's
+	// probe ran and confirmed there is nothing to report" — which
+	// ReplaceLabels must be allowed to turn into a clear, per Task 3's own
+	// design — apart from "something that can produce device facts broke
+	// this pass, so an empty result here proves nothing about the device
+	// itself". A single flag, not a per-device or per-probe map: gatherLabels
+	// has no way to know in advance which device a probe would have named
+	// had it succeeded, so a failure anywhere is treated as inconclusive
+	// for every device that came back empty, not just the one nearest the
+	// failure.
+	Failed bool
 }
 
 // probePassBudget bounds the WHOLE gatherLabels pass — every built-in call
@@ -69,7 +90,11 @@ func (w *Worker) gatherLabels(ctx context.Context) ProbeResult {
 	}
 
 	merge("builtin", builtinLabels())
-	merge("nvidia-smi", nvidiaLabels(ctx, w.cfg.ProbeTimeout))
+	nvFacts, nvFailed := nvidiaLabels(ctx, w.cfg.ProbeTimeout)
+	merge("nvidia-smi", nvFacts)
+	if nvFailed {
+		res.Failed = true
+	}
 
 	entries, err := os.ReadDir(w.cfg.ProbeDir)
 	if err != nil {
@@ -94,6 +119,11 @@ func (w *Worker) gatherLabels(ctx context.Context) ProbeResult {
 		if err := ctx.Err(); err != nil {
 			slog.Warn("probe pass exceeded its budget; remaining probes skipped",
 				"dir", w.cfg.ProbeDir, "budget", probePassBudget)
+			// A probe skipped for budget reasons never ran at all, so
+			// whatever it would have said about any device is simply
+			// unknown — indistinguishable, for labelsPayload's purposes,
+			// from one that ran and failed outright.
+			res.Failed = true
 			break
 		}
 
@@ -101,6 +131,7 @@ func (w *Worker) gatherLabels(ctx context.Context) ProbeResult {
 		info, err := os.Stat(path)
 		if err != nil {
 			slog.Warn("stat probe; skipped", "probe", path, "err", err)
+			res.Failed = true
 			continue
 		}
 		if info.Mode()&0o111 == 0 {
@@ -110,6 +141,7 @@ func (w *Worker) gatherLabels(ctx context.Context) ProbeResult {
 		facts, err := runProbe(ctx, path, w.cfg.ProbeTimeout)
 		if err != nil {
 			slog.Warn("probe failed; skipped", "probe", path, "err", err)
+			res.Failed = true
 			continue
 		}
 		merge(path, facts)
@@ -387,8 +419,18 @@ func kernelRelease() (string, bool) {
 }
 
 // nvidiaLabels reports GPU facts from nvidia-smi when it is on PATH; when it
-// is absent, this returns nil and that is not an error — a box with no
-// NVIDIA GPUs simply has no GPU labels.
+// is absent, this returns (nil, false) and that is not a failure — a box
+// with no NVIDIA GPUs simply has no GPU labels. The second return, failed,
+// is true only when nvidia-smi WAS found but its invocation or output was
+// no good (a non-zero exit, a timeout, output that doesn't parse) — the
+// "driver upgrade broke nvidia-smi" case, which is the common real-world
+// shape of an nvidia-smi that starts failing: the binary stays on PATH, it
+// just stops working ("Failed to initialize NVML: Driver/library version
+// mismatch" being the canonical example). That distinction is what lets
+// gatherLabels tell "there really are no GPUs to report" apart from
+// "something that reports GPUs broke this pass", so a caller (see
+// ProbeResult.Failed / labelsPayload) doesn't clear a device's previously
+// detected GPU facts just because this one pass couldn't reproduce them.
 //
 // nvidia-smi is run through the SAME Run() process-group supervision every
 // other spawned process in this package gets: its own process group,
@@ -413,10 +455,10 @@ func kernelRelease() (string, bool) {
 // silently promoted to host-wide facts misattributed to every device. An
 // operator who wants GPU facts attributed to a differently-named device can
 // do so with a drop-in probe that knows the mapping.
-func nvidiaLabels(ctx context.Context, timeout time.Duration) map[string]string {
+func nvidiaLabels(ctx context.Context, timeout time.Duration) (facts map[string]string, failed bool) {
 	smi, err := exec.LookPath("nvidia-smi")
 	if err != nil {
-		return nil
+		return nil, false
 	}
 
 	stdout := &boundedBuffer{limit: maxProbeOutputBytes}
@@ -431,25 +473,25 @@ func nvidiaLabels(ctx context.Context, timeout time.Duration) map[string]string 
 	switch {
 	case res.Err != nil:
 		slog.Warn("nvidia-smi failed; no GPU labels reported", "err", res.Err)
-		return nil
+		return nil, true
 	case res.Killed:
 		reason := res.Reason
 		if reason == "" {
 			reason = "killed"
 		}
 		slog.Warn("nvidia-smi timed out; no GPU labels reported", "reason", reason)
-		return nil
+		return nil, true
 	case res.ExitCode != 0:
 		slog.Warn("nvidia-smi exited non-zero; no GPU labels reported",
 			"exit_code", res.ExitCode, "stderr", strings.TrimSpace(stderr.buf.String()))
-		return nil
+		return nil, true
 	case stdout.truncated:
 		slog.Warn("nvidia-smi output exceeded the size cap; no GPU labels reported",
 			"limit", maxProbeOutputBytes)
-		return nil
+		return nil, true
 	}
 
-	facts := map[string]string{}
+	facts = map[string]string{}
 	for i, line := range strings.Split(strings.TrimSpace(stdout.buf.String()), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
@@ -480,5 +522,5 @@ func nvidiaLabels(ctx context.Context, timeout time.Duration) map[string]string 
 		facts[prefix+".vram"] = vram + "M"
 		facts[prefix+".driver"] = driver
 	}
-	return facts
+	return facts, false
 }

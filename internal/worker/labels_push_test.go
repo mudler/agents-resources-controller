@@ -198,3 +198,98 @@ func TestProbePassNeverBlocksHeartbeat(t *testing.T) {
 	require.Greater(t, n, 15,
 		"the heartbeat loop must keep ticking on its own goroutine through slow, back-to-back probe passes; got %d heartbeats", n)
 }
+
+// TestPushLabelsOmitsADeviceWhoseProbeStartsFailing is the fix-round-1
+// Critical finding, driven through the REAL gatherLabels path end to end —
+// not a hand-built ProbeResult — exactly as the review asked: a drop-in
+// probe reports real gpu0 facts on its first run (captured in the
+// /v1/workers/register body), then starts failing on every subsequent run
+// (simulating "a driver upgrade broke nvidia-smi"). The next probe-interval
+// push must OMIT gpu0 from its labels map entirely — not send it as {},
+// which the controller's ReplaceLabels would still turn into a clear — even
+// though the pass's built-in host facts (at minimum "cpus") keep flowing
+// and make the pass as a whole very much non-empty. This is precisely the
+// scenario the ORIGINAL pass-wide-only guard could never catch, because a
+// real host's built-ins essentially never produce an empty ProbeResult.
+func TestPushLabelsOmitsADeviceWhoseProbeStartsFailing(t *testing.T) {
+	probeDir := t.TempDir()
+	marker := filepath.Join(probeDir, ".ran-once")
+	script := "#!/bin/sh\n" +
+		"if [ -f " + marker + " ]; then\n" +
+		"  echo 'nvidia-smi: Failed to initialize NVML' >&2\n" +
+		"  exit 1\n" +
+		"fi\n" +
+		"touch " + marker + "\n" +
+		`echo '{"gpu0.vram":"80G","gpu0.model":"a100"}'` + "\n"
+	require.NoError(t, os.WriteFile(filepath.Join(probeDir, "10-gpu.sh"), []byte(script), 0o755))
+
+	registered := make(chan registerBody, 1)
+	pushed := make(chan map[string]any, 4)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/workers/register":
+			var body registerBody
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			select {
+			case registered <- body:
+			default:
+			}
+			_ = json.NewEncoder(w).Encode(map[string]string{"worker_id": "w1"})
+		case "/v1/workers/w1/labels":
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			select {
+			case pushed <- body:
+			default:
+			}
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	wk := worker.New(worker.Config{
+		ControllerURL:     ts.URL,
+		Token:             "t",
+		Host:              "gpubox",
+		Devices:           []worker.DeviceConfig{{Name: "gpu0"}},
+		HeartbeatInterval: 500 * time.Millisecond,
+		PollWait:          50 * time.Millisecond,
+		ProbeDir:          probeDir,
+		ProbeInterval:     150 * time.Millisecond,
+	})
+	go func() { _ = wk.Start(ctx) }()
+
+	// The FIRST pass (inside register()) must have captured gpu0's real
+	// facts — proving the probe script and the pipeline both work before
+	// asserting on the interesting (failure) case.
+	var regBody registerBody
+	select {
+	case regBody = <-registered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("register never reached the controller")
+	}
+	require.Equal(t, "80G", regBody.Labels["gpu0"]["vram"], "sanity: the first pass must have captured gpu0's real facts")
+
+	// A subsequent probe-interval push must have run the (now failing)
+	// probe again and omitted gpu0 entirely.
+	var pushBody map[string]any
+	select {
+	case pushBody = <-pushed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("no periodic label push reached the controller")
+	}
+	labels, _ := pushBody["labels"].(map[string]any)
+	require.NotNil(t, labels, "host-wide built-ins (at minimum cpus) must still be present")
+	_, hasHostKey := labels[""]
+	require.True(t, hasHostKey, "host-wide facts must be unaffected by gpu0's probe failure")
+	_, hasGPU0Key := labels["gpu0"]
+	require.False(t, hasGPU0Key,
+		"a device whose probe started failing must be OMITTED from the labels push, not sent as {} — "+
+			"sending {} would have the controller clear its previously detected vram/model facts")
+}

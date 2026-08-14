@@ -11,9 +11,18 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// ptr is a small helper so tests can build a *string inline — RegisterRequest
+// and LabelsPushRequest's Sheet field is a pointer so nil (leave the stored
+// sheet alone) can be told apart from an explicit, present "" (clear it).
+func ptr(s string) *string { return &s }
+
 // A registration carrying detected and declared labels stores each under
 // the right provenance, and a host-wide fact (the "" key) reaches every
-// device declared in that registration.
+// device PRESENT in the map — gpu1 here has no facts of its own but is
+// still explicitly reported (an empty submap), exactly what a real,
+// non-failed gatherLabels pass sends for every configured device (see
+// worker.labelsPayload): only a device a pass had a genuine failure for is
+// ever left out of the map entirely.
 func TestRegisterStoresDetectedAndDeclaredLabels(t *testing.T) {
 	ts, st, _, _ := newServer(t)
 
@@ -23,6 +32,7 @@ func TestRegisterStoresDetectedAndDeclaredLabels(t *testing.T) {
 		Labels: map[string]map[string]string{
 			"":     {"rack": "a1"},
 			"gpu0": {"vendor": "nvidia"},
+			"gpu1": {},
 		},
 		DeclaredLabels: map[string]map[string]string{
 			"gpu0": {"owner": "team-a"},
@@ -49,6 +59,48 @@ func TestRegisterStoresDetectedAndDeclaredLabels(t *testing.T) {
 	require.Equal(t, "rack", gpu1[0].Key)
 	require.Equal(t, "a1", gpu1[0].Value)
 	require.Equal(t, model.SourceDetected, gpu1[0].Source)
+}
+
+// The complement, and the fix-round-1 finding pinned directly at this
+// layer: a device whose bare name is NOT a key in Labels at all — because
+// its own probes failed this pass, per worker.labelsPayload — must be left
+// completely untouched, host-wide fact included, not merely spared an
+// empty-clear. A prior version of applyDeviceFacts iterated every device in
+// deviceNames unconditionally once Labels was non-nil, which would have
+// applied the host-wide fact alone to an omitted device and silently
+// dropped whatever GPU/VRAM facts it had from an earlier pass.
+func TestRegisterLeavesADeviceAbsentFromLabelsCompletelyUntouched(t *testing.T) {
+	ts, st, _, _ := newServer(t)
+
+	first := post(t, ts, "wtok", "/v1/workers/register", server.RegisterRequest{
+		Host:    "gpubox",
+		Devices: []server.DeviceSpec{{Name: "gpu0"}},
+		Labels:  map[string]map[string]string{"gpu0": {"vram": "80G", "model": "a100"}},
+	})
+	first.Body.Close()
+	require.Equal(t, 200, first.StatusCode)
+
+	// gpu0's own probe failed this round (e.g. nvidia-smi broke): the
+	// worker reports a host-wide fact but says nothing at all about gpu0.
+	second := post(t, ts, "wtok", "/v1/workers/register", server.RegisterRequest{
+		Host:    "gpubox",
+		Devices: []server.DeviceSpec{{Name: "gpu0"}},
+		Labels:  map[string]map[string]string{"": {"kernel": "6.8.0"}},
+	})
+	second.Body.Close()
+	require.Equal(t, 200, second.StatusCode)
+
+	labels, err := st.LabelsFor("gpubox:gpu0")
+	require.NoError(t, err)
+	byKey := map[string]string{}
+	for _, l := range labels {
+		byKey[l.Key] = l.Value
+	}
+	require.Equal(t, "80G", byKey["vram"], "gpu0's stale facts must survive a round it was omitted from")
+	require.Equal(t, "a100", byKey["model"])
+	_, gotKernel := byKey["kernel"]
+	require.False(t, gotKernel,
+		"a device omitted from Labels must not even pick up the host-wide fact — it is untouched, not partially updated")
 }
 
 // A device-scoped value wins over a host-wide one on a key collision: the
@@ -81,7 +133,7 @@ func TestRegisterStoresUsageSheets(t *testing.T) {
 	resp := post(t, ts, "wtok", "/v1/workers/register", server.RegisterRequest{
 		Host:         "gpubox",
 		Devices:      []server.DeviceSpec{{Name: "gpu0"}},
-		Sheet:        "# gpubox\nshared rack A1",
+		Sheet:        ptr("# gpubox\nshared rack A1"),
 		DeviceSheets: map[string]string{"gpu0": "gpu0 runs the eval suite"},
 	})
 	defer resp.Body.Close()
@@ -107,7 +159,7 @@ func TestRegisterRejectsOversizedSheet(t *testing.T) {
 	resp := post(t, ts, "wtok", "/v1/workers/register", server.RegisterRequest{
 		Host:    "gpubox",
 		Devices: []server.DeviceSpec{{Name: "gpu0"}},
-		Sheet:   huge,
+		Sheet:   ptr(huge),
 		Labels:  map[string]map[string]string{"gpu0": {"vendor": "nvidia"}},
 	})
 	defer resp.Body.Close()
@@ -221,7 +273,7 @@ func TestPushLabelsStoresDetectedLabelsAndSheet(t *testing.T) {
 		Host:    "gpubox",
 		Devices: []string{"gpu0"},
 		Labels:  map[string]map[string]string{"gpu0": {"vendor": "nvidia"}},
-		Sheet:   "# gpubox",
+		Sheet:   ptr("# gpubox"),
 	})
 	defer resp.Body.Close()
 	require.Equal(t, 200, resp.StatusCode)
@@ -274,13 +326,91 @@ func TestPushLabelsDoesNotDisturbARunningJob(t *testing.T) {
 // An oversized sheet on the push route is rejected exactly like on
 // registration.
 func TestPushLabelsRejectsOversizedSheet(t *testing.T) {
-	ts, _, _, _ := newServer(t)
+	ts, st, _, _ := newServer(t)
 	workerID := registerWorker(t, ts)
 
 	huge := strings.Repeat("x", (64*1024)+1)
 	resp := post(t, ts, "wtok", "/v1/workers/"+workerID+"/labels", server.LabelsPushRequest{
-		Host: "gpubox", Devices: []string{"gpu0"}, Sheet: huge,
+		Host: "gpubox", Devices: []string{"gpu0"}, Sheet: ptr(huge),
 	})
 	defer resp.Body.Close()
 	require.Equal(t, 413, resp.StatusCode)
+
+	hostBody, at, err := st.HostDoc("gpubox", "")
+	require.NoError(t, err)
+	require.Empty(t, hostBody, "nothing must be stored when the push is rejected")
+	require.True(t, at.IsZero())
+}
+
+// TestPushLabelsRejectsOversizedSheetAtExactBoundary pins the boundary
+// precisely: a sheet of exactly maxSheetBytes is accepted (the cap is
+// "exceeds", not "reaches"), and one byte over is rejected — proven against
+// the same route, not just the size-comparison helper in isolation.
+func TestPushLabelsRejectsOversizedSheetAtExactBoundary(t *testing.T) {
+	ts, st, _, _ := newServer(t)
+	workerID := registerWorker(t, ts)
+
+	atCap := strings.Repeat("x", 64*1024)
+	ok := post(t, ts, "wtok", "/v1/workers/"+workerID+"/labels", server.LabelsPushRequest{
+		Host: "gpubox", Devices: []string{"gpu0"}, Sheet: ptr(atCap),
+	})
+	ok.Body.Close()
+	require.Equal(t, 200, ok.StatusCode, "exactly 64KB must be accepted")
+
+	hostBody, _, err := st.HostDoc("gpubox", "")
+	require.NoError(t, err)
+	require.Equal(t, atCap, hostBody)
+
+	overCap := atCap + "x"
+	rejected := post(t, ts, "wtok", "/v1/workers/"+workerID+"/labels", server.LabelsPushRequest{
+		Host: "gpubox", Devices: []string{"gpu0"}, Sheet: ptr(overCap),
+	})
+	defer rejected.Body.Close()
+	require.Equal(t, 413, rejected.StatusCode, "64KB plus one byte must be rejected")
+
+	stillOld, _, err := st.HostDoc("gpubox", "")
+	require.NoError(t, err)
+	require.Equal(t, atCap, stillOld, "a rejected oversized push must not overwrite the previously accepted sheet")
+}
+
+// TestPushLabelsToUnknownWorkerIDReturns404 pins the fix-round-1 finding: a
+// worker ID this controller never registered must not be a silent no-op
+// that answers 200 — that is exactly how a worker with a typo'd or stale
+// worker ID looks perfectly healthy while every push it sends lands nowhere.
+func TestPushLabelsToUnknownWorkerIDReturns404(t *testing.T) {
+	ts, _, _, _ := newServer(t)
+
+	resp := post(t, ts, "wtok", "/v1/workers/not-a-real-worker-id/labels", server.LabelsPushRequest{
+		Host: "some-other-host", Devices: []string{"gpu9"},
+		Labels: map[string]map[string]string{"gpu9": {"vendor": "nvidia"}},
+	})
+	defer resp.Body.Close()
+	require.Equal(t, 404, resp.StatusCode)
+}
+
+// TestPushLabelsHostMismatchIsRejected pins the other half: even a KNOWN
+// worker ID must have its body's host agree with what that worker actually
+// registered as. Without this, a worker whose host changed (or a stale/
+// forged ID reused against a different host) could write labels under a
+// device ID ("claimed-host:name") that doesn't match anything real, or —
+// if the claimed host happens to collide with an actual different host —
+// silently overwrite that other host's labels.
+func TestPushLabelsHostMismatchIsRejected(t *testing.T) {
+	ts, st, _, _ := newServer(t)
+	workerID := registerWorker(t, ts) // registered as host "gpubox"
+
+	resp := post(t, ts, "wtok", "/v1/workers/"+workerID+"/labels", server.LabelsPushRequest{
+		Host: "not-gpubox", Devices: []string{"gpu0"},
+		Labels: map[string]map[string]string{"gpu0": {"vendor": "nvidia"}},
+	})
+	defer resp.Body.Close()
+	require.Equal(t, 400, resp.StatusCode)
+
+	// Nothing was written under either host.
+	labels, err := st.LabelsFor("gpubox:gpu0")
+	require.NoError(t, err)
+	require.Empty(t, labels)
+	otherLabels, err := st.LabelsFor("not-gpubox:gpu0")
+	require.NoError(t, err)
+	require.Empty(t, otherLabels)
 }

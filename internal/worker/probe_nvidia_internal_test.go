@@ -31,7 +31,7 @@ func TestNvidiaLabelsParsesPresentDriver(t *testing.T) {
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	facts := nvidiaLabels(context.Background(), 5*time.Second)
+	facts, _ := nvidiaLabels(context.Background(), 5*time.Second)
 
 	want := map[string]string{
 		"gpu0.vendor": "nvidia",
@@ -58,13 +58,42 @@ func TestNvidiaLabelsParsesPresentDriver(t *testing.T) {
 }
 
 // TestNvidiaLabelsAbsentIsNotAnError confirms exec.LookPath failing (no
-// nvidia-smi on PATH) yields nil facts, not an error — the documented
-// behavior for a box with no NVIDIA GPUs.
+// nvidia-smi on PATH) yields nil facts and failed=false — the documented
+// behavior for a box with no NVIDIA GPUs: ordinary absence, not a failure
+// that would make gatherLabels withhold a device's other, unrelated facts.
 func TestNvidiaLabelsAbsentIsNotAnError(t *testing.T) {
 	t.Setenv("PATH", t.TempDir())
-	facts := nvidiaLabels(context.Background(), 5*time.Second)
+	facts, failed := nvidiaLabels(context.Background(), 5*time.Second)
 	if facts != nil {
 		t.Errorf("expected nil facts when nvidia-smi is absent, got %#v", facts)
+	}
+	if failed {
+		t.Error("nvidia-smi merely absent from PATH must not be reported as a failure")
+	}
+}
+
+// TestNvidiaLabelsPresentButBrokenIsAFailure is the OTHER half: nvidia-smi
+// present on PATH but exiting non-zero — the realistic shape of "a driver
+// upgrade broke nvidia-smi" (e.g. "Failed to initialize NVML: Driver/library
+// version mismatch") — must be reported as failed=true, not treated the
+// same as ordinary absence. See ProbeResult.Failed for why the distinction
+// matters: only this case may withhold a device's stale facts from being
+// wiped by an empty result.
+func TestNvidiaLabelsPresentButBrokenIsAFailure(t *testing.T) {
+	dir := t.TempDir()
+	fake := filepath.Join(dir, "nvidia-smi")
+	script := "#!/bin/sh\necho 'Failed to initialize NVML' >&2\nexit 1\n"
+	if err := os.WriteFile(fake, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	facts, failed := nvidiaLabels(context.Background(), 5*time.Second)
+	if facts != nil {
+		t.Errorf("a broken nvidia-smi must report no facts, got %#v", facts)
+	}
+	if !failed {
+		t.Error("nvidia-smi present but exiting non-zero must be reported as a failure")
 	}
 }
 
@@ -89,7 +118,7 @@ func TestProbedVRAMComparesCorrectlyThroughSelector(t *testing.T) {
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	facts := nvidiaLabels(context.Background(), 5*time.Second)
+	facts, _ := nvidiaLabels(context.Background(), 5*time.Second)
 	bigVRAM := facts["gpu0.vram"]
 	smallVRAM := facts["gpu1.vram"]
 	if bigVRAM != "81920M" || smallVRAM != "9000M" {

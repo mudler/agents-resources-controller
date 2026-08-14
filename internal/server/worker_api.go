@@ -74,11 +74,20 @@ type RegisterRequest struct {
 	DeclaredLabels map[string]map[string]string `json:"declared_labels"`
 	// Sheet is this host's usage-sheet documentation (host.md), and
 	// DeviceSheets is each device's own (host.d/<device>.md), keyed by bare
-	// device name. Both are plain, unconditional snapshots of the worker's
-	// disk: an empty sheet is a completely ordinary state (most hosts have
-	// none), not something that needs the nil/absent distinction Labels
-	// does.
-	Sheet        string            `json:"sheet,omitempty"`
+	// device name.
+	//
+	// Sheet is a *string, not a plain string, for the same nil-vs-empty
+	// reason Labels is a nil-checked map — a fix-round-1 finding: the
+	// worker's readSheets can fail to read host.md for a reason OTHER than
+	// it simply not existing (permission denied, ...), and a plain string
+	// could not tell that apart from "the host genuinely has no sheet".
+	// nil means "leave whatever is already stored for this host's sheet
+	// alone"; a non-nil pointer, even to "", is an explicit, trustworthy
+	// report and is applied via UpsertHostDoc. DeviceSheets needs no such
+	// pointer: a device whose sheet could not be read is simply omitted
+	// from the map (its key is absent), which applyDeviceFacts already
+	// treats as "leave it alone" via its `if body, ok := ...` check.
+	Sheet        *string           `json:"sheet,omitempty"`
 	DeviceSheets map[string]string `json:"device_sheets,omitempty"`
 }
 
@@ -87,13 +96,14 @@ type RegisterRequest struct {
 // usage sheets RegisterRequest carries, scoped to ONLY that. It deliberately
 // has no boot_id or device-upsert path, and handlePushLabels never calls
 // UpsertWorker — see that handler's doc comment for why reusing
-// registration itself for this would be actively dangerous.
+// registration itself for this would be actively dangerous. Sheet has the
+// same nil-vs-empty contract as RegisterRequest.Sheet.
 type LabelsPushRequest struct {
 	Host           string                       `json:"host"`
 	Devices        []string                     `json:"devices"`
 	Labels         map[string]map[string]string `json:"labels"`
 	DeclaredLabels map[string]map[string]string `json:"declared_labels"`
-	Sheet          string                       `json:"sheet,omitempty"`
+	Sheet          *string                      `json:"sheet,omitempty"`
 	DeviceSheets   map[string]string            `json:"device_sheets,omitempty"`
 }
 
@@ -243,6 +253,32 @@ func (s *Server) handlePushLabels(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "bad_request", "host required")
 		return
 	}
+
+	// The {id} in the path must name a worker this controller actually
+	// knows about, AND that worker's recorded host must match req.Host — a
+	// fix-round-1 finding: without this, POSTing to an arbitrary or
+	// typo'd worker ID silently wrote device_labels/host_docs rows for
+	// whatever host the body claimed, with no verification the two agree.
+	// A worker with a typo'd `host:` in worker.yaml would then push into
+	// rows nothing ever reads (its real device IDs are "correct-host:name",
+	// not "typo-host:name") while this route kept answering 200 forever —
+	// a misconfigured node that looks perfectly healthy for months. Worse,
+	// a typo that happened to COLLIDE with a different real host's name
+	// would silently overwrite that host's labels instead.
+	knownHost, err := s.cfg.Store.WorkerHost(r.PathValue("id"))
+	if err != nil {
+		if errors.Is(err, store.ErrWorkerNotFound) {
+			writeErr(w, http.StatusNotFound, "not_found", "worker not found")
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
+		return
+	}
+	if req.Host != knownHost {
+		writeErr(w, http.StatusBadRequest, "bad_request", "host does not match the registered worker")
+		return
+	}
+
 	if name := oversizedSheet(req.Sheet, req.DeviceSheets); name != "" {
 		writeErr(w, http.StatusRequestEntityTooLarge, "sheet_too_large",
 			fmt.Sprintf("usage sheet %q exceeds 64KB", name))
@@ -259,9 +295,11 @@ func (s *Server) handlePushLabels(w http.ResponseWriter, r *http.Request) {
 }
 
 // oversizedSheet reports the name of the first sheet ("host", or a device's
-// bare name) that exceeds maxSheetBytes, or "" if none do.
-func oversizedSheet(sheet string, deviceSheets map[string]string) string {
-	if len(sheet) > maxSheetBytes {
+// bare name) that exceeds maxSheetBytes, or "" if none do. A nil sheet (the
+// worker has nothing trustworthy to say about the host sheet this round) is
+// never oversized — there is nothing to check.
+func oversizedSheet(sheet *string, deviceSheets map[string]string) string {
+	if sheet != nil && len(*sheet) > maxSheetBytes {
 		return "host"
 	}
 	for name, body := range deviceSheets {
@@ -280,18 +318,37 @@ func oversizedSheet(sheet string, deviceSheets map[string]string) string {
 // a caller-specific duplicate of this logic would be exactly the kind of
 // place the two could quietly drift.
 //
-// A nil labels (or declaredLabels) map skips that source entirely, leaving
-// whatever is already stored untouched — see RegisterRequest.Labels for why.
-// A non-nil map, even empty, replaces it via ReplaceLabels for every named
-// device, merging that device's own host-wide value (the "" key) in first so
-// a device-scoped value wins any key collision.
+// The nil-vs-empty contract is applied per DEVICE, not just once for the
+// whole map: a nil labels (or declaredLabels) map skips that source for
+// every device, but even a non-nil map only touches a device whose bare
+// name is actually a KEY in it — see RegisterRequest.Labels and
+// worker.labelsPayload for why a device can be legitimately absent from an
+// otherwise non-nil map (its own probes failed this pass, so nothing about
+// it is trustworthy) while a sibling device that DID report cleanly is
+// still updated. A fix-round-1 review finding caught the earlier, coarser
+// version of this: gatherLabels' built-ins (at minimum "cpus") make the
+// TOP-LEVEL map non-nil on virtually every real pass, so a nil-check alone
+// never actually protected a device whose OWN facts (e.g. nvidia-smi's
+// GPU/VRAM keys) disappeared for one pass while the host-wide facts kept
+// flowing.
+//
+// A present device key, even mapping to an empty submap, DOES replace via
+// ReplaceLabels — that is the legitimate "this device's probes ran and
+// found nothing" case Task 3's ReplaceLabels exists to support — merging
+// that device's own host-wide value (the "" key) in first so a
+// device-scoped value wins any key collision.
 func (s *Server) applyDeviceFacts(host string, deviceNames []string,
 	labels, declaredLabels map[string]map[string]string,
-	sheet string, deviceSheets map[string]string, now time.Time) error {
+	sheet *string, deviceSheets map[string]string, now time.Time) error {
 
-	if err := s.cfg.Store.UpsertHostDoc(host, "", sheet, now); err != nil {
-		return fmt.Errorf("store host sheet: %w", err)
+	if sheet != nil {
+		if err := s.cfg.Store.UpsertHostDoc(host, "", *sheet, now); err != nil {
+			return fmt.Errorf("store host sheet: %w", err)
+		}
 	}
+	// else: the worker could not read host.md this round (see
+	// RegisterRequest.Sheet) — leave whatever is already stored for this
+	// host's sheet exactly as it was.
 
 	hostLabels := labels[""]
 	hostDeclared := declaredLabels[""]
@@ -300,15 +357,23 @@ func (s *Server) applyDeviceFacts(host string, deviceNames []string,
 		deviceID := host + ":" + name
 
 		if labels != nil {
-			if err := s.cfg.Store.ReplaceLabels(deviceID, model.SourceDetected,
-				mergeLabelMaps(hostLabels, labels[name]), now); err != nil {
-				return fmt.Errorf("replace detected labels for %s: %w", deviceID, err)
+			if deviceLabels, ok := labels[name]; ok {
+				if err := s.cfg.Store.ReplaceLabels(deviceID, model.SourceDetected,
+					mergeLabelMaps(hostLabels, deviceLabels), now); err != nil {
+					return fmt.Errorf("replace detected labels for %s: %w", deviceID, err)
+				}
 			}
+			// else: this device has no key in labels at all — the worker
+			// has nothing trustworthy to say about it this round, so its
+			// previously stored detected labels are left exactly as they
+			// were.
 		}
 		if declaredLabels != nil {
-			if err := s.cfg.Store.ReplaceLabels(deviceID, model.SourceDeclared,
-				mergeLabelMaps(hostDeclared, declaredLabels[name]), now); err != nil {
-				return fmt.Errorf("replace declared labels for %s: %w", deviceID, err)
+			if deviceDeclared, ok := declaredLabels[name]; ok {
+				if err := s.cfg.Store.ReplaceLabels(deviceID, model.SourceDeclared,
+					mergeLabelMaps(hostDeclared, deviceDeclared), now); err != nil {
+					return fmt.Errorf("replace declared labels for %s: %w", deviceID, err)
+				}
 			}
 		}
 		if body, ok := deviceSheets[name]; ok {

@@ -40,14 +40,21 @@ type deviceSpec struct {
 // registerRequest mirrors server.RegisterRequest: what this worker posts
 // once at startup. Labels and DeclaredLabels are deliberately NOT
 // `omitempty` — see labelsPayload for why a nil map (omitted from the wire
-// entirely) must mean something different from a non-nil, empty one.
+// entirely) must mean something different from a non-nil, empty one. Sheet
+// is a pointer for the identical reason, fixed in fix round 1: readSheets
+// can fail to read host.md for a reason other than "it doesn't exist"
+// (permission denied, ...), and a plain string could not tell that case
+// apart from "the host genuinely has no sheet" — which would let a
+// transient chmod erase a previously good, stored sheet the next time this
+// worker registers or pushes. nil means "leave the stored host sheet
+// alone"; a non-nil pointer, even to "", is an explicit, trustworthy report.
 type registerRequest struct {
 	Host           string                       `json:"host"`
 	BootID         string                       `json:"boot_id,omitempty"`
 	Devices        []deviceSpec                 `json:"devices"`
 	Labels         map[string]map[string]string `json:"labels"`
 	DeclaredLabels map[string]map[string]string `json:"declared_labels"`
-	Sheet          string                       `json:"sheet,omitempty"`
+	Sheet          *string                      `json:"sheet,omitempty"`
 	DeviceSheets   map[string]string            `json:"device_sheets,omitempty"`
 }
 
@@ -55,13 +62,14 @@ type registerRequest struct {
 // on every probe-interval pass AFTER its initial registration. It carries no
 // boot_id and no ceiling — see pushLabels and handlePushLabels's own doc
 // comment for why this is a route separate from register() entirely, not a
-// repeated call to it.
+// repeated call to it. Sheet has the same nil-vs-empty contract as
+// registerRequest.Sheet.
 type labelsPushRequest struct {
 	Host           string                       `json:"host"`
 	Devices        []string                     `json:"devices"`
 	Labels         map[string]map[string]string `json:"labels"`
 	DeclaredLabels map[string]map[string]string `json:"declared_labels"`
-	Sheet          string                       `json:"sheet,omitempty"`
+	Sheet          *string                      `json:"sheet,omitempty"`
 	DeviceSheets   map[string]string            `json:"device_sheets,omitempty"`
 }
 
@@ -288,11 +296,7 @@ func (w *Worker) register(ctx context.Context) error {
 			"host", w.cfg.Host)
 	}
 	declared := declaredLabelsPayload(w.cfg.Devices)
-
-	hostSheet, deviceSheets, err := readSheets(w.cfg.SheetDir, w.cfg.Devices)
-	if err != nil {
-		slog.Warn("read usage sheets", "err", err)
-	}
+	sheet, deviceSheets := sheetPayload(w.cfg.SheetDir, w.cfg.Devices)
 
 	payload, err := json.Marshal(registerRequest{
 		Host:           w.cfg.Host,
@@ -300,7 +304,7 @@ func (w *Worker) register(ctx context.Context) error {
 		Devices:        devices,
 		Labels:         labels,
 		DeclaredLabels: declared,
-		Sheet:          hostSheet,
+		Sheet:          sheet,
 		DeviceSheets:   deviceSheets,
 	})
 	if err != nil {
@@ -504,15 +508,11 @@ func (w *Worker) pushLabels(ctx context.Context) {
 	res := w.gatherLabels(ctx)
 	labels := labelsPayload(res)
 	if labels == nil {
-		slog.Error("probe pass produced no facts at all; skipping this round's label push so previously detected labels are not wiped",
+		slog.Error("probe pass produced no facts at all; pushing without a labels field so previously detected labels are not wiped",
 			"host", w.cfg.Host)
 	}
 	declared := declaredLabelsPayload(w.cfg.Devices)
-
-	hostSheet, deviceSheets, err := readSheets(w.cfg.SheetDir, w.cfg.Devices)
-	if err != nil {
-		slog.Warn("read usage sheets", "err", err)
-	}
+	sheet, deviceSheets := sheetPayload(w.cfg.SheetDir, w.cfg.Devices)
 
 	names := make([]string, 0, len(w.cfg.Devices))
 	for _, d := range w.cfg.Devices {
@@ -524,7 +524,7 @@ func (w *Worker) pushLabels(ctx context.Context) {
 		Devices:        names,
 		Labels:         labels,
 		DeclaredLabels: declared,
-		Sheet:          hostSheet,
+		Sheet:          sheet,
 		DeviceSheets:   deviceSheets,
 	})
 	if err != nil {
@@ -544,32 +544,50 @@ func (w *Worker) pushLabels(ctx context.Context) {
 
 // labelsPayload turns one gatherLabels pass into the wire shape a register
 // or labels-push request carries: "" for host-wide facts, a device's bare
-// name for everything scoped to it. It returns nil — meaning "say nothing
-// about detected labels this round" — when the WHOLE pass produced not a
-// single fact, host or device.
+// name for everything scoped to it.
 //
-// This is the one guard standing between a probe outage and every device's
-// detected labels being silently wiped. The controller's ReplaceLabels
-// makes the stored set for a source exactly what it is given, so an empty
-// map means "clear" — correct for a probe that legitimately ran and found
-// nothing (a card removed), catastrophic for a probe that simply failed to
-// run at all (every built-in and drop-in erroring, a misconfigured
-// ProbeDir). The two cases produce an IDENTICAL empty ProbeResult, so this
-// is the only place that distinction can still be made: nil is sent only
-// when literally nothing was gathered anywhere, which is the one case that
-// can never legitimately mean "every device really has zero facts" for an
-// entire fleet at once.
+// This is the guard standing between a probe outage and a device's detected
+// labels being silently wiped, and it is applied PER DEVICE, not once for
+// the whole pass — a fix-round-1 review finding caught the original,
+// pass-wide version of this guard being inert in production:
+// builtinLabels() always yields at least "cpus" from runtime.NumCPU(), so
+// res.Host is non-empty on virtually every real host, which made the
+// pass-wide "everything is empty" check unreachable outside a contrived
+// unit test. The actual danger it needs to prevent is narrower and more
+// common: nvidia-smi (present on PATH but broken — the realistic shape of
+// "a driver upgrade broke it", see nvidiaLabels) or a drop-in probe failing
+// while the rest of the pass — built-ins included — keeps succeeding. That
+// must not turn a device's LAST KNOWN GPU/VRAM facts into nothing just
+// because host-wide facts happened to still come through.
+//
+// The controller's ReplaceLabels makes the stored set for one device and one
+// source exactly what it is given, so an empty submap means "clear" —
+// correct for a device whose probes ran and legitimately found nothing (a
+// card removed), wrong for a device whose probes simply failed to run this
+// pass. Those two cases produce an identical empty per-device map, so the
+// only place left to distinguish them is res.Failed: when nothing capable of
+// producing device-scoped facts failed anywhere this pass, an empty device
+// is trustworthy and is sent as an explicit clear; when something did fail,
+// every device that came back empty is OMITTED from the returned map
+// entirely (its key is simply absent, not present as {}) rather than sent
+// as a clear — see applyDeviceFacts (server-side) for why omission, not an
+// empty map, is what actually protects it: only a present key gets
+// ReplaceLabels called on it at all.
+//
+// A nil return — meaning "say nothing about detected labels at all" — is
+// reserved for the one case where there is nothing to say about anything:
+// no host facts and no device facts whatsoever.
 func labelsPayload(res ProbeResult) map[string]map[string]string {
-	empty := len(res.Host) == 0
-	if empty {
+	allEmpty := len(res.Host) == 0
+	if allEmpty {
 		for _, m := range res.Device {
 			if len(m) > 0 {
-				empty = false
+				allEmpty = false
 				break
 			}
 		}
 	}
-	if empty {
+	if allEmpty {
 		return nil
 	}
 
@@ -578,7 +596,19 @@ func labelsPayload(res ProbeResult) map[string]map[string]string {
 		out[""] = res.Host
 	}
 	for name, m := range res.Device {
-		out[name] = m
+		if len(m) > 0 {
+			out[name] = m
+			continue
+		}
+		if !res.Failed {
+			// Confirmed clean: this device's probes ran (or there simply
+			// were none configured) and nothing failed anywhere this
+			// pass, so an empty result here is trustworthy.
+			out[name] = m
+		}
+		// else: something that can produce device-scoped facts failed
+		// this pass, so this device's empty result proves nothing about
+		// it — omit it so applyDeviceFacts leaves it untouched.
 	}
 	return out
 }
@@ -597,6 +627,24 @@ func declaredLabelsPayload(devices []DeviceConfig) map[string]map[string]string 
 		out[d.Name] = d.Labels
 	}
 	return out
+}
+
+// sheetPayload wraps readSheets into the wire shape a register or
+// labels-push request carries. A nil sheet return means "host.md could not
+// be read this round (for a reason other than it simply not existing);
+// leave whatever the controller already has for this host's sheet alone" —
+// see registerRequest.Sheet's own doc comment for why a plain string cannot
+// carry that distinction. deviceSheets already carries the equivalent
+// per-device signal on its own: readSheets omits a device's key entirely
+// when ITS sheet could not be read, which is exactly the shape
+// applyDeviceFacts (server-side) already expects.
+func sheetPayload(dir string, devices []DeviceConfig) (sheet *string, deviceSheets map[string]string) {
+	host, perDevice, err := readSheets(dir, devices)
+	if err != nil {
+		slog.Warn("read host usage sheet; leaving the previously stored copy alone", "err", err)
+		return nil, perDevice
+	}
+	return &host, perDevice
 }
 
 // minPollInterval floors the gap between successive polls when the previous

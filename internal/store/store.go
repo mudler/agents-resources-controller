@@ -24,6 +24,9 @@ var schema string
 // that did: see SetDeviceState.
 var ErrDeviceNotFound = errors.New("device not found")
 
+// ErrWorkerNotFound means the worker ID named by a caller matches no row.
+var ErrWorkerNotFound = errors.New("worker not found")
+
 type Store struct {
 	db    *sql.DB
 	clock clock.Clock
@@ -296,6 +299,28 @@ func (s *Store) SetDeviceState(id string, state model.DeviceState, at time.Time)
 		return fmt.Errorf("%w: %s", ErrDeviceNotFound, id)
 	}
 	return nil
+}
+
+// WorkerHost returns the host a registered worker ID belongs to, so a
+// caller can verify a request naming that worker ID actually agrees about
+// which host it is — see handlePushLabels for why: without this check, a
+// worker with a typo'd or stale `host:` in worker.yaml could push labels
+// that silently land nowhere (a device ID for a host that doesn't exist)
+// while reporting success forever, or overwrite another host's labels
+// outright if the typo happens to collide with a real one.
+//
+// An ID that matches no row yields ErrWorkerNotFound rather than an empty
+// string, so "unknown worker" is never silently treated as "empty host".
+func (s *Store) WorkerHost(workerID string) (string, error) {
+	var host string
+	err := s.db.QueryRow(`SELECT host FROM workers WHERE id = ?`, workerID).Scan(&host)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", fmt.Errorf("%w: %s", ErrWorkerNotFound, workerID)
+	}
+	if err != nil {
+		return "", err
+	}
+	return host, nil
 }
 
 func (s *Store) Devices() ([]model.Device, error) {
