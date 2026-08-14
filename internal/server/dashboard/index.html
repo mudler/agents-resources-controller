@@ -1,0 +1,213 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>resource controller</title>
+<style>
+  :root {
+    --bg:#fbfbfd; --panel:#fff; --ink:#16181d; --muted:#6b7280; --line:#e5e7eb;
+    --ready:#15803d; --busy:#b45309; --unknown:#6b7280; --unhealthy:#b91c1c;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg:#0f1115; --panel:#171a21; --ink:#e8eaed; --muted:#9aa1ab; --line:#262b34;
+      --ready:#4ade80; --busy:#fbbf24; --unknown:#9aa1ab; --unhealthy:#f87171;
+    }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+         font:14px/1.5 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
+  header { display:flex; gap:12px; align-items:center; justify-content:space-between;
+           padding:14px 20px; border-bottom:1px solid var(--line); }
+  h1 { font-size:15px; margin:0; font-weight:600; letter-spacing:.01em; }
+  main { padding:20px; max-width:1200px; margin:0 auto; }
+  h2 { font-size:12px; text-transform:uppercase; letter-spacing:.08em;
+       color:var(--muted); margin:24px 0 10px; font-weight:600; }
+  .grid { display:grid; gap:12px; grid-template-columns:repeat(auto-fill,minmax(280px,1fr)); }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px; }
+  .card.alert { border-color:var(--unhealthy); }
+  .dev { display:flex; justify-content:space-between; align-items:baseline; gap:8px; }
+  .name { font-weight:600; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
+  .state { font-size:12px; font-weight:600; }
+  .ready{color:var(--ready)} .busy{color:var(--busy)}
+  .unknown{color:var(--unknown)} .unhealthy{color:var(--unhealthy)}
+  .meta { color:var(--muted); font-size:12px; margin-top:6px; }
+  .cmd { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px;
+         margin-top:6px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  table { width:100%; border-collapse:collapse; }
+  th,td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); font-size:13px; }
+  th { color:var(--muted); font-weight:600; font-size:11px; text-transform:uppercase; letter-spacing:.06em; }
+  td.mono { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px; }
+  .wrap { overflow-x:auto; }
+  input { background:var(--panel); color:var(--ink); border:1px solid var(--line);
+          border-radius:7px; padding:7px 10px; font:inherit; min-width:260px; }
+  button { background:var(--ink); color:var(--bg); border:0; border-radius:7px;
+           padding:7px 13px; font:inherit; font-weight:600; cursor:pointer; }
+  .empty { color:var(--muted); padding:14px 0; }
+  #err { color:var(--unhealthy); font-size:12px; }
+  #gate { padding:40px 20px; max-width:460px; margin:0 auto; }
+  .hide { display:none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>resource controller</h1>
+  <span id="err"></span>
+</header>
+
+<div id="gate">
+  <h2>client token</h2>
+  <p class="meta">Held for this tab only, never stored on disk.</p>
+  <form id="gateForm">
+    <input id="token" type="password" autocomplete="off" placeholder="paste a client token" required>
+    <button type="submit">connect</button>
+  </form>
+</div>
+
+<main id="app" class="hide">
+  <h2>devices</h2>
+  <div class="grid" id="devices"></div>
+
+  <h2>queue</h2>
+  <div class="wrap"><table id="queue">
+    <thead><tr><th>#</th><th>job</th><th>device</th><th>submitter</th><th>command</th></tr></thead>
+    <tbody></tbody>
+  </table></div>
+  <div class="empty hide" id="queueEmpty">nothing waiting</div>
+
+  <h2>running</h2>
+  <div class="wrap"><table id="jobs">
+    <thead><tr><th>job</th><th>device</th><th>state</th><th>submitter</th><th>command</th></tr></thead>
+    <tbody></tbody>
+  </table></div>
+  <div class="empty hide" id="jobsEmpty">nothing running</div>
+</main>
+
+<script>
+(function () {
+  var token = sessionStorage.getItem("rc_token") || "";
+  var gate = document.getElementById("gate");
+  var app = document.getElementById("app");
+  var err = document.getElementById("err");
+
+  document.getElementById("gateForm").addEventListener("submit", function (e) {
+    e.preventDefault();
+    token = document.getElementById("token").value.trim();
+    sessionStorage.setItem("rc_token", token);
+    start();
+  });
+
+  function fail(message) { err.textContent = message; }
+
+  function fetchState() {
+    return fetch("/v1/state", { headers: { Authorization: "Bearer " + token } })
+      .then(function (r) {
+        if (r.status === 401 || r.status === 403) {
+          sessionStorage.removeItem("rc_token");
+          gate.classList.remove("hide");
+          app.classList.add("hide");
+          throw new Error("token rejected");
+        }
+        if (!r.ok) throw new Error("state: " + r.status);
+        return r.json();
+      });
+  }
+
+  function ago(seconds) {
+    if (seconds < 60) return seconds + "s";
+    if (seconds < 3600) return Math.floor(seconds / 60) + "m" + (seconds % 60) + "s";
+    return Math.floor(seconds / 3600) + "h" + Math.floor((seconds % 3600) / 60) + "m";
+  }
+
+  function renderDevices(views) {
+    var box = document.getElementById("devices");
+    box.textContent = "";
+    (views || []).forEach(function (v) {
+      var d = v.device;
+      var stale = v.heartbeat_age_seconds > 30;
+      var card = document.createElement("div");
+      card.className = "card" + (d.state === "unhealthy" ? " alert" : "");
+
+      var head = document.createElement("div");
+      head.className = "dev";
+      var name = document.createElement("span");
+      name.className = "name";
+      name.textContent = d.id;
+      var state = document.createElement("span");
+      state.className = "state " + d.state;
+      state.textContent = d.state;
+      head.appendChild(name); head.appendChild(state);
+      card.appendChild(head);
+
+      var meta = document.createElement("div");
+      meta.className = "meta";
+      var bits = [];
+      if (v.holder) bits.push("held by " + v.holder + " for " + ago(v.elapsed_seconds));
+      if (stale) bits.push("no contact " + ago(v.heartbeat_age_seconds));
+      meta.textContent = bits.join(" · ") || "idle";
+      card.appendChild(meta);
+
+      if (v.command && v.command.length) {
+        var cmd = document.createElement("div");
+        cmd.className = "cmd";
+        cmd.textContent = v.command.join(" ");
+        card.appendChild(cmd);
+      }
+      box.appendChild(card);
+    });
+  }
+
+  function fillTable(id, emptyId, rows, cells) {
+    var body = document.querySelector("#" + id + " tbody");
+    body.textContent = "";
+    (rows || []).forEach(function (row, i) {
+      var tr = document.createElement("tr");
+      cells(row, i).forEach(function (text, idx) {
+        var td = document.createElement("td");
+        if (idx === 0 || idx === 1) td.className = "mono";
+        td.textContent = text;
+        tr.appendChild(td);
+      });
+      body.appendChild(tr);
+    });
+    var empty = document.getElementById(emptyId);
+    var none = !rows || rows.length === 0;
+    empty.classList.toggle("hide", !none);
+    document.getElementById(id).classList.toggle("hide", none);
+  }
+
+  function render(state) {
+    err.textContent = "";
+    renderDevices(state.devices);
+    fillTable("queue", "queueEmpty", state.queued, function (j, i) {
+      return [String(i + 1), j.id.slice(0, 8), j.device_id, j.submitter, (j.command || []).join(" ")];
+    });
+    fillTable("jobs", "jobsEmpty", state.jobs, function (j) {
+      return [j.id.slice(0, 8), j.device_id, j.state, j.submitter, (j.command || []).join(" ")];
+    });
+  }
+
+  function refresh() { fetchState().then(render).catch(function (e) { fail(e.message); }); }
+
+  function start() {
+    gate.classList.add("hide");
+    app.classList.remove("hide");
+    refresh();
+
+    // SSE cannot carry an Authorization header, so the stream is only a
+    // nudge: every event triggers an authenticated refetch of /v1/state.
+    try {
+      var es = new EventSource("/v1/events?token=" + encodeURIComponent(token));
+      es.onmessage = refresh;
+      es.onerror = function () { fail("event stream dropped; polling"); };
+    } catch (e) { /* polling below is the fallback */ }
+
+    setInterval(refresh, 5000);
+  }
+
+  if (token) start();
+})();
+</script>
+</body>
+</html>

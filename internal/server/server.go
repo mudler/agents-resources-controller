@@ -56,6 +56,12 @@ func (s *Server) Handler() http.Handler {
 
 	mux.Handle("POST /v1/devices/{id}/clear", s.require("admin", s.handleClearDevice))
 
+	// Registered last so it cannot shadow any API route: ServeMux prefers
+	// the most specific pattern regardless of registration order, but "/"
+	// is the least specific pattern there is, so this ordering is really
+	// just documentation of that fact for the next reader.
+	mux.HandleFunc("GET /", s.handleDashboard)
+
 	return mux
 }
 
@@ -66,6 +72,15 @@ func (s *Server) require(role string, h http.HandlerFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		auth := r.Header.Get("Authorization")
 		token, hasScheme := strings.CutPrefix(auth, "Bearer ")
+		// Browsers' EventSource cannot set an Authorization header, so the
+		// event stream alone also accepts the token as a query parameter.
+		// Nowhere else: a token in a query string can land in access logs
+		// and proxy logs, so every other route keeps the header as the
+		// only accepted form.
+		if token == "" && r.URL.Path == "/v1/events" {
+			token = r.URL.Query().Get("token")
+			hasScheme = token != ""
+		}
 		got, ok := s.cfg.Tokens[token]
 		if !hasScheme || token == "" || !ok {
 			writeErr(w, http.StatusUnauthorized, "unauthorized", "unknown or missing token")

@@ -46,6 +46,29 @@ func TestEventStreamDeliversPublishedEvents(t *testing.T) {
 	t.Fatal("no event received within 5s")
 }
 
+// EventSource cannot send an Authorization header, so /v1/events alone also
+// accepts the token as a query parameter.
+func TestEventStreamAcceptsTokenAsQueryParameter(t *testing.T) {
+	ts, _, _, _ := newServer(t)
+
+	resp, err := ts.Client().Get(ts.URL + "/v1/events?token=ctok")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+}
+
+// That fallback must not leak to any other route: a token in a query string
+// can land in access logs, so every other route keeps the header as the only
+// accepted form.
+func TestStateRejectsTokenAsQueryParameter(t *testing.T) {
+	ts, _, _, _ := newServer(t)
+
+	resp, err := ts.Client().Get(ts.URL + "/v1/state?token=ctok")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+}
+
 // A slow reader must not wedge the server.
 func TestSlowEventReaderIsDroppedNotBlocking(t *testing.T) {
 	ts, _, _, _ := newServer(t)
