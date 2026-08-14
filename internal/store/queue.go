@@ -16,6 +16,12 @@ import (
 // produces a run whose submitter believes it had longer.
 var ErrRuntimeAboveCeiling = errors.New("requested runtime exceeds the device ceiling")
 
+// ErrUnknownDevice means the caller named a device_id that no worker has ever
+// registered. Distinct from ErrNoDevice (the device exists but is busy) and
+// ErrRuntimeAboveCeiling (the device exists but the requested runtime is too
+// long) so a caller — and the HTTP layer — can answer each differently.
+var ErrUnknownDevice = errors.New("unknown device")
+
 type EnqueueRequest struct {
 	DeviceID       string
 	Command        []string
@@ -43,7 +49,7 @@ func (s *Store) SetDeviceMaxRuntime(deviceID string, d time.Duration) error {
 		return err
 	}
 	if n == 0 {
-		return fmt.Errorf("unknown device %q", deviceID)
+		return fmt.Errorf("%w: %q", ErrUnknownDevice, deviceID)
 	}
 	return nil
 }
@@ -82,7 +88,7 @@ func (s *Store) Enqueue(req EnqueueRequest) (*model.Job, error) {
 	var ceiling int64
 	err = tx.QueryRow(`SELECT max_runtime FROM devices WHERE id = ?`, req.DeviceID).Scan(&ceiling)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, fmt.Errorf("unknown device %q", req.DeviceID)
+		return nil, fmt.Errorf("%w: %q", ErrUnknownDevice, req.DeviceID)
 	}
 	if err != nil {
 		return nil, err
@@ -275,12 +281,22 @@ func (s *Store) CancelQueued(jobID, reason string) (bool, error) {
 // RequestKill flags a running job for termination. The worker sees the flag on
 // its next poll and terminates the process group; the terminal report then
 // arrives through the normal path, so there is exactly one place where a job
-// ends.
-func (s *Store) RequestKill(jobID string) error {
-	_, err := s.db.Exec(
+// ends. It reports whether it actually flagged anything: a job that has
+// already left assigned/running (finished, or raced onto a terminal state
+// between the caller's lookup and this call) flags nothing, and the caller
+// must not report success for a kill that did not land on anything live.
+func (s *Store) RequestKill(jobID string) (bool, error) {
+	res, err := s.db.Exec(
 		`UPDATE jobs SET kill_requested = 1 WHERE id = ? AND state IN (?, ?)`,
 		jobID, string(model.JobAssigned), string(model.JobRunning))
-	return err
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
 
 // KillRequestedFor lists jobs on a worker that have been flagged for kill.

@@ -86,6 +86,10 @@ func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "runtime_above_ceiling", err.Error())
 		return
 	}
+	if errors.Is(err, store.ErrUnknownDevice) {
+		writeErr(w, http.StatusBadRequest, "unknown_device", err.Error())
+		return
+	}
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "store_error", "could not queue job")
 		return
@@ -95,7 +99,8 @@ func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 	// than waiting for the loop's next tick.
 	assigned, err := s.cfg.Store.ScheduleOnce()
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "store_error", "could not schedule")
+		writeErr(w, http.StatusInternalServerError, "store_error",
+			s.abandonQueuedJob(job.ID, "submit failed: could not schedule", "could not schedule"))
 		return
 	}
 	for _, a := range assigned {
@@ -104,14 +109,33 @@ func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 
 	current, err := s.cfg.Store.Job(job.ID)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "store_error", "could not read job")
+		writeErr(w, http.StatusInternalServerError, "store_error",
+			s.abandonQueuedJob(job.ID, "submit failed: could not read job", "could not read job"))
 		return
 	}
 
 	// --no-wait keeps stage 1's behaviour: never sit in a queue.
 	if req.NoWait && current.State == model.JobQueued {
-		if _, err := s.cfg.Store.CancelQueued(current.ID, "no-wait: device busy"); err != nil {
+		cancelled, err := s.cfg.Store.CancelQueued(current.ID, "no-wait: device busy")
+		if err != nil {
 			writeErr(w, http.StatusInternalServerError, "store_error", "could not cancel")
+			return
+		}
+		if !cancelled {
+			// Lost the race: something — this request's own ScheduleOnce
+			// pass above, a concurrent submit, or rc serve's ticking
+			// scheduler loop — assigned the device to this exact job
+			// between the Job() read above and this cancel attempt.
+			// NoWait asked not to sit in a queue; it did not ask to have a
+			// job that is now actually running hidden behind a 409 while
+			// it holds a GPU with no client watching it. Report it exactly
+			// as an ordinary submit would.
+			reloaded, err := s.cfg.Store.Job(current.ID)
+			if err != nil {
+				writeErr(w, http.StatusInternalServerError, "store_error", "could not read job")
+				return
+			}
+			writeJSON(w, http.StatusCreated, reloaded)
 			return
 		}
 		writeErr(w, http.StatusConflict, "no_device_available",
@@ -120,6 +144,23 @@ func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusCreated, current)
+}
+
+// abandonQueuedJob is called from the submit error paths that run after
+// Enqueue has already created a queued job: it makes a best-effort attempt
+// to cancel that job before the caller sees an error. Without this, a
+// transient failure from a later step (ScheduleOnce, the read-back) — which
+// the client sees as a failed submit it may reasonably retry elsewhere —
+// would leave the job sitting in the queue to be picked up and run later by
+// rc serve's scheduler loop with no client ever attached to it. It returns
+// the message to report: the original failure alone, or, if the cancel
+// itself also failed, both failures rather than letting the cancel error
+// swallow the original one.
+func (s *Server) abandonQueuedJob(jobID, cancelReason, failureMsg string) string {
+	if _, err := s.cfg.Store.CancelQueued(jobID, cancelReason); err != nil {
+		return fmt.Sprintf("%s, and could not cancel the queued job: %v", failureMsg, err)
+	}
+	return failureMsg
 }
 
 func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {
@@ -162,9 +203,21 @@ func (s *Server) handleKill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// An admin token may kill a job it does not own — that is what "admin"
+	// means here — but the recorded reason must say so plainly rather than
+	// crediting an empty or unrelated req.Submitter value, which would read
+	// back as a mystery to whoever investigates the job later.
+	reason := "killed by " + req.Submitter
+	if isAdmin(r) {
+		reason = "killed by admin override"
+		if req.Submitter != "" {
+			reason += " (as " + req.Submitter + ")"
+		}
+	}
+
 	switch job.State {
 	case model.JobQueued:
-		ok, err := s.cfg.Store.CancelQueued(jobID, "killed by "+req.Submitter)
+		ok, err := s.cfg.Store.CancelQueued(jobID, reason)
 		if err != nil {
 			writeErr(w, http.StatusInternalServerError, "store_error", "could not cancel")
 			return
@@ -174,8 +227,13 @@ func (s *Server) handleKill(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	case model.JobAssigned, model.JobRunning:
-		if err := s.cfg.Store.RequestKill(jobID); err != nil {
+		flagged, err := s.cfg.Store.RequestKill(jobID)
+		if err != nil {
 			writeErr(w, http.StatusInternalServerError, "store_error", "could not request kill")
+			return
+		}
+		if !flagged {
+			writeErr(w, http.StatusConflict, "not_cancellable", "job already finished")
 			return
 		}
 		s.notify.poke(job.WorkerID)

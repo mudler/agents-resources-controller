@@ -39,6 +39,17 @@ type AllocateRequest struct {
 
 // Allocate claims a device and creates its job in ONE transaction. Either the
 // device flips ready -> busy and the job and lease exist, or nothing happened.
+//
+// It bypasses the queue entirely: there is no queued state, no priority, no
+// reservation, and no interaction with ScheduleOnce. That made it stage 1's
+// only allocation path; since stage 2, production code must go through
+// Enqueue followed by ScheduleOnce instead, which is the only route that
+// keeps "who gets a device next" consistent with what a client seeing its
+// queue position was told. Allocate is not deleted because the store's own
+// tests still use it to set up a device already busy without needing a
+// scheduling pass — but a second, queue-bypassing way to hand out a device
+// is exactly the kind of thing that turns into a race if production code
+// ever calls it again, so: do not wire this into any handler.
 func (s *Store) Allocate(req AllocateRequest) (*model.Job, error) {
 	if len(req.Command) == 0 {
 		return nil, errors.New("command required")
