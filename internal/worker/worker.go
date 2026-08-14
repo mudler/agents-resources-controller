@@ -42,6 +42,14 @@ type pollResponse struct {
 	Kills       []string     `json:"kills,omitempty"`
 }
 
+// heartbeatRequest mirrors server.HeartbeatRequest: the jobs this worker is
+// actually supervising. The controller renews the lease of each named job and
+// nothing else, so this list — not the mere fact that the heartbeat arrived —
+// is what keeps a device's lease alive.
+type heartbeatRequest struct {
+	RunningJobIDs []string `json:"running_job_ids,omitempty"`
+}
+
 type Worker struct {
 	cfg      Config
 	http     *http.Client
@@ -181,6 +189,27 @@ func (w *Worker) register(ctx context.Context) error {
 	return nil
 }
 
+// supervisedJobIDs is what this worker tells the controller it is actually
+// running: the jobs it currently has a live supervision goroutine for. A job
+// stays in this set until its terminal report has been made (or definitively
+// given up on), because that is precisely the window during which its device
+// is genuinely occupied.
+//
+// It is deliberately NOT "every job the controller assigned me". The
+// controller renews only the leases of the jobs named here (see
+// store.RecordHeartbeat), so naming a job this process has no handle on would
+// re-create the bug that motivated this: a lease renewed forever for a
+// process that does not exist.
+func (w *Worker) supervisedJobIDs() []string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	ids := make([]string, 0, len(w.running))
+	for id := range w.running {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
 func (w *Worker) heartbeatLoop(ctx context.Context) {
 	t := time.NewTicker(w.cfg.HeartbeatInterval)
 	defer t.Stop()
@@ -189,7 +218,13 @@ func (w *Worker) heartbeatLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			resp, err := w.do(ctx, http.MethodPost, "/v1/workers/"+w.workerID+"/heartbeat", nil)
+			payload, err := json.Marshal(heartbeatRequest{RunningJobIDs: w.supervisedJobIDs()})
+			if err != nil {
+				slog.Warn("heartbeat marshal failed", "err", err)
+				continue
+			}
+			resp, err := w.do(ctx, http.MethodPost,
+				"/v1/workers/"+w.workerID+"/heartbeat", bytes.NewReader(payload))
 			if err != nil {
 				slog.Warn("heartbeat failed", "err", err)
 				continue

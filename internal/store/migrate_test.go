@@ -53,6 +53,8 @@ func TestOpenMigratesAStageOneDatabase(t *testing.T) {
 		{"jobs", "queued_at"},
 		{"devices", "max_runtime"},
 		{"workers", "boot_id"},
+		{"jobs", "kill_requested"},
+		{"jobs", "kill_delivered_at"},
 	} {
 		var count int
 		require.NoError(t, check.QueryRow(

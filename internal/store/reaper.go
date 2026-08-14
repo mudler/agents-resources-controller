@@ -2,6 +2,7 @@ package store
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/mudler/agents-resources-controller/internal/model"
@@ -206,18 +207,34 @@ func (s *Store) Sweep(grace, unhealthyAfter time.Duration) (SweepResult, error) 
 const leaseRenewWindow = 15 * time.Minute
 
 // RecordHeartbeat refreshes a worker, restores its unknown devices, and
-// renews the lease of every job it still has assigned/running. A device
-// whose lease is still live returns to busy, NOT to ready: the job it was
-// demoted with is still running on it. Promoting a leased device to ready
-// would offer an occupied GPU to the next claimant. Devices marked unhealthy
-// stay out until explicitly cleared.
+// renews the lease of every job the worker reports it is actually
+// supervising. A device whose lease is still live returns to busy, NOT to
+// ready: the job it was demoted with is still running on it. Promoting a
+// leased device to ready would offer an occupied GPU to the next claimant.
+// Devices marked unhealthy stay out until explicitly cleared.
 //
 // Lease renewal here is what makes expiry (Sweep) safe: without it, any job
 // running longer than its lease TTL would be killed and its device
-// quarantined while still healthy. A job's lease is kept alive for as long
-// as its worker keeps heartbeating; expiry only fires once the heartbeats
-// themselves stop.
-func (s *Store) RecordHeartbeat(workerID string, at time.Time) error {
+// quarantined while still healthy.
+//
+// runningJobIDs is the crucial input, and the reason this is not simply
+// "renew everything this worker owns". A job can be recorded assigned/running
+// on a worker that never actually received it — handleAssignments commits the
+// running transition before writing the response, so a lost response (a
+// controller restart mid-write, a proxy, a decode error at the worker) leaves
+// the controller believing a job is running that the worker has no process
+// for and will never report on. Renewing on the strength of the worker merely
+// being alive kept that job's lease alive forever: the device stayed busy,
+// its holder never changed, and lease expiry — the backstop the design
+// promises — could never fire, leaving no way to recover the hardware short
+// of restarting the worker and clearing the device by hand.
+//
+// So renewal follows reality: only the leases of jobs the worker names are
+// pushed forward. A job the worker is not running stops being renewed, its
+// lease lapses, and Sweep reclaims it — marking the job lost and quarantining
+// the device, which is exactly the intended behaviour for a job nobody can
+// account for.
+func (s *Store) RecordHeartbeat(workerID string, at time.Time, runningJobIDs []string) error {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
@@ -228,12 +245,27 @@ func (s *Store) RecordHeartbeat(workerID string, at time.Time) error {
 		`UPDATE workers SET last_heartbeat_at = ? WHERE id = ?`, at.Unix(), workerID); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(
-		`UPDATE leases SET expires_at = ?
-		 WHERE released_at IS NULL
-		   AND job_id IN (SELECT id FROM jobs WHERE worker_id = ? AND state IN (?, ?))`,
-		at.Add(leaseRenewWindow).Unix(), workerID, string(model.JobAssigned), string(model.JobRunning)); err != nil {
-		return err
+	if len(runningJobIDs) > 0 {
+		// The worker's claim is still checked against the controller's own
+		// records: a named job must belong to this worker and still be
+		// assigned/running, so naming someone else's job renews nothing.
+		args := []any{
+			at.Add(leaseRenewWindow).Unix(), workerID,
+			string(model.JobAssigned), string(model.JobRunning),
+		}
+		placeholders := make([]string, len(runningJobIDs))
+		for i, id := range runningJobIDs {
+			placeholders[i] = "?"
+			args = append(args, id)
+		}
+		if _, err := tx.Exec(fmt.Sprintf(
+			`UPDATE leases SET expires_at = ?
+			 WHERE released_at IS NULL
+			   AND job_id IN (SELECT id FROM jobs
+			                  WHERE worker_id = ? AND state IN (?, ?) AND id IN (%s))`,
+			strings.Join(placeholders, ", ")), args...); err != nil {
+			return err
+		}
 	}
 	if _, err := tx.Exec(
 		`UPDATE devices SET state = ?, last_heartbeat_at = ?

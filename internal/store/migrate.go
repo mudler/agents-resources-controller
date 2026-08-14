@@ -41,6 +41,18 @@ var migrations = []struct {
 			`ALTER TABLE jobs ADD COLUMN kill_requested INTEGER NOT NULL DEFAULT 0`,
 		},
 	},
+	{
+		name: "kill delivery bookkeeping",
+		stmts: []string{
+			// When this job's kill flag was last handed to a worker. 0 means
+			// never. TakeKillRequests uses it to stop re-delivering the same
+			// flag on every poll: a kill nobody can action (the job's worker
+			// never actually received it, so no process exists to signal)
+			// otherwise ends every long poll instantly, turning the worker's
+			// poll loop into a hot loop for as long as the flag stands.
+			`ALTER TABLE jobs ADD COLUMN kill_delivered_at INTEGER NOT NULL DEFAULT 0`,
+		},
+	},
 }
 
 // migrate brings the database up to len(migrations). It runs each pending

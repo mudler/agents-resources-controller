@@ -260,7 +260,7 @@ func TestAdminCanKillAnotherSubmittersJob(t *testing.T) {
 // TestRequestKillFlagsARunningJob proves RequestKill's actual effect: it has
 // no caller yet outside handleKill (the worker side that acts on it arrives
 // in a later task), so this is the only coverage that the flag it sets is
-// the one KillRequestedFor reads back.
+// the one TakeKillRequests reads back.
 func TestRequestKillFlagsARunningJob(t *testing.T) {
 	ts, st, _, _ := newServer(t)
 	registerWorker(t, ts)
@@ -278,7 +278,7 @@ func TestRequestKillFlagsARunningJob(t *testing.T) {
 	defer kill.Body.Close()
 	require.Equal(t, http.StatusOK, kill.StatusCode)
 
-	flagged, err := st.KillRequestedFor(job.WorkerID)
+	flagged, err := st.TakeKillRequests(job.WorkerID)
 	require.NoError(t, err)
 	require.Contains(t, flagged, job.ID)
 }

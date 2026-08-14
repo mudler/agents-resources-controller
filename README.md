@@ -324,7 +324,11 @@ rc: kill requested for 2ef79507-9cc7-49db-92b7-3ecfc8421d93
 
 The kill is asynchronous for a running job (the worker has to actually stop
 the process), so a moment later the job shows up terminated and the device
-is back in the pool:
+is back in the pool. The flag rides the worker's existing long poll, so it
+normally reaches the worker within milliseconds; if that response is lost it
+is re-offered every 30s rather than on every poll, so a kill for a job no
+worker is actually running costs one extra wake per interval instead of
+spinning the worker's poll loop at its floor rate:
 
 ```
 $ rc devices
@@ -423,7 +427,16 @@ from — still requires the header and rejects a query-string token.
 - Every claimed device carries a lease with an expiry; the controller
   actively reaps an expired lease rather than trusting it forever, so a
   worker that vanishes mid-job without ever reporting back does not pin the
-  device indefinitely on the strength of a lease nobody is renewing.
+  device indefinitely on the strength of a lease nobody is renewing. A
+  worker's heartbeat renews the leases of **the jobs it names in that
+  heartbeat**, not every job the controller has down against it: renewal
+  follows what the worker is actually supervising, so a job the worker has
+  no process for (e.g. one whose assignment response was lost in transit)
+  stops being renewed, expires, and is reclaimed — marked `lost` with reason
+  `lease expired`, its device quarantined `unhealthy` and clearable by an
+  admin. Otherwise a worker that stayed alive but never received a job could
+  keep that job's lease renewed forever, and the expiry backstop would never
+  fire for the one case that most needs it.
 - A disconnected client does not release the device: the worker owns the
   process and reports its outcome directly to the controller.
 - A worker that stops reporting has its devices marked `unknown` after 30s

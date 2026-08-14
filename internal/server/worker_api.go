@@ -1,7 +1,9 @@
 package server
 
 import (
+	"bytes"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -15,6 +17,11 @@ import (
 // is told so explicitly (413) and must split and retry: silently truncating
 // a job's output would lose data without telling anyone.
 const maxLogChunk = 1 << 20
+
+// maxHeartbeatBody bounds a heartbeat's job list. A worker supervises a
+// handful of jobs at most (one per device), so anything approaching this is
+// either a bug or an attempt to make the controller allocate on demand.
+const maxHeartbeatBody = 64 << 10
 
 // DeviceSpec is one device a worker declares at registration: its name and,
 // if the operator configured one, the runtime ceiling the controller should
@@ -51,6 +58,16 @@ type Assignment struct {
 type PollResponse struct {
 	Assignments []Assignment `json:"assignments"`
 	Kills       []string     `json:"kills,omitempty"`
+}
+
+// HeartbeatRequest is what a worker says on every heartbeat: the IDs of the
+// jobs it is actually supervising right now. The controller renews the leases
+// of exactly those jobs and no others, so a job the worker has no process for
+// — one whose assignment response never arrived, say — stops being renewed
+// and falls to lease expiry rather than being kept alive forever by an
+// unrelated liveness signal.
+type HeartbeatRequest struct {
+	RunningJobIDs []string `json:"running_job_ids,omitempty"`
 }
 
 type StatusRequest struct {
@@ -114,8 +131,36 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, RegisterResponse{WorkerID: workerID})
 }
 
+// handleHeartbeat renews the leases of the jobs the worker names, and only
+// those. See store.RecordHeartbeat for why: a worker being alive says nothing
+// about whether it is running any particular job, and renewing on liveness
+// alone made lease expiry unreachable for a job whose assignment response was
+// lost.
+//
+// A body is optional so a heartbeat from a worker with nothing running can
+// stay a bare POST. An absent or empty body means "I am running nothing",
+// which is the honest reading: a worker that cannot name a job is not
+// evidence that the job is alive.
 func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
-	if err := s.cfg.Store.RecordHeartbeat(r.PathValue("id"), s.cfg.Clock.Now()); err != nil {
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxHeartbeatBody+1))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	if len(body) > maxHeartbeatBody {
+		writeErr(w, http.StatusRequestEntityTooLarge, "body_too_large", "heartbeat body exceeds 64KB")
+		return
+	}
+	var req HeartbeatRequest
+	if len(bytes.TrimSpace(body)) > 0 {
+		if err := json.Unmarshal(body, &req); err != nil {
+			writeErr(w, http.StatusBadRequest, "bad_request", err.Error())
+			return
+		}
+	}
+
+	if err := s.cfg.Store.RecordHeartbeat(
+		r.PathValue("id"), s.cfg.Clock.Now(), req.RunningJobIDs); err != nil {
 		writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
 		return
 	}
@@ -149,7 +194,15 @@ func (s *Server) handleAssignments(w http.ResponseWriter, r *http.Request) {
 		// A kill must reach the worker as fast as an assignment does, so it
 		// rides the same long-poll response rather than a separate channel:
 		// checked on every wake, and on its own enough to end the wait.
-		kills, err := s.cfg.Store.KillRequestedFor(workerID)
+		//
+		// This is a take: each flag handed out here is stamped delivered and
+		// stays quiet for killRedeliverInterval. Ending the poll early is
+		// exactly what a kill is for, but a flag on a job no worker is
+		// actually running would otherwise end EVERY poll instantly and the
+		// worker would re-poll at its floor interval forever. Spacing
+		// re-delivery keeps the fast path fast and bounds the pathological
+		// one.
+		kills, err := s.cfg.Store.TakeKillRequests(workerID)
 		if err != nil {
 			writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
 			return

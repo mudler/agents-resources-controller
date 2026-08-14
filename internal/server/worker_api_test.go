@@ -237,6 +237,162 @@ func TestAssignmentsEnvelopeCarriesKillRequests(t *testing.T) {
 	require.Contains(t, poll.Kills, job.ID)
 }
 
+// poll drains one long-poll for a worker and returns the response, so tests
+// that care about what a poll answers don't each rebuild the request.
+func poll(t *testing.T, ts *httptest.Server, workerID, wait string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet,
+		ts.URL+"/v1/workers/"+workerID+"/assignments?wait="+wait, nil)
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer wtok")
+	resp, err := ts.Client().Do(req)
+	require.NoError(t, err)
+	return resp
+}
+
+// A kill flag nobody can action must not turn the long poll into a hot loop.
+//
+// handleAssignments ends its wait the instant there is a kill to report,
+// which is right for a kill the worker can act on. But a flag on a job no
+// worker is actually running — the lost-assignment case — is never cleared by
+// anyone, so re-offering it on every poll made each poll return in
+// milliseconds and the worker re-poll at its 250ms floor for as long as the
+// flag stood: thousands of requests a minute from one idle worker.
+//
+// After the first delivery the flag goes quiet for killRedeliverInterval, so
+// the very next poll must block for its full window and answer 204.
+func TestDeliveredKillDoesNotHotLoopTheLongPoll(t *testing.T) {
+	ts, st, _, _ := newServer(t)
+	workerID := registerWorker(t, ts)
+
+	a := post(t, ts, "ctok", "/v1/jobs", server.SubmitRequest{
+		DeviceID: "gpubox:gpu0", Command: []string{"./a"}, Submitter: "agent-a",
+	})
+	var job model.Job
+	require.NoError(t, json.NewDecoder(a.Body).Decode(&job))
+	a.Body.Close()
+
+	poll(t, ts, workerID, "50ms").Body.Close() // drain the assignment
+
+	flagged, err := st.RequestKill(job.ID)
+	require.NoError(t, err)
+	require.True(t, flagged)
+
+	first := poll(t, ts, workerID, "2s")
+	defer first.Body.Close()
+	require.Equal(t, http.StatusOK, first.StatusCode)
+	var delivered server.PollResponse
+	require.NoError(t, json.NewDecoder(first.Body).Decode(&delivered))
+	require.Contains(t, delivered.Kills, job.ID)
+
+	// The worker did nothing with it (it has no process for this job). The
+	// next poll must wait rather than answering instantly with the same flag.
+	started := time.Now()
+	second := poll(t, ts, workerID, "300ms")
+	defer second.Body.Close()
+	require.Equal(t, http.StatusNoContent, second.StatusCode,
+		"an already-delivered kill must not end the next long poll immediately")
+	require.GreaterOrEqual(t, time.Since(started), 250*time.Millisecond,
+		"the poll must actually have waited out its window, not spun")
+}
+
+// A kill IS re-delivered once the quiet interval has passed: the response
+// carrying it can be lost like any other, so re-delivery has to exist — it
+// just must not be free-running.
+func TestKillIsRedeliveredAfterTheQuietInterval(t *testing.T) {
+	ts, st, _, c := newServer(t)
+	workerID := registerWorker(t, ts)
+
+	a := post(t, ts, "ctok", "/v1/jobs", server.SubmitRequest{
+		DeviceID: "gpubox:gpu0", Command: []string{"./a"}, Submitter: "agent-a",
+	})
+	var job model.Job
+	require.NoError(t, json.NewDecoder(a.Body).Decode(&job))
+	a.Body.Close()
+
+	poll(t, ts, workerID, "50ms").Body.Close()
+
+	_, err := st.RequestKill(job.ID)
+	require.NoError(t, err)
+	poll(t, ts, workerID, "2s").Body.Close() // first delivery
+
+	c.Advance(31 * time.Second)
+
+	again := poll(t, ts, workerID, "2s")
+	defer again.Body.Close()
+	require.Equal(t, http.StatusOK, again.StatusCode)
+	var redelivered server.PollResponse
+	require.NoError(t, json.NewDecoder(again.Body).Decode(&redelivered))
+	require.Contains(t, redelivered.Kills, job.ID,
+		"a kill whose delivery may have been lost must be offered again")
+}
+
+// The wire half of the lease-renewal fix: the controller renews the lease of
+// a job the worker names in its heartbeat, and does not renew one it doesn't.
+// The store-level reasoning is in store.RecordHeartbeat and
+// TestHeartbeatDoesNotRenewAnUnclaimedJobLease; this pins the HTTP contract
+// the worker actually speaks.
+func TestHeartbeatRenewsOnlyTheJobsTheWorkerNames(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		claim     func(jobID string) any
+		wantState model.JobState
+	}{
+		{
+			name:      "named",
+			claim:     func(jobID string) any { return server.HeartbeatRequest{RunningJobIDs: []string{jobID}} },
+			wantState: model.JobRunning,
+		},
+		{
+			// Exactly what a worker whose assignment response was lost sends:
+			// it is alive and heartbeating, it just has no such job.
+			name:      "unnamed",
+			claim:     func(string) any { return server.HeartbeatRequest{} },
+			wantState: model.JobLost,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ts, st, _, c := newServer(t)
+			workerID := registerWorker(t, ts)
+
+			a := post(t, ts, "ctok", "/v1/jobs", server.SubmitRequest{
+				DeviceID: "gpubox:gpu0", Command: []string{"./a"}, Submitter: "agent-a",
+			})
+			var job model.Job
+			require.NoError(t, json.NewDecoder(a.Body).Decode(&job))
+			a.Body.Close()
+			poll(t, ts, workerID, "50ms").Body.Close() // the job is now running
+
+			// Well past the job's 5-minute default lease TTL, heartbeating
+			// throughout so the worker itself is never the silent one.
+			for i := 0; i < 8; i++ {
+				c.Advance(time.Minute)
+				hb := post(t, ts, "wtok", "/v1/workers/"+workerID+"/heartbeat", tc.claim(job.ID))
+				require.Equal(t, http.StatusOK, hb.StatusCode)
+				hb.Body.Close()
+			}
+
+			_, err := st.Sweep(30*time.Second, 5*time.Minute)
+			require.NoError(t, err)
+
+			reloaded, err := st.Job(job.ID)
+			require.NoError(t, err)
+			require.Equal(t, tc.wantState, reloaded.State)
+		})
+	}
+}
+
+// A heartbeat with no body at all stays valid: it means "I am running
+// nothing", which is what a worker with an empty job table has always sent.
+func TestBareHeartbeatIsAccepted(t *testing.T) {
+	ts, _, _, _ := newServer(t)
+	workerID := registerWorker(t, ts)
+
+	resp := postRaw(t, ts, "Bearer wtok", "/v1/workers/"+workerID+"/heartbeat", nil)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+}
+
 func TestAssignmentsLongPollReturns204WhenIdle(t *testing.T) {
 	ts, _, _, _ := newServer(t)
 

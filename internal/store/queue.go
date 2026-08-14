@@ -286,8 +286,11 @@ func (s *Store) CancelQueued(jobID, reason string) (bool, error) {
 // between the caller's lookup and this call) flags nothing, and the caller
 // must not report success for a kill that did not land on anything live.
 func (s *Store) RequestKill(jobID string) (bool, error) {
+	// kill_delivered_at is reset so an operator re-issuing `rc kill` gets the
+	// flag re-offered on the next poll rather than waiting out
+	// killRedeliverInterval from an earlier delivery.
 	res, err := s.db.Exec(
-		`UPDATE jobs SET kill_requested = 1 WHERE id = ? AND state IN (?, ?)`,
+		`UPDATE jobs SET kill_requested = 1, kill_delivered_at = 0 WHERE id = ? AND state IN (?, ?)`,
 		jobID, string(model.JobAssigned), string(model.JobRunning))
 	if err != nil {
 		return false, err
@@ -299,25 +302,72 @@ func (s *Store) RequestKill(jobID string) (bool, error) {
 	return n > 0, nil
 }
 
-// KillRequestedFor lists jobs on a worker that have been flagged for kill.
-func (s *Store) KillRequestedFor(workerID string) ([]string, error) {
-	rows, err := s.db.Query(
-		`SELECT id FROM jobs WHERE worker_id = ? AND kill_requested = 1 AND state IN (?, ?)`,
-		workerID, string(model.JobAssigned), string(model.JobRunning))
+// killRedeliverInterval is how long a kill flag stays quiet after it has been
+// handed to a worker before it is offered again.
+//
+// Re-delivery has to exist: a poll response can be lost (a dropped
+// connection, a proxy, a controller restart mid-write), and a kill that
+// reached nobody must still reach the worker eventually. But re-delivering it
+// on *every* poll is what turns an unactionable flag into a hot loop —
+// handleAssignments ends its long poll the instant there is a kill to report,
+// so a flag on a job no worker is actually running (the lost-assignment case
+// this stage's heartbeat/lease fix is about) makes every poll return in
+// milliseconds and the worker re-poll at its minimum interval, forever.
+// Spacing re-delivery out keeps both properties: a real running job still
+// gets its kill within one interval of a lost response, and a flag nobody can
+// action costs one extra wake every interval instead of thousands.
+const killRedeliverInterval = 30 * time.Second
+
+// TakeKillRequests lists the jobs on a worker whose kill flag is due for
+// delivery, and stamps them as delivered in the same transaction. It is a
+// take, not a read: the stamp is what bounds re-delivery (see
+// killRedeliverInterval), so a caller that reads without stamping would
+// reintroduce the hot loop.
+func (s *Store) TakeKillRequests(workerID string) ([]string, error) {
+	now := s.clock.Now()
+
+	tx, err := s.db.Begin()
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer tx.Rollback()
 
+	rows, err := tx.Query(
+		`SELECT id FROM jobs
+		 WHERE worker_id = ? AND kill_requested = 1 AND state IN (?, ?)
+		   AND kill_delivered_at <= ?`,
+		workerID, string(model.JobAssigned), string(model.JobRunning),
+		now.Add(-killRedeliverInterval).Unix())
+	if err != nil {
+		return nil, err
+	}
 	var out []string
 	for rows.Next() {
 		var id string
 		if err := rows.Scan(&id); err != nil {
+			rows.Close()
 			return nil, err
 		}
 		out = append(out, id)
 	}
-	return out, rows.Err()
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// Rows are fully drained above before this write: the pool is capped at
+	// one connection, so a write issued while the cursor is still open would
+	// deadlock.
+	for _, id := range out {
+		if _, err := tx.Exec(
+			`UPDATE jobs SET kill_delivered_at = ? WHERE id = ?`, now.Unix(), id); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func (s *Store) reserve(jobID, deviceID string) error {

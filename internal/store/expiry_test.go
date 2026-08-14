@@ -79,10 +79,12 @@ func TestLeaseExpiresAtTTLBoundary(t *testing.T) {
 	require.Equal(t, []string{job.ID}, res.LeasesExpired)
 }
 
-// A worker that keeps heartbeating renews its running job's lease every
-// time, so expiry is never a timer on honest, still-reporting work — only a
-// backstop once the heartbeats themselves stop (that case is
-// TestExpiredLeaseIsReleasedAndDeviceQuarantined above).
+// A worker that keeps heartbeating AND keeps naming the job it is running
+// renews that job's lease every time, so expiry is never a timer on honest,
+// still-reporting work — only a backstop once the heartbeats themselves stop
+// (that case is TestExpiredLeaseIsReleasedAndDeviceQuarantined above) or the
+// worker stops claiming the job (TestHeartbeatDoesNotRenewAnUnclaimedJobLease
+// below). This is the healthy path: it must keep working exactly as before.
 func TestHeartbeatRenewsALiveJobLease(t *testing.T) {
 	s, c := newStore(t)
 
@@ -94,7 +96,7 @@ func TestHeartbeatRenewsALiveJobLease(t *testing.T) {
 	// worker heartbeating every ~10s would, just compressed for the test.
 	for i := 0; i < 20; i++ {
 		c.Advance(time.Minute)
-		require.NoError(t, s.RecordHeartbeat("w1", c.Now()))
+		require.NoError(t, s.RecordHeartbeat("w1", c.Now(), []string{job.ID}))
 	}
 
 	res, err := s.Sweep(30*time.Second, 5*time.Minute)
@@ -113,6 +115,109 @@ func TestHeartbeatRenewsALiveJobLease(t *testing.T) {
 	devices, err := s.Devices()
 	require.NoError(t, err)
 	require.Equal(t, model.DeviceBusy, devices[0].State)
+}
+
+// The lost-assignment-response case, and the reason lease renewal is driven
+// by what the worker claims rather than by the worker merely being alive.
+//
+// The controller commits a job to "running" before writing the assignment
+// response (see server.handleAssignments — that ordering is deliberate: it is
+// what stops a retried poll from starting the same job twice). If that
+// response is then lost, the worker has no process for the job and will never
+// report on it, but it keeps heartbeating for its other work. Renewing every
+// lease the worker owns on that heartbeat pinned the lease forever: the
+// device stayed busy with a holder that did not exist, expires_in never
+// counted down, and no CLI could recover the hardware.
+//
+// Here the worker heartbeats without naming the job, exactly as a worker that
+// never received it would. The lease must lapse, the sweep must mark the job
+// lost and quarantine the device, and an admin clear must then be able to put
+// the hardware back in the pool.
+func TestHeartbeatDoesNotRenewAnUnclaimedJobLease(t *testing.T) {
+	s, c := newStore(t)
+
+	job, err := s.Allocate(req("agent-a")) // req()'s LeaseTTL is one minute
+	require.NoError(t, err)
+	require.NoError(t, s.MarkRunning(job.ID, c.Now()))
+
+	// The worker is alive and heartbeating throughout — it just never claims
+	// this job, because it never got the assignment.
+	for i := 0; i < 3; i++ {
+		c.Advance(10 * time.Second)
+		require.NoError(t, s.RecordHeartbeat("w1", c.Now(), nil))
+	}
+
+	// Still inside the original TTL: nothing has expired yet, and the worker
+	// itself is in perfect contact, so nothing else may demote the device.
+	res, err := s.Sweep(30*time.Second, 5*time.Minute)
+	require.NoError(t, err)
+	require.Empty(t, res.LeasesExpired)
+	require.Empty(t, res.DevicesUnhealthy)
+
+	// Past the lease TTL, with the worker still heartbeating and still not
+	// claiming the job.
+	c.Advance(2 * time.Minute)
+	require.NoError(t, s.RecordHeartbeat("w1", c.Now(), nil))
+
+	res, err = s.Sweep(30*time.Second, 5*time.Minute)
+	require.NoError(t, err)
+	require.Equal(t, []string{job.ID}, res.LeasesExpired,
+		"a lease nobody claims to be holding must be allowed to expire")
+
+	reloaded, err := s.Job(job.ID)
+	require.NoError(t, err)
+	require.Equal(t, model.JobLost, reloaded.State)
+	require.Contains(t, reloaded.KillReason, "lease expired")
+
+	leases, err := s.Leases()
+	require.NoError(t, err)
+	require.Empty(t, leases, "the stranded lease must be released")
+
+	devices, err := s.Devices()
+	require.NoError(t, err)
+	require.Equal(t, model.DeviceUnhealthy, devices[0].State,
+		"expiry proves the holder stopped reporting, not that the device is idle")
+
+	// And the device is recoverable: with no live lease left, the operator's
+	// clear is no longer refused, which is what makes this an actual way out
+	// rather than a different kind of stuck.
+	cleared, err := s.ClearDevice("gpubox:gpu0")
+	require.NoError(t, err)
+	require.True(t, cleared)
+
+	next, err := s.Allocate(req("agent-b"))
+	require.NoError(t, err)
+	require.Equal(t, "gpubox:gpu0", next.DeviceID)
+}
+
+// A worker may only renew what is genuinely its own: naming a job assigned to
+// a different worker must not push that job's lease forward, or a
+// misconfigured (or hostile) worker could keep someone else's device pinned.
+func TestHeartbeatOnlyRenewsItsOwnJobs(t *testing.T) {
+	s, c := newStore(t)
+
+	job, err := s.Allocate(req("agent-a"))
+	require.NoError(t, err)
+
+	require.NoError(t, s.UpsertWorker(
+		model.Worker{ID: "w2", Host: "otherbox", LastHeartbeatAt: c.Now()},
+		[]model.Device{{ID: "otherbox:gpu0", Host: "otherbox", Name: "gpu0", WorkerID: "w2", State: model.DeviceReady}},
+	))
+
+	// w2 claims w1's job on every heartbeat. w1 keeps its own worker row
+	// fresh so this test isolates lease renewal from the silence sweep.
+	for i := 0; i < 4; i++ {
+		c.Advance(20 * time.Second)
+		require.NoError(t, s.RecordHeartbeat("w2", c.Now(), []string{job.ID}))
+		require.NoError(t, s.RecordHeartbeat("w1", c.Now(), nil))
+	}
+	c.Advance(2 * time.Minute)
+	require.NoError(t, s.RecordHeartbeat("w1", c.Now(), nil))
+
+	res, err := s.Sweep(30*time.Second, 5*time.Minute)
+	require.NoError(t, err)
+	require.Equal(t, []string{job.ID}, res.LeasesExpired,
+		"another worker's claim must not renew this job's lease")
 }
 
 // A reboot is the one event that proves the device is clean, so its devices

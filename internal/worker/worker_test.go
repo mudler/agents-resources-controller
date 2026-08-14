@@ -796,3 +796,110 @@ func TestStatusReportsIncludeWorkerID(t *testing.T) {
 	defer mu.Unlock()
 	require.Equal(t, []string{"w1", "w1"}, workerIDs)
 }
+
+// TestHeartbeatNamesTheJobsTheWorkerIsRunning pins the worker's half of the
+// lease-renewal contract: the controller renews only the leases of the jobs a
+// heartbeat names (see store.RecordHeartbeat), so a worker that fails to name
+// the job it is supervising would have its own device reclaimed out from
+// under a live process, and one that names a job it is NOT supervising would
+// re-create the leak that motivated the change.
+//
+// The job here sleeps, so heartbeats necessarily land both while it runs and
+// (after it finishes) once it does not.
+func TestHeartbeatNamesTheJobsTheWorkerIsRunning(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		claims   [][]string
+		served   bool
+		finished bool
+	)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/v1/workers/register":
+			json.NewEncoder(w).Encode(map[string]string{"worker_id": "w1"})
+
+		case r.URL.Path == "/v1/workers/w1/assignments":
+			mu.Lock()
+			first := !served
+			served = true
+			mu.Unlock()
+			if !first {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			json.NewEncoder(w).Encode(map[string]any{"assignments": []map[string]any{{
+				"job_id":    "job1",
+				"device_id": "gpubox:gpu0",
+				"command":   []string{"sleep", "1"},
+			}}})
+
+		case r.URL.Path == "/v1/workers/w1/heartbeat":
+			var body struct {
+				RunningJobIDs []string `json:"running_job_ids"`
+			}
+			json.NewDecoder(r.Body).Decode(&body)
+			mu.Lock()
+			claims = append(claims, body.RunningJobIDs)
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+
+		case r.URL.Path == "/v1/jobs/job1/logs":
+			w.WriteHeader(http.StatusOK)
+
+		case r.URL.Path == "/v1/jobs/job1/status":
+			var body struct {
+				State string `json:"state"`
+			}
+			json.NewDecoder(r.Body).Decode(&body)
+			mu.Lock()
+			if body.State == "succeeded" {
+				finished = true
+			}
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	wk := worker.New(worker.Config{
+		ControllerURL:     ts.URL,
+		Host:              "gpubox",
+		Devices:           []worker.DeviceConfig{{Name: "gpu0"}},
+		HeartbeatInterval: 100 * time.Millisecond,
+		PollWait:          50 * time.Millisecond,
+	})
+	go func() { _ = wk.Start(ctx) }()
+
+	// Wait for the job to finish and for at least one heartbeat to land
+	// after it: only then can both halves of the assertion be made.
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		if !finished {
+			return false
+		}
+		return len(claims) > 0 && len(claims[len(claims)-1]) == 0
+	}, 15*time.Second, 50*time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	var namedWhileRunning bool
+	for _, c := range claims {
+		if len(c) == 1 && c[0] == "job1" {
+			namedWhileRunning = true
+		}
+		require.LessOrEqual(t, len(c), 1, "the worker only ever has one job here")
+	}
+	require.True(t, namedWhileRunning,
+		"a heartbeat sent while the job was running must name it, or its lease is never renewed")
+	require.Empty(t, claims[len(claims)-1],
+		"once the job is done the worker must stop claiming it, or its lease is renewed forever")
+}
