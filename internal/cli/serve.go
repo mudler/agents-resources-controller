@@ -86,9 +86,10 @@ func NewServeCmd() *cobra.Command {
 							slog.Error("sweep", "err", err)
 							continue
 						}
-						if len(res.DevicesUnhealthy) > 0 || len(res.JobsLost) > 0 {
+						if len(res.DevicesUnhealthy) > 0 || len(res.JobsLost) > 0 || len(res.LeasesExpired) > 0 {
 							slog.Warn("devices demoted",
-								"unhealthy", res.DevicesUnhealthy, "jobs_lost", res.JobsLost)
+								"unhealthy", res.DevicesUnhealthy, "jobs_lost", res.JobsLost,
+								"leases_expired", res.LeasesExpired)
 						}
 					}
 				}

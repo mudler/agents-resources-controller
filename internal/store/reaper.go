@@ -123,20 +123,20 @@ func (s *Store) Sweep(grace, unhealthyAfter time.Duration) (SweepResult, error) 
 
 	// A lease past its expiry is released, but its device is quarantined
 	// rather than freed: expiry tells us the holder stopped renewing, not
-	// that the hardware is idle. Strictly less-than: a lease at exactly its
-	// TTL boundary has not yet gone unrenewed, only reached the instant it
-	// must be renewed by.
+	// that the hardware is idle. expires_at is a deadline, not a "still
+	// live until" marker: at now == expires_at the TTL has fully elapsed,
+	// so <= (not <) is correct here.
 	expRows, err := tx.Query(
-		`SELECT job_id, device_id FROM leases
-		 WHERE released_at IS NULL AND expires_at < ?`, now.Unix())
+		`SELECT id, job_id, device_id FROM leases
+		 WHERE released_at IS NULL AND expires_at <= ?`, now.Unix())
 	if err != nil {
 		return res, err
 	}
-	type expired struct{ jobID, deviceID string }
+	type expired struct{ leaseID, jobID, deviceID string }
 	var stale []expired
 	for expRows.Next() {
 		var e expired
-		if err := expRows.Scan(&e.jobID, &e.deviceID); err != nil {
+		if err := expRows.Scan(&e.leaseID, &e.jobID, &e.deviceID); err != nil {
 			expRows.Close()
 			return res, err
 		}
@@ -148,9 +148,13 @@ func (s *Store) Sweep(grace, unhealthyAfter time.Duration) (SweepResult, error) 
 	}
 
 	for _, e := range stale {
+		// Released by the lease's own id, not job_id: job_id defaults to ""
+		// and a future lease kind (interactive holds) will have no job at
+		// all, so two live leases could otherwise share a job_id and
+		// expiring one would release the other.
 		if _, err := tx.Exec(
-			`UPDATE leases SET released_at = ? WHERE job_id = ? AND released_at IS NULL`,
-			now.Unix(), e.jobID); err != nil {
+			`UPDATE leases SET released_at = ? WHERE id = ? AND released_at IS NULL`,
+			now.Unix(), e.leaseID); err != nil {
 			return res, err
 		}
 		if _, err := tx.Exec(
@@ -159,14 +163,30 @@ func (s *Store) Sweep(grace, unhealthyAfter time.Duration) (SweepResult, error) 
 			return res, err
 		}
 		if e.jobID != "" {
-			if _, err := tx.Exec(
+			result, err := tx.Exec(
 				`UPDATE jobs SET state = ?, kill_reason = ?, finished_at = ?
 				 WHERE id = ? AND state IN (?, ?)`,
 				string(model.JobLost), "lease expired", now.Unix(), e.jobID,
-				string(model.JobAssigned), string(model.JobRunning)); err != nil {
+				string(model.JobAssigned), string(model.JobRunning))
+			if err != nil {
 				return res, err
 			}
-			res.LeasesExpired = append(res.LeasesExpired, e.jobID)
+			// Only report what actually changed: the guard above can miss
+			// (the job already finished through another path), and
+			// unconditionally appending would over-report a job as newly
+			// lost when nothing about it changed here.
+			n, err := result.RowsAffected()
+			if err != nil {
+				return res, err
+			}
+			if n > 0 {
+				res.LeasesExpired = append(res.LeasesExpired, e.jobID)
+			}
+		} else {
+			// A job-less lease (a future interactive hold) has nothing else
+			// to report, but its own expiry is still real — report the
+			// lease's identity rather than dropping it silently.
+			res.LeasesExpired = append(res.LeasesExpired, e.leaseID)
 		}
 	}
 
@@ -176,11 +196,27 @@ func (s *Store) Sweep(grace, unhealthyAfter time.Duration) (SweepResult, error) 
 	return res, nil
 }
 
-// RecordHeartbeat refreshes a worker and restores its unknown devices. A
-// device whose lease is still live returns to busy, NOT to ready: the job it
-// was demoted with is still running on it. Promoting a leased device to ready
+// leaseRenewWindow is how far past each heartbeat a live job's lease is
+// pushed forward. It must comfortably outlast both the heartbeat interval
+// and the sweep interval (10s each, see internal/cli/serve.go) — expiry
+// exists to catch a worker that has genuinely stopped reporting, not to put
+// a clock on honest work that is still heartbeating on schedule. 15 minutes
+// leaves many missed heartbeats' worth of slack before a live job's lease
+// could ever lapse.
+const leaseRenewWindow = 15 * time.Minute
+
+// RecordHeartbeat refreshes a worker, restores its unknown devices, and
+// renews the lease of every job it still has assigned/running. A device
+// whose lease is still live returns to busy, NOT to ready: the job it was
+// demoted with is still running on it. Promoting a leased device to ready
 // would offer an occupied GPU to the next claimant. Devices marked unhealthy
 // stay out until explicitly cleared.
+//
+// Lease renewal here is what makes expiry (Sweep) safe: without it, any job
+// running longer than its lease TTL would be killed and its device
+// quarantined while still healthy. A job's lease is kept alive for as long
+// as its worker keeps heartbeating; expiry only fires once the heartbeats
+// themselves stop.
 func (s *Store) RecordHeartbeat(workerID string, at time.Time) error {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -190,6 +226,13 @@ func (s *Store) RecordHeartbeat(workerID string, at time.Time) error {
 
 	if _, err := tx.Exec(
 		`UPDATE workers SET last_heartbeat_at = ? WHERE id = ?`, at.Unix(), workerID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(
+		`UPDATE leases SET expires_at = ?
+		 WHERE released_at IS NULL
+		   AND job_id IN (SELECT id FROM jobs WHERE worker_id = ? AND state IN (?, ?))`,
+		at.Add(leaseRenewWindow).Unix(), workerID, string(model.JobAssigned), string(model.JobRunning)); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(

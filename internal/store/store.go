@@ -155,11 +155,6 @@ func (s *Store) reapInFlightJobsLocked(tx *sql.Tx, workerID string, at time.Time
 		return err
 	}
 
-	quarantineState := model.DeviceUnhealthy
-	if rebooted {
-		quarantineState = model.DeviceReady
-	}
-
 	for _, j := range jobs {
 		if _, err := tx.Exec(
 			`UPDATE jobs SET state = ?, kill_reason = ?, finished_at = ? WHERE id = ?`,
@@ -173,11 +168,27 @@ func (s *Store) reapInFlightJobsLocked(tx *sql.Tx, workerID string, at time.Time
 		); err != nil {
 			return fmt.Errorf("release lease for job %s: %w", j.jobID, err)
 		}
-		if _, err := tx.Exec(
-			`UPDATE devices SET state = ? WHERE id = ?`,
-			string(quarantineState), j.deviceID,
-		); err != nil {
-			return fmt.Errorf("quarantine device %s: %w", j.deviceID, err)
+		if rebooted {
+			// A reboot proves no process survived, but proves nothing about
+			// the hardware: a device already unhealthy for a self-reported
+			// fault (SetDeviceState) must stay quarantined until an explicit
+			// clear, not be resurrected just because the host power-cycled.
+			// Only devices left busy/unknown by the dead job are proven
+			// clean by the reboot.
+			if _, err := tx.Exec(
+				`UPDATE devices SET state = ? WHERE id = ? AND state IN (?, ?)`,
+				string(model.DeviceReady), j.deviceID,
+				string(model.DeviceBusy), string(model.DeviceUnknown),
+			); err != nil {
+				return fmt.Errorf("restore device %s: %w", j.deviceID, err)
+			}
+		} else {
+			if _, err := tx.Exec(
+				`UPDATE devices SET state = ? WHERE id = ?`,
+				string(model.DeviceUnhealthy), j.deviceID,
+			); err != nil {
+				return fmt.Errorf("quarantine device %s: %w", j.deviceID, err)
+			}
 		}
 	}
 	return nil
