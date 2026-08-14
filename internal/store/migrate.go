@@ -69,6 +69,34 @@ var migrations = []struct {
 			`ALTER TABLE devices ADD COLUMN quarantine_reason TEXT NOT NULL DEFAULT ''`,
 		},
 	},
+	{
+		name: "stage3 labels and usage sheets",
+		stmts: []string{
+			`CREATE TABLE IF NOT EXISTS device_labels (
+			   device_id  TEXT NOT NULL,
+			   key        TEXT NOT NULL,
+			   value      TEXT NOT NULL,
+			   source     TEXT NOT NULL,
+			   updated_at INTEGER NOT NULL,
+			   PRIMARY KEY (device_id, key, source)
+			 )`,
+			`CREATE INDEX IF NOT EXISTS device_labels_by_device ON device_labels(device_id)`,
+			`CREATE TABLE IF NOT EXISTS host_docs (
+			   host       TEXT NOT NULL,
+			   device_id  TEXT NOT NULL DEFAULT '',
+			   body       TEXT NOT NULL,
+			   updated_at INTEGER NOT NULL,
+			   PRIMARY KEY (host, device_id)
+			 )`,
+		},
+	},
+	{
+		name: "stage3 interactive holds",
+		stmts: []string{
+			`ALTER TABLE leases ADD COLUMN kind TEXT NOT NULL DEFAULT 'job'`,
+			`ALTER TABLE leases ADD COLUMN reason TEXT NOT NULL DEFAULT ''`,
+		},
+	},
 }
 
 // migrate brings the database up to len(migrations). It runs each pending

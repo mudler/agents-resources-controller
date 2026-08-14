@@ -56,6 +56,8 @@ func TestOpenMigratesAStageOneDatabase(t *testing.T) {
 		{"jobs", "kill_requested"},
 		{"jobs", "kill_delivered_at"},
 		{"devices", "quarantine_reason"},
+		{"leases", "kind"},
+		{"leases", "reason"},
 	} {
 		var count int
 		require.NoError(t, check.QueryRow(
@@ -92,4 +94,23 @@ func TestMigrationsAreIdempotent(t *testing.T) {
 	var version int
 	require.NoError(t, check.QueryRow(`PRAGMA user_version`).Scan(&version))
 	require.Greater(t, version, 0, "user_version should record applied migrations")
+}
+
+func TestStage3TablesArePresent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rc.db")
+	c := clock.NewFake(time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC))
+	s, err := store.Open(path, c)
+	require.NoError(t, err)
+	require.NoError(t, s.Close())
+
+	check, err := sql.Open("sqlite", "file:"+path)
+	require.NoError(t, err)
+	defer check.Close()
+
+	for _, table := range []string{"device_labels", "host_docs"} {
+		var n int
+		require.NoError(t, check.QueryRow(
+			`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&n))
+		require.Equal(t, 1, n, "%s missing", table)
+	}
 }

@@ -24,6 +24,16 @@ const (
 	JobQueued    JobState = "queued"
 )
 
+const (
+	SourceDetected = "detected"
+	SourceDeclared = "declared"
+)
+
+const (
+	LeaseKindJob  = "job"
+	LeaseKindHold = "hold"
+)
+
 // Terminal reports whether the job will never change state again.
 func (s JobState) Terminal() bool {
 	switch s {
@@ -31,6 +41,16 @@ func (s JobState) Terminal() bool {
 		return true
 	}
 	return false
+}
+
+// Label is one fact about a device, with where it came from and when it was
+// last confirmed. Provenance matters because a hand-written value that
+// survives a hardware change is worse than no value at all.
+type Label struct {
+	Key       string    `json:"key"`
+	Value     string    `json:"value"`
+	Source    string    `json:"source"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 type Device struct {
@@ -41,6 +61,7 @@ type Device struct {
 	State             DeviceState `json:"state"`
 	MaxRuntimeSeconds int         `json:"max_runtime_seconds,omitempty"`
 	LastHeartbeatAt   time.Time   `json:"last_heartbeat_at"`
+	Labels            []Label     `json:"labels,omitempty"`
 }
 
 type Lease struct {
@@ -48,6 +69,8 @@ type Lease struct {
 	DeviceID   string    `json:"device_id"`
 	Holder     string    `json:"holder"`
 	JobID      string    `json:"job_id,omitempty"`
+	Kind       string    `json:"kind"`
+	Reason     string    `json:"reason,omitempty"`
 	AcquiredAt time.Time `json:"acquired_at"`
 	ExpiresAt  time.Time `json:"expires_at"`
 }
