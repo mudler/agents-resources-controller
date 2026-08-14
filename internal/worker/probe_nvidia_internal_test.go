@@ -31,7 +31,10 @@ func TestNvidiaLabelsParsesPresentDriver(t *testing.T) {
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	facts, _ := nvidiaLabels(context.Background(), 5*time.Second)
+	facts, found, broken := nvidiaLabels(context.Background(), 5*time.Second)
+	if !found || broken {
+		t.Fatalf("expected found=true, broken=false for a working nvidia-smi; got found=%v broken=%v", found, broken)
+	}
 
 	want := map[string]string{
 		"gpu0.vendor": "nvidia",
@@ -57,38 +60,37 @@ func TestNvidiaLabelsParsesPresentDriver(t *testing.T) {
 	}
 }
 
-// TestNvidiaLabelsAbsentIsTreatedAsAFailure pins the fix-round-2 ruling:
-// exec.LookPath failing (no nvidia-smi on PATH at all) now reports
-// failed=true, the same as nvidia-smi being present but broken. This
-// INVERTS the original Task 5 stance (ordinary absence, not a failure),
-// deliberately: a real controller holding prior GPU labels for a device
-// loses them the moment a driver-package upgrade removes the nvidia-smi
-// BINARY (as opposed to merely breaking it) if this case were still
-// treated as "no failure" — see TestPushLabelsPreservesGPULabelsWhenNvidiaSmiBinaryIsMissing
-// for the end-to-end proof. gatherLabels has no way to tell "this box
-// never had an NVIDIA GPU" apart from "this box's nvidia-smi just
-// vanished" from a single stateless pass, and a fleet-wide wipe (every
-// selector job refused at submit) was judged worse than one device
-// advertising a card that is actually gone.
-func TestNvidiaLabelsAbsentIsTreatedAsAFailure(t *testing.T) {
+// TestNvidiaLabelsAbsentReportsNotFound pins the fix-round-3 shape:
+// exec.LookPath failing (no nvidia-smi on PATH at all) reports found=false,
+// broken=false — nvidiaLabels itself no longer decides whether this counts
+// as a "failure" worth preserving a device's stale labels for; that
+// decision moved to gatherLabels, which needs to know SEPARATELY whether
+// nvidia-smi was ever seen present by this worker before treating an
+// absence as meaningful (see gatherLabels' own fix-round-3 comment, and
+// TestPushLabelsPreservesGPULabelsWhenNvidiaSmiBinaryDisappears /
+// TestPushLabelsClearsGPULabelsOnAHostThatNeverHadNvidiaSmi for the two
+// end-to-end behaviors this split makes possible).
+func TestNvidiaLabelsAbsentReportsNotFound(t *testing.T) {
 	t.Setenv("PATH", t.TempDir())
-	facts, failed := nvidiaLabels(context.Background(), 5*time.Second)
+	facts, found, broken := nvidiaLabels(context.Background(), 5*time.Second)
 	if facts != nil {
 		t.Errorf("expected nil facts when nvidia-smi is absent, got %#v", facts)
 	}
-	if !failed {
-		t.Error("nvidia-smi absent from PATH must be reported as a failure (fix round 2 ruling), not ordinary absence")
+	if found {
+		t.Error("nvidia-smi absent from PATH must report found=false")
+	}
+	if broken {
+		t.Error("nvidia-smi absent from PATH must never report broken=true — broken only applies once found is true")
 	}
 }
 
-// TestNvidiaLabelsPresentButBrokenIsAFailure is the OTHER half: nvidia-smi
-// present on PATH but exiting non-zero — the realistic shape of "a driver
-// upgrade broke nvidia-smi" (e.g. "Failed to initialize NVML: Driver/library
-// version mismatch") — must be reported as failed=true, not treated the
-// same as ordinary absence. See ProbeResult.Failed for why the distinction
-// matters: only this case may withhold a device's stale facts from being
-// wiped by an empty result.
-func TestNvidiaLabelsPresentButBrokenIsAFailure(t *testing.T) {
+// TestNvidiaLabelsPresentButBrokenReportsFoundAndBroken is the OTHER half:
+// nvidia-smi present on PATH but exiting non-zero — the realistic shape of
+// "a driver upgrade broke nvidia-smi" (e.g. "Failed to initialize NVML:
+// Driver/library version mismatch") — must report found=true, broken=true,
+// unconditionally a failure regardless of gatherLabels' startup-seen state
+// (unlike plain absence, being found-but-broken never depends on history).
+func TestNvidiaLabelsPresentButBrokenReportsFoundAndBroken(t *testing.T) {
 	dir := t.TempDir()
 	fake := filepath.Join(dir, "nvidia-smi")
 	script := "#!/bin/sh\necho 'Failed to initialize NVML' >&2\nexit 1\n"
@@ -97,12 +99,15 @@ func TestNvidiaLabelsPresentButBrokenIsAFailure(t *testing.T) {
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	facts, failed := nvidiaLabels(context.Background(), 5*time.Second)
+	facts, found, broken := nvidiaLabels(context.Background(), 5*time.Second)
 	if facts != nil {
 		t.Errorf("a broken nvidia-smi must report no facts, got %#v", facts)
 	}
-	if !failed {
-		t.Error("nvidia-smi present but exiting non-zero must be reported as a failure")
+	if !found {
+		t.Error("nvidia-smi located on PATH must report found=true even though the run itself failed")
+	}
+	if !broken {
+		t.Error("nvidia-smi present but exiting non-zero must report broken=true")
 	}
 }
 
@@ -127,7 +132,7 @@ func TestProbedVRAMComparesCorrectlyThroughSelector(t *testing.T) {
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	facts, _ := nvidiaLabels(context.Background(), 5*time.Second)
+	facts, _, _ := nvidiaLabels(context.Background(), 5*time.Second)
 	bigVRAM := facts["gpu0.vram"]
 	smallVRAM := facts["gpu1.vram"]
 	if bigVRAM != "81920M" || smallVRAM != "9000M" {

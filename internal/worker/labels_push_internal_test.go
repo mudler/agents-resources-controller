@@ -1,6 +1,8 @@
 package worker
 
 import (
+	"bytes"
+	"log/slog"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -23,7 +25,7 @@ func TestLabelsPayloadNilWhenPassProducedNothing(t *testing.T) {
 		Host:   map[string]string{},
 		Device: map[string]map[string]string{"gpu0": {}, "gpu1": {}},
 	}
-	require.Nil(t, labelsPayload(res), "a pass with zero facts anywhere must send nil, not an empty map")
+	require.Nil(t, labelsPayload(res, map[string]bool{}), "a pass with zero facts anywhere must send nil, not an empty map")
 }
 
 // When nothing failed this pass, an empty device result is trustworthy: the
@@ -36,7 +38,7 @@ func TestLabelsPayloadIncludesEverythingWhenPassProducedAnything(t *testing.T) {
 		Device: map[string]map[string]string{"gpu0": {"vram": "80G"}, "gpu1": {}},
 		Failed: false,
 	}
-	out := labelsPayload(res)
+	out := labelsPayload(res, map[string]bool{})
 	require.NotNil(t, out)
 	require.Equal(t, map[string]string{"kernel": "6.8.0"}, out[""])
 	require.Equal(t, map[string]string{"vram": "80G"}, out["gpu0"])
@@ -60,7 +62,7 @@ func TestLabelsPayloadOmitsFailedDeviceButKeepsHostAndOtherDevices(t *testing.T)
 		Device: map[string]map[string]string{"gpu0": {}, "gpu1": {"vram": "40G"}},
 		Failed: true,
 	}
-	out := labelsPayload(res)
+	out := labelsPayload(res, map[string]bool{})
 	require.NotNil(t, out)
 	require.Equal(t, map[string]string{"cpus": "8"}, out[""], "host-wide facts are unaffected by a device probe failure")
 	require.Equal(t, map[string]string{"vram": "40G"}, out["gpu1"], "a device whose own facts came through is unaffected")
@@ -80,7 +82,7 @@ func TestLabelsPayloadSendsExplicitClearWhenNothingFailed(t *testing.T) {
 		Device: map[string]map[string]string{"gpu0": {}},
 		Failed: false,
 	}
-	out := labelsPayload(res)
+	out := labelsPayload(res, map[string]bool{})
 	require.NotNil(t, out)
 	gpu0, hasGPU0Key := out["gpu0"]
 	require.True(t, hasGPU0Key, "a confirmed-clean empty device must still be a present key")
@@ -95,11 +97,92 @@ func TestLabelsPayloadOmitsHostKeyWhenOnlyDeviceFactsExist(t *testing.T) {
 		Host:   map[string]string{},
 		Device: map[string]map[string]string{"gpu0": {"vram": "80G"}},
 	}
-	out := labelsPayload(res)
+	out := labelsPayload(res, map[string]bool{})
 	require.NotNil(t, out)
 	_, hasHostKey := out[""]
 	require.False(t, hasHostKey)
 	require.Equal(t, "80G", out["gpu0"]["vram"])
+}
+
+// TestLabelsPayloadWarnsOnceThenStaysQuietForTheSameEpisode is the
+// fix-round-3 "reconsider the warning's placement" fix: an ongoing failure
+// (the SAME device omitted pass after pass) must log the preserve warning
+// once, not on every single pass — a warning that repeats forever trains an
+// operator to ignore it, exactly the alert-fatigue concern that made
+// nvidiaLabels' own "not found" line Debug-level rather than Warn in fix
+// round 2.
+func TestLabelsPayloadWarnsOnceThenStaysQuietForTheSameEpisode(t *testing.T) {
+	var buf bytes.Buffer
+	orig := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(orig) })
+
+	res := ProbeResult{
+		Host:   map[string]string{"cpus": "8"},
+		Device: map[string]map[string]string{"gpu0": {}},
+		Failed: true,
+	}
+	warned := map[string]bool{}
+
+	out1 := labelsPayload(res, warned)
+	_, hasKey := out1["gpu0"]
+	require.False(t, hasKey, "sanity: gpu0 omitted as expected")
+	require.True(t, warned["gpu0"], "the device must be marked warned after the first omission")
+	firstCount := countOccurrences(buf.String(), "gpu0")
+	require.Equal(t, 1, firstCount, "exactly one log line naming gpu0 after the first omission")
+
+	// Same failure, same device, three more passes: no additional lines.
+	for i := 0; i < 3; i++ {
+		labelsPayload(res, warned)
+	}
+	require.Equal(t, firstCount, countOccurrences(buf.String(), "gpu0"),
+		"an ongoing failure must not re-log the same warning on every pass")
+}
+
+// TestLabelsPayloadWarnsAgainAfterRecovery is the complement: once a device
+// recovers (its probe reports real facts again, or is confirmed cleanly
+// empty), the warned marker resets — so a LATER, new failure episode logs
+// again rather than staying silent forever because of a stale marker from a
+// past, already-resolved episode.
+func TestLabelsPayloadWarnsAgainAfterRecovery(t *testing.T) {
+	var buf bytes.Buffer
+	orig := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(orig) })
+
+	warned := map[string]bool{}
+	failing := ProbeResult{
+		Host:   map[string]string{"cpus": "8"},
+		Device: map[string]map[string]string{"gpu0": {}},
+		Failed: true,
+	}
+	labelsPayload(failing, warned)
+	require.Equal(t, 1, countOccurrences(buf.String(), "gpu0"))
+
+	// gpu0 recovers with real facts.
+	recovered := ProbeResult{
+		Host:   map[string]string{"cpus": "8"},
+		Device: map[string]map[string]string{"gpu0": {"vram": "80G"}},
+		Failed: false,
+	}
+	out := labelsPayload(recovered, warned)
+	require.Equal(t, "80G", out["gpu0"]["vram"])
+	require.False(t, warned["gpu0"], "recovery must clear the warned marker")
+
+	// A NEW failure episode must log again, not stay silent.
+	labelsPayload(failing, warned)
+	require.Equal(t, 2, countOccurrences(buf.String(), "gpu0"),
+		"a new failure episode after a recovery must log its own warning")
+}
+
+func countOccurrences(s, substr string) int {
+	n := 0
+	for i := 0; i+len(substr) <= len(s); i++ {
+		if s[i:i+len(substr)] == substr {
+			n++
+		}
+	}
+	return n
 }
 
 // declaredLabelsPayload always sends the config's declared labels verbatim,

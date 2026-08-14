@@ -108,6 +108,28 @@ type Worker struct {
 	// state, so devices never contend with each other.
 	hooksMu     sync.Mutex
 	deviceHooks map[string]*deviceHookState
+
+	// nvidiaSmiStartupChecked and nvidiaSmiSeenAtStartup are gatherLabels'
+	// fix-round-3 state: whether nvidia-smi's presence has been recorded
+	// yet, and what that one-time recording found. Written exactly once,
+	// on this worker's first probe pass (inside register(), which always
+	// completes before Start ever spawns probeLoop's goroutine — no mutex
+	// needed for the same reason w.workerID needs none: the `go` statement
+	// that starts probeLoop happens-after every write register() made).
+	// See gatherLabels for the full reasoning.
+	nvidiaSmiStartupChecked bool
+	nvidiaSmiSeenAtStartup  bool
+
+	// labelOmitWarned tracks, per device, whether labelsPayload has
+	// already logged a warning for the CURRENT episode of that device
+	// being omitted from a push (its probe source failed or was
+	// unavailable). See labelsPayload for why this exists: without it, an
+	// ongoing failure re-logs the same warning on every single pass for
+	// as long as it lasts, which trains an operator to ignore the log
+	// stream exactly the way a permanent one would. Like the two fields
+	// above, only ever touched from the sequential register()/pushLabels()
+	// call chain, never concurrently.
+	labelOmitWarned map[string]bool
 }
 
 func New(cfg Config) *Worker {
@@ -128,12 +150,13 @@ func New(cfg Config) *Worker {
 		}
 	}
 	return &Worker{
-		cfg:         cfg,
-		http:        &http.Client{Timeout: 2 * time.Minute},
-		running:     map[string]context.CancelFunc{},
-		started:     map[string]struct{}{},
-		hooks:       hooks,
-		deviceHooks: map[string]*deviceHookState{},
+		cfg:             cfg,
+		http:            &http.Client{Timeout: 2 * time.Minute},
+		running:         map[string]context.CancelFunc{},
+		started:         map[string]struct{}{},
+		hooks:           hooks,
+		deviceHooks:     map[string]*deviceHookState{},
+		labelOmitWarned: map[string]bool{},
 	}
 }
 
@@ -290,7 +313,7 @@ func (w *Worker) register(ctx context.Context) error {
 	// the same reason runStartupReleaseHooks already can: it happens once,
 	// before this worker's devices are relied on for anything.
 	res := w.gatherLabels(ctx)
-	labels := labelsPayload(res)
+	labels := labelsPayload(res, w.labelOmitWarned)
 	if labels == nil {
 		slog.Error("initial probe pass produced no facts at all; registering without detected labels",
 			"host", w.cfg.Host)
@@ -506,7 +529,7 @@ func (w *Worker) probeLoop(ctx context.Context) {
 // is actually supervising right now.
 func (w *Worker) pushLabels(ctx context.Context) {
 	res := w.gatherLabels(ctx)
-	labels := labelsPayload(res)
+	labels := labelsPayload(res, w.labelOmitWarned)
 	if labels == nil {
 		slog.Error("probe pass produced no facts at all; pushing without a labels field so previously detected labels are not wiped",
 			"host", w.cfg.Host)
@@ -577,7 +600,20 @@ func (w *Worker) pushLabels(ctx context.Context) {
 // A nil return — meaning "say nothing about detected labels at all" — is
 // reserved for the one case where there is nothing to say about anything:
 // no host facts and no device facts whatsoever.
-func labelsPayload(res ProbeResult) map[string]map[string]string {
+// labelsPayload's warned parameter is the caller's (a *Worker's)
+// labelOmitWarned map, mutated in place: fix round 3 changed the omission
+// warning below from "log every pass this device stays omitted" to
+// "log once when it FIRST becomes omitted, stay quiet while the same
+// episode continues, log again only if a NEW episode starts after a
+// recovery". An ongoing failure (nvidia-smi still gone, a drop-in still
+// broken) would otherwise re-log the identical line on every single pass
+// for as long as it lasts — indistinguishable, to an operator watching the
+// log stream, from the permanent-forever case fix round 3's primary change
+// already eliminates, and just as good at training them to stop reading it.
+// warned is plain map[string]bool, not synchronized: see its field comment
+// on Worker for why that's safe (only ever touched from the sequential
+// register()/pushLabels() call chain).
+func labelsPayload(res ProbeResult, warned map[string]bool) map[string]map[string]string {
 	allEmpty := len(res.Host) == 0
 	if allEmpty {
 		for _, m := range res.Device {
@@ -598,6 +634,7 @@ func labelsPayload(res ProbeResult) map[string]map[string]string {
 	for name, m := range res.Device {
 		if len(m) > 0 {
 			out[name] = m
+			delete(warned, name) // recovered with real facts: a future failure logs again
 			continue
 		}
 		if !res.Failed {
@@ -605,17 +642,17 @@ func labelsPayload(res ProbeResult) map[string]map[string]string {
 			// were none configured) and nothing failed anywhere this
 			// pass, so an empty result here is trustworthy.
 			out[name] = m
+			delete(warned, name) // confirmed empty and cleared normally: same reset
 			continue
 		}
 		// Something that can produce device-scoped facts failed this
-		// pass (including, as of fix round 2, nvidia-smi simply not being
-		// on PATH — see nvidiaLabels' doc comment for the ruling behind
-		// treating absence the same as an error), so this device's empty
-		// result proves nothing about it. Omit it entirely so
-		// applyDeviceFacts (server-side) leaves whatever is already
-		// stored for it untouched, and say so loudly: an operator staring
-		// at a device that stopped updating needs this line, not a
-		// silent gap in the logs.
+		// pass — nvidia-smi found but broken, or found-then-vanished
+		// after this worker had already seen it present (fix round 3:
+		// NOT "never found at all" — see gatherLabels for why that case
+		// no longer sets Failed) — so this device's empty result proves
+		// nothing about it. Omit it entirely so applyDeviceFacts
+		// (server-side) leaves whatever is already stored for it
+		// untouched.
 		//
 		// Two limitations accepted alongside this ruling, not overlooked:
 		//   - A preserved label never expires on its own. A device that
@@ -630,8 +667,11 @@ func labelsPayload(res ProbeResult) map[string]map[string]string {
 		//     drop-in anywhere on the host freezes every OTHER empty
 		//     device's labels too, not just the one the flaky probe was
 		//     ever meant to cover. Accepted for now.
-		slog.Warn("device's probe source failed or was unavailable this pass; preserving its previously detected labels instead of clearing them",
-			"device", name)
+		if !warned[name] {
+			slog.Warn("device's probe source failed or was unavailable this pass; preserving its previously detected labels instead of clearing them",
+				"device", name)
+			warned[name] = true
+		}
 	}
 	return out
 }

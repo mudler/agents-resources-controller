@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -421,6 +422,116 @@ foundOmission:
 	require.True(t,
 		strings.Contains(logBuf.String(), "preserving") || strings.Contains(logBuf.String(), "failed or was unavailable"),
 		"the log must say WHY gpu0's labels were preserved, not just that something happened; got: %s", logBuf.String())
+}
+
+// TestPushLabelsClearsGPULabelsOnAHostThatNeverHadNvidiaSmi is the
+// fix-round-3 companion to TestPushLabelsPreservesGPULabelsWhenNvidiaSmiBinaryDisappears:
+// a host that has NEVER had nvidia-smi on PATH must still be able to clear a
+// device's detected labels the ordinary way when its drop-in probe stops
+// reporting them. Fix round 2 alone broke this: an absent nvidia-smi set
+// Failed=true on EVERY pass forever regardless of history, so a device's
+// stale facts could never be cleared by any means on such a host. Fix
+// round 3's "recorded once at startup" rule must leave Failed false here,
+// since nvidia-smi was never found even on the very first pass.
+//
+// This deliberately does NOT override PATH to guarantee nvidia-smi's
+// absence: an emptied or replaced PATH also breaks the coreutils
+// (`touch`, `test`/`[`) the probe script below itself depends on, which
+// silently defeats the marker-file logic the test relies on to distinguish
+// pass 1 from pass 2+ — caught during development of this very test, see
+// the fix-round-3 report. Instead it verifies the precondition holds on
+// THIS host and skips rather than giving a false result on a real GPU box,
+// the same reasoning TestNvidiaLabelsParsesPresentDriver's own comment
+// gives for why it fakes nvidia-smi rather than assuming its absence.
+func TestPushLabelsClearsGPULabelsOnAHostThatNeverHadNvidiaSmi(t *testing.T) {
+	if _, err := exec.LookPath("nvidia-smi"); err == nil {
+		t.Skip("this host has a real nvidia-smi on PATH; this test needs an environment without one")
+	}
+
+	probeDir := t.TempDir()
+	marker := filepath.Join(probeDir, ".ran-once")
+	script := "#!/bin/sh\n" +
+		"if [ -f " + marker + " ]; then\n" +
+		"  echo '{}'\n" + // ran cleanly, confirms nothing to report — a genuine clear
+		"  exit 0\n" +
+		"fi\n" +
+		"touch " + marker + "\n" +
+		`echo '{"gpu0.vram":"80G","gpu0.model":"a100"}'` + "\n"
+	require.NoError(t, os.WriteFile(filepath.Join(probeDir, "10-gpu.sh"), []byte(script), 0o755))
+
+	registered := make(chan registerBody, 1)
+	pushed := make(chan map[string]any, 16)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/workers/register":
+			var body registerBody
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			select {
+			case registered <- body:
+			default:
+			}
+			_ = json.NewEncoder(w).Encode(map[string]string{"worker_id": "w1"})
+		case "/v1/workers/w1/labels":
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			select {
+			case pushed <- body:
+			default:
+			}
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	wk := worker.New(worker.Config{
+		ControllerURL:     ts.URL,
+		Token:             "t",
+		Host:              "gpubox",
+		Devices:           []worker.DeviceConfig{{Name: "gpu0"}},
+		HeartbeatInterval: 500 * time.Millisecond,
+		PollWait:          50 * time.Millisecond,
+		ProbeDir:          probeDir,
+		ProbeInterval:     150 * time.Millisecond,
+	})
+	go func() { _ = wk.Start(ctx) }()
+
+	var regBody registerBody
+	select {
+	case regBody = <-registered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("register never reached the controller")
+	}
+	require.Equal(t, "80G", regBody.Labels["gpu0"]["vram"], "sanity: the first pass captured gpu0's real facts")
+
+	deadline := time.After(10 * time.Second)
+	for {
+		select {
+		case pushBody := <-pushed:
+			labels, _ := pushBody["labels"].(map[string]any)
+			if labels == nil {
+				continue
+			}
+			gpu0, hasGPU0Key := labels["gpu0"].(map[string]any)
+			if !hasGPU0Key {
+				// Still omitted, or a stale push from before the drop-in
+				// started reporting empty; keep waiting.
+				continue
+			}
+			require.Empty(t, gpu0,
+				"a host that never had nvidia-smi must still clear gpu0's labels once its own probe reports nothing — "+
+					"an omission here (rather than a present, empty map) would mean the fix-round-2 permanence bug is back")
+			return
+		case <-deadline:
+			t.Fatal("gpu0 was never cleared (sent as a present, empty map) on a host with no nvidia-smi at all — " +
+				"labels can never be retired on such a host if this fails")
+		}
+	}
 }
 
 // logCapture is a trivial io.Writer collecting everything written to it,
