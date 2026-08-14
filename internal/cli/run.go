@@ -48,9 +48,14 @@ func defaultSubmitter() string {
 
 func NewRunCmd() *cobra.Command {
 	var (
-		device string
-		cwd    string
-		as     string
+		device      string
+		cwd         string
+		as          string
+		priority    int
+		maxRuntime  time.Duration
+		idleTimeout time.Duration
+		timeout     time.Duration
+		noWait      bool
 	)
 
 	cmd := &cobra.Command{
@@ -90,16 +95,49 @@ func NewRunCmd() *cobra.Command {
 				Cwd:            cwd,
 				Submitter:      submitter,
 				IdempotencyKey: uuid.NewString(),
+				Priority:       priority,
+				MaxRuntime:     maxRuntime,
+				IdleTimeout:    idleTimeout,
+				NoWait:         noWait,
 			})
 			if errors.Is(err, client.ErrNoDevice) {
-				// rc run does not set NoWait, so a plain busy device queues
-				// rather than reaching this branch; it stays here as the
-				// correct response if that ever changes (e.g. a future
-				// --no-wait flag).
+				// --no-wait opts out of stage 2's queue: a busy device fails
+				// fast here instead of the job sitting queued behind it.
 				return fmt.Errorf("%s is busy and could not be queued", device)
 			}
 			if err != nil {
 				return err
+			}
+
+			if job.State == model.JobQueued {
+				waitCtx := ctx
+				if timeout > 0 {
+					var cancelWait context.CancelFunc
+					waitCtx, cancelWait = context.WithTimeout(ctx, timeout)
+					defer cancelWait()
+				}
+
+				scheduled, err := c.WaitScheduled(waitCtx, job.ID, func(pos int) {
+					fmt.Fprintf(os.Stderr, "rc: queued at position %d for %s\n", pos, device)
+				})
+				switch {
+				case err == nil:
+					job = scheduled
+				case ctx.Err() != nil:
+					// Ctrl-C while queued cancels outright: nothing is
+					// running, so there is no lease to protect.
+					if killErr := c.Kill(context.Background(), job.ID, submitter); killErr != nil {
+						fmt.Fprintf(os.Stderr, "rc: could not cancel queued job %s: %v\n", job.ID, killErr)
+					} else {
+						fmt.Fprintf(os.Stderr, "rc: cancelled queued job %s\n", job.ID)
+					}
+					return exitCodeError{code: sigintExitCode}
+				default:
+					if killErr := c.Kill(context.Background(), job.ID, submitter); killErr != nil {
+						fmt.Fprintf(os.Stderr, "rc: could not cancel queued job %s: %v\n", job.ID, killErr)
+					}
+					return fmt.Errorf("gave up waiting for %s: %w", device, err)
+				}
 			}
 
 			fmt.Fprintf(os.Stderr, "rc: job %s on %s\n", job.ID, job.DeviceID)
@@ -144,6 +182,11 @@ func NewRunCmd() *cobra.Command {
 	cmd.Flags().StringVarP(&device, "device", "d", "", "device ID, e.g. gpubox:gpu0")
 	cmd.Flags().StringVar(&cwd, "cwd", "", "working directory on the device host")
 	cmd.Flags().StringVar(&as, "as", "", "identity shown in rc ps (defaults to user@host/session)")
+	cmd.Flags().IntVar(&priority, "priority", 0, "queue priority; higher runs sooner")
+	cmd.Flags().DurationVar(&maxRuntime, "max-runtime", 0, "kill the job if it runs longer than this (0 = device default)")
+	cmd.Flags().DurationVar(&idleTimeout, "idle-timeout", 0, "kill the job if it produces no output for this long (0 = device default)")
+	cmd.Flags().DurationVar(&timeout, "timeout", 0, "give up waiting in the queue after this long and cancel the job (0 = wait forever)")
+	cmd.Flags().BoolVar(&noWait, "no-wait", false, "fail immediately if the device is busy instead of queueing")
 	return cmd
 }
 

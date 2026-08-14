@@ -42,6 +42,12 @@ type SubmitOptions struct {
 	Env            map[string]string
 	Submitter      string
 	IdempotencyKey string
+	// Priority orders queued jobs on the same device: higher runs sooner.
+	Priority int
+	// MaxRuntime and IdleTimeout are watchdog ceilings enforced by the
+	// worker (task 5); zero means "use the device's configured default".
+	MaxRuntime  time.Duration
+	IdleTimeout time.Duration
 	// NoWait opts out of stage 2's queue: a busy device fails fast with
 	// ErrNoDevice instead of the job sitting queued behind it.
 	NoWait bool
@@ -61,7 +67,10 @@ func (c *Client) Submit(ctx context.Context, opts SubmitOptions) (*model.Job, er
 	payload, err := json.Marshal(server.SubmitRequest{
 		DeviceID: opts.DeviceID, Command: opts.Command, Cwd: opts.Cwd, Env: opts.Env,
 		Submitter: opts.Submitter, IdempotencyKey: opts.IdempotencyKey,
-		NoWait: opts.NoWait,
+		Priority:           opts.Priority,
+		MaxRuntimeSeconds:  int(opts.MaxRuntime.Seconds()),
+		IdleTimeoutSeconds: int(opts.IdleTimeout.Seconds()),
+		NoWait:             opts.NoWait,
 	})
 	if err != nil {
 		return nil, err
@@ -86,6 +95,15 @@ func (c *Client) Submit(ctx context.Context, opts SubmitOptions) (*model.Job, er
 }
 
 func (c *Client) Job(ctx context.Context, id string) (*model.Job, error) {
+	view, err := c.JobView(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	return &view.Job, nil
+}
+
+// JobView fetches a job together with its queue position.
+func (c *Client) JobView(ctx context.Context, id string) (*server.JobView, error) {
 	resp, err := c.do(ctx, http.MethodGet, "/v1/jobs/"+id, nil)
 	if err != nil {
 		return nil, err
@@ -98,7 +116,50 @@ func (c *Client) Job(ctx context.Context, id string) (*model.Job, error) {
 	if err := json.NewDecoder(resp.Body).Decode(&view); err != nil {
 		return nil, err
 	}
-	return &view.Job, nil
+	return &view, nil
+}
+
+// WaitScheduled polls until the job leaves the queue, calling onPosition each
+// time its position changes so the caller can show progress.
+func (c *Client) WaitScheduled(ctx context.Context, id string, onPosition func(int)) (*model.Job, error) {
+	last := -1
+	for {
+		view, err := c.JobView(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		if view.Job.State != model.JobQueued {
+			return &view.Job, nil
+		}
+		if view.QueuePosition != last {
+			last = view.QueuePosition
+			if onPosition != nil {
+				onPosition(view.QueuePosition)
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(time.Second):
+		}
+	}
+}
+
+// Kill cancels a queued job or terminates a running one.
+func (c *Client) Kill(ctx context.Context, id, submitter string) error {
+	payload, err := json.Marshal(map[string]string{"submitter": submitter})
+	if err != nil {
+		return err
+	}
+	resp, err := c.do(ctx, http.MethodPost, "/v1/jobs/"+id+"/kill", bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return apiError(resp)
+	}
+	return nil
 }
 
 // StreamLogs copies the job's output to out until the job finishes.
