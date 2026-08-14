@@ -363,6 +363,194 @@ func TestAcquireHookFailureQuarantinesDeviceAndSkipsJob(t *testing.T) {
 	require.True(t, os.IsNotExist(err), "the job's own command must never run when its acquire hook fails")
 }
 
+// TestShutdownDuringAcquireHookCancelsTheJobWithoutFaultingTheDevice covers
+// the case a `systemctl restart rc-worker` lands mid-hook. The acquire hook
+// is interrupted by our own shutdown, which says nothing whatsoever about
+// the device: reporting a fault here would quarantine the GPU with the one
+// quarantine reason a reboot deliberately does not clear, so the node would
+// need an admin's `rc clear` to come back. The job is reported cancelled
+// through the same terminal path a kill uses, and no fault is reported.
+func TestShutdownDuringAcquireHookCancelsTheJobWithoutFaultingTheDevice(t *testing.T) {
+	dir := t.TempDir()
+	started := filepath.Join(dir, "hook-started")
+	slowAcquire := filepath.Join(dir, "acquire.sh")
+	require.NoError(t, os.WriteFile(slowAcquire,
+		[]byte("#!/bin/sh\ntouch "+started+"\nsleep 30\n"), 0o700))
+
+	var (
+		mu         sync.Mutex
+		served     bool
+		statuses   []map[string]any
+		faultCalls int
+	)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/workers/register":
+			json.NewEncoder(w).Encode(map[string]string{"worker_id": "w1"})
+
+		case "/v1/workers/w1/assignments":
+			mu.Lock()
+			first := !served
+			served = true
+			mu.Unlock()
+			if !first {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			json.NewEncoder(w).Encode(map[string]any{"assignments": []map[string]any{{
+				"job_id": "job1", "device_id": "gpubox:gpu0", "command": []string{"true"},
+			}}})
+
+		case "/v1/workers/w1/heartbeat":
+			w.WriteHeader(http.StatusOK)
+
+		case "/v1/jobs/job1/status":
+			var body map[string]any
+			json.NewDecoder(r.Body).Decode(&body)
+			mu.Lock()
+			statuses = append(statuses, body)
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+
+		case "/v1/devices/gpubox:gpu0/fault":
+			mu.Lock()
+			faultCalls++
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer ts.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	wk := worker.New(worker.Config{
+		ControllerURL: ts.URL,
+		Host:          "gpubox",
+		Devices: []worker.DeviceConfig{{
+			Name: "gpu0", OnAcquire: slowAcquire,
+			HookTimeout: 60 * time.Second, ReleaseLinger: 100 * time.Millisecond,
+		}},
+		HeartbeatInterval: 500 * time.Millisecond,
+		PollWait:          20 * time.Millisecond,
+	})
+	done := make(chan error, 1)
+	go func() { done <- wk.Start(ctx) }()
+
+	// Shut down while the hook is genuinely mid-flight, not before it starts.
+	require.Eventually(t, func() bool { return fileExists(started) }, 8*time.Second, 20*time.Millisecond,
+		"the acquire hook must actually be running before we shut down")
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("Start did not return after cancellation")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Zero(t, faultCalls,
+		"our own shutdown interrupting a hook is not evidence the device is faulty")
+	require.Len(t, statuses, 1, "the job gets exactly one terminal report and never a running one")
+	require.Equal(t, "killed", statuses[0]["state"],
+		"a job whose acquire hook we cancelled must be reported cancelled, not failed")
+}
+
+// TestPendingReleaseFiresOnShutdown covers the drain: a job ends, arming a
+// release linger far longer than this test waits, and then the worker is
+// stopped. Returning from Start without firing that release leaves the
+// operator's inference server stopped indefinitely with no job running —
+// a state only a restart heals. The linger is deliberately 60s here, so a
+// release appearing at all can only have come from the shutdown drain.
+func TestPendingReleaseFiresOnShutdown(t *testing.T) {
+	dir := t.TempDir()
+	hookLog := filepath.Join(dir, "hooks.log")
+	hook := writeHookScript(t, hookLog)
+
+	var (
+		mu       sync.Mutex
+		served   bool
+		finished bool
+	)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/workers/register":
+			json.NewEncoder(w).Encode(map[string]string{"worker_id": "w1"})
+
+		case "/v1/workers/w1/assignments":
+			mu.Lock()
+			first := !served
+			served = true
+			mu.Unlock()
+			if !first {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			json.NewEncoder(w).Encode(map[string]any{"assignments": []map[string]any{{
+				"job_id": "job1", "device_id": "gpubox:gpu0", "command": []string{"true"},
+			}}})
+
+		case "/v1/workers/w1/heartbeat", "/v1/jobs/job1/logs":
+			w.WriteHeader(http.StatusOK)
+
+		case "/v1/jobs/job1/status":
+			var body map[string]any
+			json.NewDecoder(r.Body).Decode(&body)
+			if body["state"] == "succeeded" {
+				mu.Lock()
+				finished = true
+				mu.Unlock()
+			}
+			w.WriteHeader(http.StatusOK)
+
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer ts.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	wk := worker.New(worker.Config{
+		ControllerURL: ts.URL,
+		Host:          "gpubox",
+		Devices: []worker.DeviceConfig{{
+			Name: "gpu0", OnAcquire: hook, OnRelease: hook,
+			HookTimeout: 5 * time.Second, ReleaseLinger: 60 * time.Second,
+		}},
+		HeartbeatInterval: 500 * time.Millisecond,
+		PollWait:          20 * time.Millisecond,
+	})
+	done := make(chan error, 1)
+	go func() { done <- wk.Start(ctx) }()
+
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return finished
+	}, 10*time.Second, 20*time.Millisecond, "the job must run and report before we stop the worker")
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("Start did not return after cancellation")
+	}
+
+	// Start has returned: the release must already have happened, not be
+	// left to a timer goroutine nobody waits for.
+	lines := readLines(t, hookLog)
+	require.Equal(t, []string{"release ", "acquire job1", "release job1"}, lines,
+		"a clean stop must leave the device released, not the operator's service stopped indefinitely")
+}
+
 // TestStartupRunsReleaseHooksBeforeFirstPoll covers the crash-safety
 // contract: a fresh worker process runs every declared device's release
 // hook once, before it ever polls for work. The assignments handler records

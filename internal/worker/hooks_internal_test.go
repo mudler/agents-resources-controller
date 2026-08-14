@@ -102,6 +102,67 @@ func readFileOrEmpty(t *testing.T, path string) string {
 	return string(b)
 }
 
+// TestNewAppliesHookDefaults guards the fix for a Config that never passed
+// through LoadConfig (an embedded worker, a test, any future flag path):
+// a zero hook timeout means no MaxRuntime, so a wedged hook runs forever
+// and the startup pass blocks Start from ever polling. "Unset" must resolve
+// to the documented default wherever the config arrived from.
+func TestNewAppliesHookDefaults(t *testing.T) {
+	w := New(Config{
+		Host:    "gpubox",
+		Devices: []DeviceConfig{{Name: "gpu0", OnAcquire: "/bin/true", OnRelease: "/bin/true"}},
+	})
+
+	spec := w.hooks["gpubox:gpu0"]
+	require.Equal(t, defaultHookTimeout, spec.timeout,
+		"a zero hook timeout must never reach the hook runner: it would mean no MaxRuntime at all")
+	require.Equal(t, defaultReleaseLinger, spec.releaseLinger)
+	require.Equal(t, defaultHeartbeatInterval, w.cfg.HeartbeatInterval)
+	require.Equal(t, defaultPollWait, w.cfg.PollWait)
+}
+
+// TestHostLevelHookDefaultsReachDevicesBuiltInCode is the other half: a
+// host-level hooks: block set in code (not YAML) must still be what an
+// un-overridden device inherits.
+func TestHostLevelHookDefaultsReachDevicesBuiltInCode(t *testing.T) {
+	w := New(Config{
+		Host:    "gpubox",
+		Hooks:   HooksConfig{Timeout: 7 * time.Second, ReleaseLinger: 3 * time.Second},
+		Devices: []DeviceConfig{{Name: "gpu0", OnRelease: "/bin/true"}},
+	})
+	spec := w.hooks["gpubox:gpu0"]
+	require.Equal(t, 7*time.Second, spec.timeout)
+	require.Equal(t, 3*time.Second, spec.releaseLinger)
+}
+
+// TestStartupReleasePassIsBounded guards the fix for a startup pass that
+// could delay (or, with a zero timeout, permanently prevent) this worker
+// ever polling: the pass as a whole is capped, so one slow hook costs a
+// known amount of startup delay and the remaining devices are simply left
+// to the next start's pass — which is safe precisely because release hooks
+// are required to be idempotent.
+func TestStartupReleasePassIsBounded(t *testing.T) {
+	orig := startupReleaseBudget
+	startupReleaseBudget = 300 * time.Millisecond
+	t.Cleanup(func() { startupReleaseBudget = orig })
+
+	slow := writeScript(t, `sleep 30`)
+	w := New(Config{
+		Host: "gpubox",
+		Devices: []DeviceConfig{
+			{Name: "gpu0", OnRelease: slow},
+			{Name: "gpu1", OnRelease: slow},
+		},
+	})
+
+	start := time.Now()
+	w.runStartupReleaseHooks(context.Background())
+	elapsed := time.Since(start)
+
+	require.Less(t, elapsed, 5*time.Second,
+		"the startup release pass must be bounded as a whole, not by each hook's own timeout summed over every device")
+}
+
 // TestBackToBackJobsWithinLingerProduceOneAcquireOneRelease is the property
 // the linger exists for: two jobs run back-to-back, well inside the linger
 // window between them, and across the whole burst the device sees exactly
@@ -114,7 +175,7 @@ func TestBackToBackJobsWithinLingerProduceOneAcquireOneRelease(t *testing.T) {
 	acq1 := w.acquireDevice(context.Background(), device, spec, "job1", "agent-a")
 	require.NoError(t, acq1.err)
 	require.True(t, acq1.ranHook)
-	w.scheduleRelease(device, spec, "job1", "agent-a")
+	w.scheduleRelease(device, spec, "job1", "agent-a", acq1.epoch)
 
 	// Second job arrives well within the linger window: its acquire must be
 	// skipped (the device was never released), and the pending release
@@ -123,7 +184,7 @@ func TestBackToBackJobsWithinLingerProduceOneAcquireOneRelease(t *testing.T) {
 	acq2 := w.acquireDevice(context.Background(), device, spec, "job2", "agent-a")
 	require.NoError(t, acq2.err)
 	require.False(t, acq2.ranHook, "the acquire hook must not run again while the device is still held")
-	w.scheduleRelease(device, spec, "job2", "agent-a")
+	w.scheduleRelease(device, spec, "job2", "agent-a", acq2.epoch)
 
 	require.Equal(t, "acquire job1\n", readFileOrEmpty(t, acquireLog),
 		"exactly one acquire across the whole back-to-back burst")
@@ -141,6 +202,49 @@ func TestBackToBackJobsWithinLingerProduceOneAcquireOneRelease(t *testing.T) {
 		"exactly one release, naming the job that actually triggered it (the last one)")
 }
 
+// TestDelayedReleaseFromAFinishedJobNeverFiresDuringTheNextJob drives the
+// inversion directly rather than hoping for a race: job1 ends, but its
+// scheduleRelease is delayed (in production: its terminal report's response
+// was lost and reportTerminalWithRetry burned its retry budget while the
+// controller had already freed the device and handed job2 out). By the time
+// job1 gets to arm its release, job2 owns the device. Nothing may fire for
+// job1 — a release landing here restarts the operator's inference server
+// onto the VRAM of a running job — and job2's own end must still release
+// normally.
+func TestDelayedReleaseFromAFinishedJobNeverFiresDuringTheNextJob(t *testing.T) {
+	spec, _, releaseLog := testSpec(t, 5*time.Second, 100*time.Millisecond)
+	w := New(Config{})
+	const device = "gpubox:gpu0"
+
+	acq1 := w.acquireDevice(context.Background(), device, spec, "job1", "agent-a")
+	require.NoError(t, acq1.err)
+	require.True(t, acq1.ranHook)
+
+	// job1 has ended, but its goroutine has not reached scheduleRelease yet.
+	// The controller, having freed the device, hands job2 out and job2
+	// acquires: the device is still held, so no acquire hook runs, but this
+	// acquire is what makes job2 — not job1 — the device's current owner.
+	acq2 := w.acquireDevice(context.Background(), device, spec, "job2", "agent-a")
+	require.NoError(t, acq2.err)
+	require.False(t, acq2.ranHook, "the device was never released, so job2 must not re-run the acquire hook")
+
+	// Only now does job1's delayed goroutine arm its release. It is void:
+	// a later acquire owns the device.
+	w.scheduleRelease(device, spec, "job1", "agent-a", acq1.epoch)
+
+	// Well past the linger: job2 is still running, so nothing may have fired.
+	time.Sleep(400 * time.Millisecond)
+	require.Empty(t, readFileOrEmpty(t, releaseLog),
+		"a finished job's release must never fire while a later job holds the device")
+
+	// The surviving owner still releases normally once it ends.
+	w.scheduleRelease(device, spec, "job2", "agent-a", acq2.epoch)
+	require.Eventually(t, func() bool {
+		return readFileOrEmpty(t, releaseLog) != ""
+	}, 2*time.Second, 10*time.Millisecond, "job2's own end must still release the device")
+	require.Equal(t, "release job2\n", readFileOrEmpty(t, releaseLog))
+}
+
 // TestJobAfterLingerElapsedGetsItsOwnAcquire is the other half of the
 // property: once the linger has genuinely elapsed and the release hook has
 // run, a later job on the same device gets a fresh acquire.
@@ -151,7 +255,7 @@ func TestJobAfterLingerElapsedGetsItsOwnAcquire(t *testing.T) {
 
 	acq1 := w.acquireDevice(context.Background(), device, spec, "job1", "agent-a")
 	require.NoError(t, acq1.err)
-	w.scheduleRelease(device, spec, "job1", "agent-a")
+	w.scheduleRelease(device, spec, "job1", "agent-a", acq1.epoch)
 
 	require.Eventually(t, func() bool {
 		return readFileOrEmpty(t, releaseLog) != ""
@@ -179,7 +283,7 @@ func TestAcquireHookFailureLeavesDeviceUnheld(t *testing.T) {
 	require.Error(t, acq.err)
 
 	// scheduleRelease must be a no-op: nothing was ever actually acquired.
-	w.scheduleRelease(device, spec, "job1", "agent-a")
+	w.scheduleRelease(device, spec, "job1", "agent-a", acq.epoch)
 	st := w.hookState(device)
 	st.mu.Lock()
 	held := st.held
@@ -204,7 +308,7 @@ func TestDeviceWithNoHooksConfiguredIsANoOp(t *testing.T) {
 	acq := w.acquireDevice(context.Background(), "gpubox:gpu0", hookSpec{}, "job1", "agent-a")
 	require.NoError(t, acq.err)
 	require.False(t, acq.ranHook)
-	w.scheduleRelease("gpubox:gpu0", hookSpec{}, "job1", "agent-a")
+	w.scheduleRelease("gpubox:gpu0", hookSpec{}, "job1", "agent-a", acq.epoch)
 
 	w.hooksMu.Lock()
 	_, exists := w.deviceHooks["gpubox:gpu0"]
@@ -227,7 +331,7 @@ func TestOnlyReleaseHookConfigured(t *testing.T) {
 	require.NoError(t, acq.err)
 	require.False(t, acq.ranHook, "no on_acquire script to run")
 
-	w.scheduleRelease(device, spec, "job1", "agent-a")
+	w.scheduleRelease(device, spec, "job1", "agent-a", acq.epoch)
 	require.Eventually(t, func() bool {
 		return readFileOrEmpty(t, releaseLog) != ""
 	}, 2*time.Second, 10*time.Millisecond)

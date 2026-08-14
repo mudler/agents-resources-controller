@@ -12,6 +12,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/mudler/agents-resources-controller/internal/model"
+	"github.com/mudler/agents-resources-controller/internal/store"
 )
 
 // maxLogChunk bounds a single log upload. A worker whose chunk exceeds this
@@ -287,6 +288,15 @@ func (s *Server) handleDeviceFault(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.cfg.Store.SetDeviceState(id, model.DeviceUnhealthy, s.cfg.Clock.Now()); err != nil {
+		// A device ID this controller has never heard of must not answer 200:
+		// the worker would log a successful quarantine having changed nothing,
+		// and the device (whatever its real ID is) stays schedulable while
+		// everyone believes it was taken out of the pool. Say plainly that
+		// nothing matched.
+		if errors.Is(err, store.ErrDeviceNotFound) {
+			writeErr(w, http.StatusNotFound, "not_found", "device not found")
+			return
+		}
 		writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
 		return
 	}

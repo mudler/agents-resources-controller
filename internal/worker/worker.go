@@ -75,6 +75,13 @@ type Worker struct {
 }
 
 func New(cfg Config) *Worker {
+	// Defaults are applied here, not only in LoadConfig: a Config assembled
+	// in code reaches this constructor without ever passing through the file
+	// loader, and a zero hook timeout would mean no MaxRuntime — a hook that
+	// wedges then runs forever and takes the worker's startup with it. See
+	// Config.withDefaults.
+	cfg = cfg.withDefaults()
+
 	hooks := make(map[string]hookSpec, len(cfg.Devices))
 	for _, d := range cfg.Devices {
 		hooks[cfg.Host+":"+d.Name] = hookSpec{
@@ -107,12 +114,39 @@ func New(cfg Config) *Worker {
 // (connection accepted, nothing ever comes back) could let a single attempt
 // run for w's full 2-minute http.Client timeout, and five of those blow
 // through this 45s many times over.
+//
+// One path can still exceed it: a job whose acquire hook failed makes two
+// retried calls back to back (its terminal report, then the device fault
+// report), so an unreachable controller costs up to ~56s there. That trade
+// is deliberate — a device the hook has just called unusable must not stay
+// schedulable because we were in a hurry to exit — and it costs a log line,
+// not correctness: the job in question never started, so there is no
+// process to abandon.
 const shutdownGrace = 45 * time.Second
+
+// startupReleaseBudget bounds the whole startup reconciliation pass — every
+// device's release hook together, not each one — so a slow hook delays this
+// worker's first poll by a known amount rather than an unbounded one. See
+// runStartupReleaseHooks for why the sum, not the per-hook timeout, is the
+// number that matters.
+//
+// A var, not a const, so tests can shrink it.
+var startupReleaseBudget = 2 * time.Minute
 
 func (w *Worker) Start(ctx context.Context) error {
 	if err := w.register(ctx); err != nil {
 		return err
 	}
+	// The heartbeat starts BEFORE the startup reconciliation pass, not after
+	// it. The pass runs operator scripts of unknown duration (a stop-LocalAI
+	// hook is allowed a full hook timeout each), and while it ran the worker
+	// used to be silent: past the controller's device-freshness window, this
+	// worker's own devices get marked unknown before it has polled even
+	// once. Heartbeating through the pass costs nothing — the heartbeat
+	// names the jobs this worker is supervising, and during the pass that
+	// list is correctly empty, so no lease is renewed by starting it early.
+	go w.heartbeatLoop(ctx)
+
 	// Before this worker ever polls for work, run the release hook of every
 	// device it declares one for. A worker that crashed (kill -9, an OOM,
 	// a crashed host) never got to run its normal release-on-idle path for
@@ -123,7 +157,6 @@ func (w *Worker) Start(ctx context.Context) error {
 	// to be idempotent: this call has no idea whether the service it
 	// targets is already stopped.
 	w.runStartupReleaseHooks(ctx)
-	go w.heartbeatLoop(ctx)
 	w.pollLoop(ctx)
 
 	// ctx is done: stop waiting for new work, but a job already running here
@@ -150,6 +183,13 @@ func (w *Worker) Start(ctx context.Context) error {
 			slog.Error("shutdown grace period expired with jobs still running; abandoning them", "jobs", abandoned)
 		}
 	}
+
+	// Jobs are done (or given up on), so any release those jobs armed is now
+	// sitting on a bare timer goroutine nothing waits for. Fire them here,
+	// bounded: returning without doing so is what leaves a cleanly stopped
+	// node with the operator's inference server still stopped and no job
+	// running — a state nothing but a restart heals.
+	w.drainPendingReleases(releaseDrainBudget)
 	return ctx.Err()
 }
 
@@ -232,16 +272,33 @@ func (w *Worker) register(ctx context.Context) error {
 // A failure here is logged the same way any other release-hook failure is:
 // loudly, but never as a reason to refuse to start.
 func (w *Worker) runStartupReleaseHooks(ctx context.Context) {
+	// The pass as a whole is bounded, not just each hook in it. Per-device
+	// timeouts alone make the worst case the SUM over every device this host
+	// declares, which on an 8-GPU box with the default 60s timeout is eight
+	// minutes of a worker that has registered but never polled — and a
+	// controller that has long since marked its devices unknown. A budget
+	// here turns "startup may be delayed by an unknown amount" into "startup
+	// is delayed by at most this". Whatever the budget cuts short is exactly
+	// what the NEXT start's pass will attempt again, and a release hook is
+	// required to be idempotent precisely so that is safe.
+	ctx, cancel := context.WithTimeout(ctx, startupReleaseBudget)
+	defer cancel()
+
 	for deviceID, spec := range w.hooks {
 		if spec.onRelease == "" {
 			continue
+		}
+		if err := ctx.Err(); err != nil {
+			slog.Error("startup release pass exceeded its budget; remaining devices skipped",
+				"device", deviceID, "budget", startupReleaseBudget)
+			return
 		}
 		out, err := w.runHook(ctx, spec.onRelease, "release", deviceID, "", "", spec.timeout)
 		if err != nil {
 			slog.Error("startup release hook failed", "device", deviceID, "err", err, "output_tail", tailOutput(out))
 			continue
 		}
-		slog.Info("startup release hook ran", "device", deviceID)
+		slog.Debug("startup release hook ran", "device", deviceID)
 	}
 }
 
@@ -249,25 +306,60 @@ func (w *Worker) runStartupReleaseHooks(ctx context.Context) {
 // quarantines the device unhealthy with quarantine reason "fault" — the one
 // kind a proven reboot does not clear, because a reboot proves no process
 // survived but nothing about the hardware (or, here, the service the hook
-// couldn't stop). Unlike the terminal job report, this is not retried: it is
-// a best-effort nudge, not the call the device's lease depends on, and a
-// worker must never let an HTTP failure make it hold up or abandon anything
-// it is actually supervising.
+// couldn't stop).
+//
+// It is retried on exactly the same budget as the terminal job report,
+// because it carries the same weight: it is the only thing standing between
+// a device the hook has just said is unusable and the next job the
+// controller schedules onto it. A single dropped attempt used to leave the
+// device schedulable while this worker logged nothing but one line — the
+// next job lands on a GPU whose VRAM is still held, which is the OOM this
+// project exists to prevent.
+//
+// A 4xx is not retried: an unknown device (404), a rejected token (401/403)
+// or a malformed body (400) will answer the same way five times over. Only
+// transport failures and 5xx — the transient kinds — are worth another
+// attempt.
 func (w *Worker) reportFault(ctx context.Context, deviceID, reason string) {
 	payload, err := json.Marshal(map[string]string{"reason": reason})
 	if err != nil {
 		slog.Error("marshal fault report", "device", deviceID, "err", err)
 		return
 	}
+
+	backoff := 200 * time.Millisecond
+	for attempt := 1; attempt <= terminalReportAttempts; attempt++ {
+		attemptCtx, cancel := context.WithTimeout(ctx, terminalReportAttemptTimeout)
+		ok, retryable := w.postFault(attemptCtx, deviceID, payload)
+		cancel()
+		if ok {
+			return
+		}
+		if !retryable || attempt == terminalReportAttempts {
+			break
+		}
+		time.Sleep(backoff)
+		backoff *= 2
+	}
+	slog.Error("device fault report failed; the device stays schedulable despite a failed acquire hook",
+		"device", deviceID)
+}
+
+// postFault makes one fault-report attempt. It reports whether the
+// controller accepted it and, if not, whether trying again could plausibly
+// help.
+func (w *Worker) postFault(ctx context.Context, deviceID string, payload []byte) (ok, retryable bool) {
 	resp, err := w.do(ctx, http.MethodPost, "/v1/devices/"+deviceID+"/fault", bytes.NewReader(payload))
 	if err != nil {
-		slog.Error("report device fault failed", "device", deviceID, "err", err)
-		return
+		slog.Warn("report device fault failed", "device", deviceID, "err", err)
+		return false, true
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode/100 != 2 {
-		slog.Error("report device fault rejected", "device", deviceID, "status", resp.Status)
+	if resp.StatusCode/100 == 2 {
+		return true, false
 	}
+	slog.Error("report device fault rejected", "device", deviceID, "status", resp.Status)
+	return false, resp.StatusCode/100 == 5
 }
 
 // supervisedJobIDs is what this worker tells the controller it is actually
@@ -511,8 +603,29 @@ func (w *Worker) execute(ctx context.Context, a assignment) {
 	// was never released — before this job ever touches it. spec is looked
 	// up once here and reused below for scheduleRelease, so both halves of
 	// this job's hook lifecycle agree on the same timeout/linger.
+	// jobCtx, not ctx: the hook is supervised like the job it is running for,
+	// so `rc kill` and a worker shutdown both reach it — and, crucially, so
+	// the failure below can tell "the hook says this GPU isn't free" from
+	// "we interrupted the hook ourselves".
 	spec := w.hooks[a.DeviceID]
-	if acq := w.acquireDevice(ctx, a.DeviceID, spec, a.JobID, a.Submitter); acq.err != nil {
+	acq := w.acquireDevice(jobCtx, a.DeviceID, spec, a.JobID, a.Submitter)
+	if acq.err != nil {
+		// A hook we cancelled ourselves — a shutdown, or a kill for this very
+		// job — is not evidence of anything about the device. Reporting a
+		// fault here quarantines the GPU with the one quarantine reason a
+		// reboot deliberately does not clear, so a `systemctl restart
+		// rc-worker` landing mid-hook would brick the device until an admin
+		// noticed and ran `rc clear`. Report the job through the same
+		// terminal path a kill uses and leave the device alone.
+		if jobCtx.Err() != nil {
+			slog.Warn("acquire hook cancelled; job not started, device not faulted",
+				"job", a.JobID, "device", a.DeviceID, "err", acq.err)
+			w.reportTerminalWithRetry(reportCtx, a.JobID, map[string]any{
+				"state": model.JobKilled, "worker_id": w.workerID,
+				"reason": "cancelled during acquire hook: " + acq.err.Error(),
+			})
+			return
+		}
 		// The acquire hook failed (non-zero exit or timeout): the job never
 		// runs at all, it is reported failed with the hook's own output as
 		// the reason so the operator sees why from `rc ps`, and the device
@@ -591,7 +704,14 @@ func (w *Worker) execute(ctx context.Context, a assignment) {
 	// assignment for this device arrives before it fires, acquireDevice
 	// cancels it and this job's release never runs at all, which is exactly
 	// the point: the device was never actually idle in between.
-	w.scheduleRelease(a.DeviceID, spec, a.JobID, a.Submitter)
+	//
+	// acq.epoch is this job's proof that it still owns the device. The
+	// terminal report above can take up to ~28s when its response is lost,
+	// and the controller frees the device the moment the report lands — so
+	// by the time this line runs, a later job may already hold it. Passing
+	// the epoch is what makes that case a no-op instead of a release firing
+	// on top of a running job.
+	w.scheduleRelease(a.DeviceID, spec, a.JobID, a.Submitter, acq.epoch)
 }
 
 // terminalReportAttempts bounds how many times reportTerminalWithRetry will

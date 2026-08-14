@@ -15,6 +15,9 @@ import (
 const (
 	defaultHookTimeout   = 60 * time.Second
 	defaultReleaseLinger = 30 * time.Second
+
+	defaultHeartbeatInterval = 10 * time.Second
+	defaultPollWait          = 30 * time.Second
 )
 
 type Config struct {
@@ -74,6 +77,50 @@ func (d *DeviceConfig) UnmarshalYAML(value *yaml.Node) error {
 	return nil
 }
 
+// withDefaults resolves every documented fallback in a Config, whatever
+// route that Config arrived by. LoadConfig calls it, and so does New — a
+// Config built in code (an embedded worker, a test, a future `rc worker`
+// flag path) must never end up with a zero hook timeout, because a zero
+// timeout means no MaxRuntime at all, which means a wedged hook runs
+// forever: the startup pass then blocks Start indefinitely and the worker
+// never polls. "Unset" must always mean the documented default, never
+// "unbounded".
+//
+// It is idempotent: applying it to an already-defaulted Config changes
+// nothing, so LoadConfig calling it and then New calling it again is fine.
+func (c Config) withDefaults() Config {
+	hostHookTimeout := c.Hooks.Timeout
+	if hostHookTimeout <= 0 {
+		hostHookTimeout = defaultHookTimeout
+	}
+	hostReleaseLinger := c.Hooks.ReleaseLinger
+	if hostReleaseLinger <= 0 {
+		hostReleaseLinger = defaultReleaseLinger
+	}
+	c.Hooks.Timeout = hostHookTimeout
+	c.Hooks.ReleaseLinger = hostReleaseLinger
+
+	devices := make([]DeviceConfig, len(c.Devices))
+	copy(devices, c.Devices) // never mutate the caller's slice
+	for i := range devices {
+		if devices[i].HookTimeout <= 0 {
+			devices[i].HookTimeout = hostHookTimeout
+		}
+		if devices[i].ReleaseLinger <= 0 {
+			devices[i].ReleaseLinger = hostReleaseLinger
+		}
+	}
+	c.Devices = devices
+
+	if c.HeartbeatInterval <= 0 {
+		c.HeartbeatInterval = defaultHeartbeatInterval
+	}
+	if c.PollWait <= 0 {
+		c.PollWait = defaultPollWait
+	}
+	return c
+}
+
 // LoadConfig reads /etc/rc/worker.yaml (or another path) and applies defaults.
 func LoadConfig(path string) (Config, error) {
 	b, err := os.ReadFile(path)
@@ -97,16 +144,7 @@ func LoadConfig(path string) (Config, error) {
 	if len(c.Devices) == 0 {
 		return Config{}, fmt.Errorf("at least one device required in %s", path)
 	}
-	hostHookTimeout := c.Hooks.Timeout
-	if hostHookTimeout <= 0 {
-		hostHookTimeout = defaultHookTimeout
-	}
-	hostReleaseLinger := c.Hooks.ReleaseLinger
-	if hostReleaseLinger <= 0 {
-		hostReleaseLinger = defaultReleaseLinger
-	}
-
-	for i, d := range c.Devices {
+	for _, d := range c.Devices {
 		if d.Name == "" {
 			return Config{}, fmt.Errorf("device entry needs a name in %s", path)
 		}
@@ -132,18 +170,9 @@ func LoadConfig(path string) (Config, error) {
 		if d.OnRelease != "" && strings.TrimSpace(d.OnRelease) == "" {
 			return Config{}, fmt.Errorf("device %q: on_release must not be blank, in %s", d.Name, path)
 		}
-		if d.HookTimeout <= 0 {
-			c.Devices[i].HookTimeout = hostHookTimeout
-		}
-		if d.ReleaseLinger <= 0 {
-			c.Devices[i].ReleaseLinger = hostReleaseLinger
-		}
 	}
-	if c.HeartbeatInterval <= 0 {
-		c.HeartbeatInterval = 10 * time.Second
-	}
-	if c.PollWait <= 0 {
-		c.PollWait = 30 * time.Second
-	}
-	return c, nil
+	// Every documented fallback — hook timeout, release linger, heartbeat
+	// interval, poll wait — lives in one place, applied here and again in
+	// New for a Config that never came through this function.
+	return c.withDefaults(), nil
 }

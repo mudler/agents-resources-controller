@@ -43,6 +43,21 @@ type deviceHookState struct {
 	// run the release hook for a device that was, by then, already
 	// reacquired.
 	gen int64
+	// epoch identifies WHICH job currently owns the device. It is bumped by
+	// every acquireDevice call that leaves the device held — including the
+	// one that skips the hook because an earlier job still holds it, since
+	// that call is precisely what transfers ownership to the newer job. A
+	// job carries the epoch its own acquire returned and hands it back at
+	// scheduleRelease; a mismatch means a later job owns the device now and
+	// this job's release is void.
+	//
+	// gen cannot serve this purpose: gen distinguishes one *timer* from
+	// another (a stale AfterFunc firing as it is cancelled), and it cannot
+	// see the inversion where a finished job arms a release AFTER a
+	// subsequent job has already acquired — at that moment there is no timer
+	// to be stale, and st.held is true for a reason that has nothing to do
+	// with the job doing the arming.
+	epoch int64
 	// pendingJobID/pendingSubmitter identify the job whose end scheduled
 	// the currently pending release timer, so the release hook's
 	// RC_JOB_ID/RC_SUBMITTER reflect the job that actually triggered it.
@@ -95,21 +110,33 @@ func (w *Worker) runHook(ctx context.Context, path, event, deviceID, jobID, subm
 	}, &buf)
 	out := buf.String()
 
-	slog.Info("hook ran", "event", event, "device", deviceID, "job", jobID, "path", path,
-		"exit_code", res.ExitCode, "killed", res.Killed, "output", out)
-
+	var err error
 	switch {
 	case res.Err != nil:
-		return out, fmt.Errorf("hook %s: %w", path, res.Err)
+		err = fmt.Errorf("hook %s: %w", path, res.Err)
 	case res.Killed:
 		reason := res.Reason
 		if reason == "" {
 			reason = "killed"
 		}
-		return out, fmt.Errorf("hook %s: %s", path, reason)
+		err = fmt.Errorf("hook %s: %s", path, reason)
 	case res.ExitCode != 0:
-		return out, fmt.Errorf("hook %s: exited %d", path, res.ExitCode)
+		err = fmt.Errorf("hook %s: exited %d", path, res.ExitCode)
 	}
+
+	// A hook that did its job has nothing to say at INFO on every single
+	// acquire and release — an operator's stop-LocalAI script can be chatty,
+	// and on a busy box that output is pure noise in the worker's log. It is
+	// kept at debug so it can be turned back on when a hook misbehaves, and
+	// logged at error, in full, whenever the hook actually failed: that is
+	// the one case where the output is the diagnosis.
+	if err != nil {
+		slog.Error("hook failed", "event", event, "device", deviceID, "job", jobID, "path", path,
+			"exit_code", res.ExitCode, "killed", res.Killed, "err", err, "output", out)
+		return out, err
+	}
+	slog.Debug("hook ran", "event", event, "device", deviceID, "job", jobID, "path", path,
+		"exit_code", res.ExitCode, "output", out)
 	return out, nil
 }
 
@@ -129,12 +156,19 @@ func (w *Worker) hookState(deviceID string) *deviceHookState {
 }
 
 // acquireResult is what acquireDevice decided: whether it ran the on_acquire
-// hook at all (a no-op skip vs. an actual attempt), its output, and whether
-// it failed.
+// hook at all (a no-op skip vs. an actual attempt), its output, whether it
+// failed, and the acquire epoch now in force for the device — the caller's
+// proof, when it later releases, that it is still the device's owner.
 type acquireResult struct {
 	ranHook bool
 	output  string
 	err     error
+	// epoch is the device's acquire epoch established (or, when the hook was
+	// skipped because the device was already held, transferred) by this
+	// call. It must be handed back to scheduleRelease unchanged. Zero on
+	// failure, and for a device with no hooks configured at all, where
+	// scheduleRelease is a no-op regardless.
+	epoch int64
 }
 
 // acquireDevice is called before a job touches its device. If the device is
@@ -160,13 +194,19 @@ func (w *Worker) acquireDevice(ctx context.Context, deviceID string, spec hookSp
 	st.gen++ // invalidate any fireRelease race from the timer just stopped
 
 	if st.held {
-		return acquireResult{}
+		// The device was never released, so no hook runs — but THIS job is
+		// the device's owner from here on, and the epoch says so. Whatever
+		// held it before (a job whose own scheduleRelease may still be
+		// stuck behind a retrying terminal report) can no longer release it.
+		st.epoch++
+		return acquireResult{epoch: st.epoch}
 	}
 	if spec.onAcquire == "" {
 		// Nothing to run, but the device is now considered held so a
 		// configured on_release still fires once it goes idle.
 		st.held = true
-		return acquireResult{}
+		st.epoch++
+		return acquireResult{epoch: st.epoch}
 	}
 
 	out, err := w.runHook(ctx, spec.onAcquire, "acquire", deviceID, jobID, submitter, spec.timeout)
@@ -174,7 +214,8 @@ func (w *Worker) acquireDevice(ctx context.Context, deviceID string, spec hookSp
 		return acquireResult{ranHook: true, output: out, err: err}
 	}
 	st.held = true
-	return acquireResult{ranHook: true, output: out}
+	st.epoch++
+	return acquireResult{ranHook: true, output: out, epoch: st.epoch}
 }
 
 // scheduleRelease is called once a job on this device ends, for any outcome.
@@ -185,7 +226,16 @@ func (w *Worker) acquireDevice(ctx context.Context, deviceID string, spec hookSp
 // identify the job that triggered this particular scheduling; if the timer
 // is later superseded by a subsequent job ending, that job's identity
 // replaces these for the eventual release.
-func (w *Worker) scheduleRelease(deviceID string, spec hookSpec, jobID, submitter string) {
+//
+// epoch is what the job's own acquireDevice returned. A job's end says
+// nothing about a device it no longer owns: if the epoch has moved on, a
+// later job acquired the device in the meantime — routinely, when this job's
+// terminal report response was lost and reportTerminalWithRetry burned its
+// retry budget while the controller had already freed the device and handed
+// the next job out — and arming anything here would restart the operator's
+// service on top of a running job. That release is simply void; the owner
+// that superseded it will release when it ends.
+func (w *Worker) scheduleRelease(deviceID string, spec hookSpec, jobID, submitter string, epoch int64) {
 	if !spec.configured() {
 		return
 	}
@@ -198,6 +248,11 @@ func (w *Worker) scheduleRelease(deviceID string, spec hookSpec, jobID, submitte
 		// to acquire in the first place) — nothing to release.
 		return
 	}
+	if st.epoch != epoch {
+		slog.Info("release skipped: the device was re-acquired by a later job",
+			"device", deviceID, "job", jobID, "job_epoch", epoch, "device_epoch", st.epoch)
+		return
+	}
 	if st.timer != nil {
 		st.timer.Stop()
 	}
@@ -206,7 +261,7 @@ func (w *Worker) scheduleRelease(deviceID string, spec hookSpec, jobID, submitte
 	st.pendingJobID = jobID
 	st.pendingSubmitter = submitter
 	st.timer = time.AfterFunc(spec.releaseLinger, func() {
-		w.fireRelease(deviceID, spec, gen)
+		w.fireRelease(context.Background(), deviceID, spec, gen)
 	})
 }
 
@@ -216,13 +271,15 @@ func (w *Worker) scheduleRelease(deviceID string, spec hookSpec, jobID, submitte
 // this generation is stale and fireRelease does nothing — the newer call
 // already took over (or will take over) responsibility for this device.
 //
-// Deliberately uses context.Background(), not any request or job context:
-// this runs off a bare timer goroutine, nothing hands it a context, and a
-// worker shutdown must not be what decides whether the release hook gets to
-// run — if it doesn't finish before the process exits, the crash-safety
-// startup pass (runStartupReleaseHooks) covers it on the next start, which
-// is exactly why that pass requires the hook to be idempotent.
-func (w *Worker) fireRelease(deviceID string, spec hookSpec, gen int64) {
+// The timer path passes context.Background(): a job's own context ending is
+// what triggered the release in the first place, so it must not be what
+// cancels it. The shutdown drain (drainPendingReleases) passes a bounded
+// context instead, because there it is the drain's own budget — not the
+// worker's liveness — that decides how long a slow hook may hold up the
+// exit. Either way, a release that never finishes is covered by the
+// crash-safety startup pass (runStartupReleaseHooks) on the next start,
+// which is exactly why that pass requires the hook to be idempotent.
+func (w *Worker) fireRelease(ctx context.Context, deviceID string, spec hookSpec, gen int64) {
 	st := w.hookState(deviceID)
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -234,7 +291,7 @@ func (w *Worker) fireRelease(deviceID string, spec hookSpec, gen int64) {
 	jobID, submitter := st.pendingJobID, st.pendingSubmitter
 
 	if spec.onRelease != "" {
-		out, err := w.runHook(context.Background(), spec.onRelease, "release", deviceID, jobID, submitter, spec.timeout)
+		out, err := w.runHook(ctx, spec.onRelease, "release", deviceID, jobID, submitter, spec.timeout)
 		if err != nil {
 			// Release failure is never a scheduling problem: the device is
 			// genuinely free (the job that held it is long done), so it
@@ -245,4 +302,58 @@ func (w *Worker) fireRelease(deviceID string, spec hookSpec, gen int64) {
 		}
 	}
 	st.held = false
+}
+
+// releaseDrainBudget bounds the whole shutdown drain: every pending release
+// across every device, together. It is deliberately well under a single
+// device's default hook timeout (60s): a shutdown already spends up to
+// shutdownGrace waiting on jobs, so the drain has to be a known, small
+// addition to that rather than a second open-ended wait. A hook that
+// does not finish inside it is killed like any over-budget job's process
+// group and left to the next start's reconciliation pass — the same
+// crash-safety net that has always covered a worker that died mid-linger.
+//
+// A var, not a const, so tests can shrink it.
+var releaseDrainBudget = 20 * time.Second
+
+// drainPendingReleases fires every armed-but-not-yet-fired release, now,
+// without waiting out the remaining linger. It is the shutdown counterpart
+// to the timers scheduleRelease arms: those live on bare time.AfterFunc
+// goroutines that nothing waits for, so a clean `systemctl stop rc-worker`
+// after a job would otherwise return with the operator's inference server
+// still stopped and no job running — a state only a restart heals. Stopping
+// the worker should leave the node the way the operator expects to find it.
+//
+// Devices with nothing pending are skipped, so a worker with no hooks (or
+// none armed) pays nothing at shutdown.
+func (w *Worker) drainPendingReleases(budget time.Duration) {
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
+
+	w.hooksMu.Lock()
+	ids := make([]string, 0, len(w.deviceHooks))
+	for id := range w.deviceHooks {
+		ids = append(ids, id)
+	}
+	w.hooksMu.Unlock()
+
+	for _, deviceID := range ids {
+		st := w.hookState(deviceID)
+		st.mu.Lock()
+		if st.timer == nil {
+			st.mu.Unlock()
+			continue // nothing pending, or its release already ran
+		}
+		st.timer.Stop()
+		st.timer = nil
+		// Bump the generation before firing: a timer that fired in the same
+		// instant we stopped it is now stale and will no-op instead of
+		// running the release hook a second time behind us.
+		st.gen++
+		gen := st.gen
+		st.mu.Unlock()
+
+		slog.Info("firing pending release before shutdown", "device", deviceID)
+		w.fireRelease(ctx, deviceID, w.hooks[deviceID], gen)
+	}
 }
