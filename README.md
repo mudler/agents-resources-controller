@@ -6,24 +6,25 @@ Replaces a `flock` file mutex: a central controller owns allocation in a
 single SQLite transaction, workers on device hosts supervise the jobs, and
 `rc ps` / `rc devices` show who holds what.
 
-## Stage 1 scope
+## Scope
 
-Exclusive device leases, supervised job execution, live log streaming, and
-fleet visibility. **There is no queue yet** — a busy device is refused
-immediately with `no_device_available`.
+Exclusive device leases, supervised job execution, live log streaming, fleet
+visibility, a queue with priorities, per-device runtime watchdogs, lease
+expiry, boot-identity recovery, server-side cancellation (`rc kill`),
+re-attaching to a running job's output (`rc attach`), a live SSE event
+stream, and a read-only web dashboard.
 
 **Not built yet**, so you will not find them documented below:
 
-| Not in Stage 1 | What you do instead today |
+| Not built yet | What you do instead today |
 |---|---|
-| Web dashboard | `rc devices`, `rc ps`, or `GET /v1/state` |
 | Capability probes (`/etc/rc/probe.d/*.sh`) and device labels | List device names in `worker.yaml` |
 | Per-host usage sheet (`/etc/rc/host.md`) and `rc describe` | Keep host notes wherever you keep them now |
 | Device selectors (`--select 'vram>=40G'`) | Address a device by exact ID: `-d gpubox:gpu0` |
-| Queue and priorities | Retry, or pick another device |
-| Watchdogs (max runtime, idle timeout) | Nothing stops a hung job holding its GPU |
-| `rc kill`, `rc attach`, `rc hold` | Ctrl-C detaches; the job keeps running |
+| `rc hold` | Submit a placeholder job that just sleeps, then `rc kill` it |
 | Verify probes between jobs | Nothing checks VRAM was released after a job |
+| Webhook notifications | Poll `rc ps` / `rc devices`, or watch `/v1/events` |
+| Dashboard actions (kill/hold from the browser) | `rc kill` from a terminal; the dashboard is read-only |
 
 ## Controller
 
@@ -45,6 +46,23 @@ rc: duplicate token "wtok" in RC_TOKENS
 
 `--data` holds the SQLite database and the append-only per-job log files;
 back that directory up if you care about job history.
+
+**`rc serve` is doing work even when idle.** Besides answering requests, it
+runs two background loops for as long as it's up: a reaper sweeps every 10s
+for workers that have gone quiet, and a scheduler sweeps every second for
+queued jobs that can now be handed to a device that just freed up (a job
+finishing, a worker re-registering). The scheduler is also why a submit onto
+a free device is assigned immediately without waiting for that sweep — every
+submit makes its own scheduling pass too — but it is the periodic loop that
+notices a device freeing up *later* and hands the next queued job to it.
+
+**Upgrade the controller and all workers together — they are not
+independently upgradeable.** A stale worker speaking the old wire format
+fails to poll a newer controller right away, and any jobs it still had in
+flight get marked `lost`, quarantining their devices `unhealthy` until an
+admin clears each one. Nothing is double-allocated in the meantime — an
+`unhealthy` device is unschedulable — so recovery is just one
+`POST /v1/devices/{id}/clear` per affected device.
 
 ### Running the controller in Docker
 
@@ -77,7 +95,7 @@ that runs commands on your GPU hosts. Two consequences worth taking
 seriously: use generated tokens (`openssl rand -hex 24`), never the values
 in `.env.example`; and put the controller behind a tunnel (Cloudflare,
 Tailscale), a VPN, or a private network, because bearer tokens cross the
-wire in the clear and stage 1 terminates no TLS of its own. On a machine
+wire in the clear and the controller terminates no TLS of its own. On a machine
 with a public interface, bind it back to a private address or a loopback
 plus tunnel instead.
 
@@ -94,7 +112,17 @@ controller_url: https://rc.internal.example
 token: replace-with-worker-token
 # host defaults to the machine's hostname; device IDs become <host>:<name>
 devices:
-  - gpu0
+  # Object form: max_runtime is a per-device runtime ceiling the controller
+  # enforces at submit time and the worker enforces as a wall-clock watchdog
+  # while the job runs. A job that asks for more than this (rc run
+  # --max-runtime, or the API's max_runtime_seconds) is REJECTED at submit
+  # time, not silently clamped down to fit — see "Guarantees" below.
+  # A job that requests no ceiling of its own inherits this one.
+  - name: gpu0
+    max_runtime: 6h
+  # Plain name form still works: it is shorthand for {name: gpu1} with no
+  # ceiling, so jobs on gpu1 run unbounded unless they set their own
+  # --max-runtime.
   - gpu1
 heartbeat_interval: 10s
 poll_wait: 30s
@@ -107,7 +135,7 @@ rc worker
 # or: rc worker --config /path/to/worker.yaml
 ```
 
-That file is the whole of a node's configuration in stage 1. There is no
+That file is the whole of a node's configuration. There is no
 auto-detection: the controller knows only the device names you list, with no
 labels, no VRAM figures, no driver versions, and no per-host notes. If you
 list `gpu0` and `gpu1` on a four-GPU box, the other two do not exist as far
@@ -135,22 +163,49 @@ die and for their terminal report — job state `killed`, reason `cancelled`
 exists so the controller learns the job's real outcome and releases the
 device cleanly, not so the job survives; a `systemctl restart` (or any other
 SIGTERM) of `rc worker` during a multi-hour job kills that job. There is no
-way in stage 1 to detach a job from a specific worker process and hand it to
-a replacement — the worker that started a job is the one supervising it for
+way to detach a job from a specific worker process and hand it to a
+replacement — the worker that started a job is the one supervising it for
 its entire life.
 
-**A worker that never got to run that shutdown sequence — killed -9, host
-power loss, an OOM of the worker process itself — leaves the controller
+**A worker that never got to run that shutdown sequence — killed -9, an OOM
+of the worker process itself, a crashed host — leaves the controller
 believing the job is still assigned or running.** Registration reconciles
 this: when a worker registers, it is announcing (truthfully, since it is a
-fresh process) that it has no running jobs. Any job the controller still has
-this worker ID down as `assigned` or `running` is marked `lost`, its lease
-is released, and — critically — its device comes back `unhealthy`, never
-`ready` and never left `busy` forever. A device is never handed back to the
-pool on the strength of "the old process is gone now"; nothing proves an
-orphaned process from that process isn't still pinning it. Clearing it is
-the same explicit `POST /v1/devices/{id}/clear` used for any other
-unhealthy device.
+fresh process) that it has no running jobs, so any job the controller still
+has this worker ID down as `assigned` or `running` is marked `lost` and its
+lease released. What happens to the *device* next depends on whether the
+worker can prove the host actually rebooted:
+
+- **A worker process restart without a reboot quarantines `unhealthy` only
+  the devices that had a stranded `assigned`/`running` job on them — a
+  device that was idle when the worker died comes back `ready`, same as
+  before.** For a device that did have a live job, the worker sends the
+  same boot ID (`/proc/sys/kernel/random/boot_id`) it always has, which
+  proves nothing about whatever the old process left running — an orphaned
+  CUDA process from a `kill -9`'d worker can still be pinning that GPU. That
+  device is never handed back to the pool on the strength of "the old
+  process is gone now"; it stays `unhealthy` until an operator clears it
+  explicitly: `POST /v1/devices/{id}/clear` (that call only succeeds when
+  the device is currently `unhealthy` **and** has no live lease).
+- **A host that reboots gets its devices back `ready` automatically, however
+  long it was down.** A changed boot ID at registration is proof the machine
+  actually restarted, so nothing from before the reboot can still be running
+  or holding VRAM — a reboot is the one event that positively proves a device
+  is clean, not just that a process went quiet. This covers the ordinary
+  case of a box rebooted overnight or held down for maintenance, where the
+  reaper has long since quarantined every device on it: recovery is decided
+  by *why* each device was quarantined, not by whether a job was still in
+  flight when the host came back.
+  What a reboot does **not** do is resurrect a device that was quarantined by
+  a self-reported hardware fault. A reboot proves no process survived; it
+  proves nothing about the hardware. So a device the host itself reported
+  faulty stays `unhealthy` until a human clears it, and so does any device
+  quarantined before this bookkeeping existed (an upgrade from an older
+  database records no reason, and an unknown cause is never assumed benign).
+
+A worker with no boot ID at all (the `/proc` file unreadable, e.g. inside
+some containers) is treated the same as an unchanged one: no proof, so it
+quarantines rather than guesses.
 
 The job's environment receives `RC_JOB_ID` and `RC_DEVICE` (the assigned
 device ID), plus `CUDA_VISIBLE_DEVICES` derived by convention: **device
@@ -186,31 +241,126 @@ $ echo $?
 3
 ```
 
-If the device is already held, `rc run` fails immediately — stage 1 has no
-queue:
+**`rc run` blocks by default: if the device is busy, it queues instead of
+failing.** It prints the queue position as it changes and starts streaming
+as soon as a device frees up and the job is scheduled onto it — this is a
+real queue behind the device, not a client-side retry loop:
 
 ```
 $ rc run -d gpubox:gpu0 -- true
-rc: gpubox:gpu0 is busy (stage 1 has no queue — retry or pick another device)
+rc: queued at position 1 for gpubox:gpu0
+rc: job 24880200-a51a-479e-b668-f9a801b2ad4f on gpubox:gpu0
 ```
 
-**Ctrl-C detaches, it does not cancel the job.** The worker owns the process
-and its lease, not the client that submitted it, so losing the terminal (or
-pressing Ctrl-C on purpose) must never free a GPU that a process is still
-using. The job keeps running and keeps holding the device; `rc run` prints
-where things stand and exits with status 130:
+Two flags change that default. `--no-wait` restores the old fail-fast
+behaviour — a busy device is refused immediately instead of queuing:
 
 ```
-$ rc run -d gpubox:gpu0 -- sh -c 'sleep 15'
-rc: job bfbf7d29-9306-41da-9a9f-413026b7361e on gpubox:gpu0
+$ rc run -d gpubox:gpu0 --no-wait -- true
+rc: gpubox:gpu0 is busy and could not be queued
+```
+
+`--timeout` bounds how long `rc run` will wait in the queue before giving up
+and cancelling the job on its own — useful in scripts that would rather fail
+fast than wait indefinitely behind someone else's job:
+
+```
+$ rc run -d gpubox:gpu0 --timeout 3s -- true
+rc: queued at position 1 for gpubox:gpu0
+rc: cancelled queued job 18b9e6e0-4900-47be-b2c0-392f3746b83d
+rc: gave up waiting for gpubox:gpu0: context deadline exceeded
+```
+
+**Ctrl-C on a QUEUED job cancels it.** Nothing is running yet, so there is
+no lease to protect — cancelling is always safe, and `rc run` reports the
+cancellation and exits 130:
+
+```
+$ rc run -d gpubox:gpu0 -- true
+rc: queued at position 1 for gpubox:gpu0
 ^C
-rc: detached from job bfbf7d29-9306-41da-9a9f-413026b7361e — it is STILL RUNNING on gpubox:gpu0 and holds it until it finishes. Watch it with: rc ps
+rc: cancelled queued job 65a95e7a-b76b-463a-b718-44c26df58573
 ```
 
-Server-side cancellation (`rc kill`) does not exist yet — it is a later
-stage. Until then, the only ways a device comes back are the job finishing
-on its own, or stopping the worker process on the device host — which, as
-described above, kills the job rather than merely detaching from it.
+**Ctrl-C on a RUNNING job only detaches — it does not cancel it.** The
+worker, not the client, owns the process and its lease once a job is
+running, so losing the terminal (or pressing Ctrl-C on purpose) must never
+free a GPU that a process is still using. The job keeps running and keeps
+holding the device; `rc run` prints where things stand and exits 130:
+
+```
+$ rc run -d gpubox:gpu0 -- sh -c 'sleep 30'
+rc: job e8720e80-ccf2-4b06-a442-c1348553585e on gpubox:gpu0
+^C
+rc: detached from job e8720e80-ccf2-4b06-a442-c1348553585e — it is STILL RUNNING on gpubox:gpu0 and holds it until it finishes. Watch it with: rc ps
+```
+
+That distinction — cancel while queued, detach-only while running — is
+surprising until you know the reason: nothing is holding a device for a
+queued job, but a worker process really is holding one for a running job,
+and a dropped terminal must never be indistinguishable from "safe to free
+the GPU".
+
+`rc kill` reaches further than Ctrl-C: it works from any terminal (not just
+the one that ran `rc run`) and it actually terminates a *running* job, not
+just a queued one — the controller flags it and the worker SIGTERMs the
+process group, the same path an ordinary shutdown uses.
+
+**But `rc kill` is not a free-for-all: only the job's own submitter, or an
+admin token, may kill it.** The controller checks the `submitter` on the
+kill request against the job's recorded submitter (`defaultSubmitter()`
+embeds `$USER@$HOSTNAME`, plus a session ID when run as an agent) and
+refuses everyone else with 403, even from a perfectly valid client token:
+
+```
+$ rc kill 707b485b-8a91-4350-a327-d39df63250b3
+rc: not_job_owner: only the submitter or an admin may kill this job
+```
+
+That matters because the identity that submitted a job is very often not the
+operator who later needs to kill it — an agent submitted it under its own
+`--as` identity, or its session, and the human at the keyboard is neither.
+Two ways around it: assert the submitting identity with `--as` if you know
+it —
+
+```
+$ rc kill 707b485b-8a91-4350-a327-d39df63250b3 --as agent-x
+rc: kill requested for 707b485b-8a91-4350-a327-d39df63250b3
+```
+
+— or, the way an operator actually reaches for someone else's stuck job
+without knowing or spoofing their identity, use an admin token, which skips
+the ownership check entirely:
+
+```
+$ RC_TOKEN=<admin-token> rc kill 2ef79507-9cc7-49db-92b7-3ecfc8421d93
+rc: kill requested for 2ef79507-9cc7-49db-92b7-3ecfc8421d93
+```
+
+The kill is asynchronous for a running job (the worker has to actually stop
+the process), so a moment later the job shows up terminated and the device
+is back in the pool. The flag rides the worker's existing long poll, so it
+normally reaches the worker within milliseconds; if that response is lost it
+is re-offered every 30s rather than on every poll, so a kill for a job no
+worker is actually running costs one extra wake per interval instead of
+spinning the worker's poll loop at its floor rate:
+
+```
+$ rc devices
+DEVICE       STATE  HOLDER  ELAPSED  COMMAND
+gpubox:gpu0  ready  -       -        -
+```
+
+`rc attach` re-streams a job's output from the beginning — handy for
+watching a job someone else (or your own detached `rc run`) started. It is
+read-only: exiting it, by Ctrl-C or otherwise, never affects the job, since
+attach never held a lease in the first place:
+
+```
+$ rc attach 2cb5dcd8-6081-49d7-9384-e3226ab87120
+streaming
+done
+```
 
 `rc devices` shows the fleet, including devices whose worker has gone quiet:
 
@@ -220,21 +370,93 @@ DEVICE       STATE  HOLDER                    ELAPSED  COMMAND
 gpubox:gpu0  busy   mudler@mudler-ubuntu-box  15s      sh -c sleep 15
 ```
 
-`rc ps` shows the same information job-first, for the currently
-assigned/running jobs:
+`rc ps` shows the same information job-first: the currently
+assigned/running jobs, then the queue behind them with each job's position
+in its own device's queue. Queued jobs are listed because their IDs are
+otherwise unobtainable, and `rc kill` needs one:
 
 ```
 $ rc ps
-JOB                                   DEVICE       STATE    SUBMITTER                 COMMAND
-25147ef7-7bf4-40b9-9034-31e294e5be1a  gpubox:gpu0  running  mudler@mudler-ubuntu-box  sh -c sleep 30
+JOB                                   DEVICE       STATE        SUBMITTER                 COMMAND
+25147ef7-7bf4-40b9-9034-31e294e5be1a  gpubox:gpu0  running      mudler@mudler-ubuntu-box  sh -c sleep 30
+9d1c8a44-0f7a-4a1e-9e2e-2b4f2c0a1a77  gpubox:gpu0  queued (#1)  agent-b@builder           ./train
 ```
+
+## Dashboard
+
+The controller serves a read-only web dashboard at `/` — the same address
+`rc serve --addr` binds, no separate process or port. It shows the same
+picture as `rc devices` / `rc ps` in a browser: a card per device (state,
+current holder, elapsed time, and a `stale`/`alert` tint once a worker's
+heartbeat has gone quiet or a device has been quarantined `unhealthy`), the
+queue in priority order, and the currently running jobs. It refreshes on a
+poll plus a live SSE nudge, and shows how long ago its own snapshot was
+last refreshed so a disconnected browser tab does not quietly look current.
+
+**It is read-only.** There is no kill/hold/submit button anywhere on the
+page — the actions that touch a lease or a process still go through `rc
+kill` / `rc run` from a terminal. The page asks for a client token before
+showing anything, and that token is kept in the tab's `sessionStorage`
+only: it is never written to disk, never sent to any other tab or a new
+browser session, and is gone the moment the tab is closed. Reloading the
+page (in the same tab) keeps it; opening the dashboard in a second tab asks
+for the token again.
+
+The one exception to "tokens go in the `Authorization` header, never the
+URL" is `GET /v1/events`, the SSE stream the dashboard uses to know when to
+refresh: browsers' `EventSource` API cannot set request headers, so that
+route alone also accepts `?token=...` as a query parameter. Every other
+route — including `/v1/state`, which the dashboard actually reads its data
+from — still requires the header and rejects a query-string token.
 
 ## Guarantees
 
 - One live lease per device, enforced by a unique index in SQLite plus a
   single allocation transaction — not by convention and not by a file in
-  `/tmp`. A second `rc run`/submit against a held device is refused with
-  `no_device_available` at allocation time, before any job is created.
+  `/tmp`. A second `rc run`/submit against a held device never gets handed
+  the device too: by default it joins the queue (see below); with
+  `--no-wait`/`NoWait`, the job is still created (it gets a real ID and a
+  row in job history) but is immediately cancelled server-side and the
+  request answered with 409 `no_device_available` — so a `killed` job with
+  `kill_reason: "no-wait: device busy"` in history is expected and not a
+  sign anything went wrong; it just means a `--no-wait` submit found the
+  device taken.
+- Submitting onto a busy device queues it rather than failing, FIFO within a
+  priority tier (`--priority`, higher runs sooner, bounded to `-10..10` and
+  rejected with 400 `priority_out_of_range` outside it — it is a nudge
+  within one device's queue, not a scheduling language) — but **not** FIFO
+  *across* tiers: a higher-priority job submitted later jumps ahead of an
+  already-queued lower-priority one for the same device, every scheduling
+  pass, for as long as higher-priority work keeps arriving. A low-priority
+  job behind a steady stream of higher-priority submits can be starved
+  indefinitely; there is no aging or fairness mechanism yet. Within its own
+  tier, though, the controller schedules a queued job onto its device the
+  instant that device frees up — at submit time if it's already free, and
+  via a background scheduler loop (`rc serve` runs one every second) once it
+  frees up later. `rc kill` on a still-queued job cancels it outright;
+  nothing about the queue requires the submitting client to still be
+  connected.
+- A device can declare a `max_runtime` ceiling in `worker.yaml`. A job that
+  asks for more than the ceiling is rejected at submit time — never
+  silently clamped down to fit. The worker enforces the resulting limit
+  (its own, if set, or the device's) as a wall-clock watchdog once the job
+  is running, and separately enforces `--idle-timeout` (no stdout/stderr
+  progress for that long); either firing kills the job, marks it `killed`
+  with a `kill_reason` naming which limit fired (e.g. `max_runtime exceeded
+  (2s)`), and returns the device to the pool.
+- Every claimed device carries a lease with an expiry; the controller
+  actively reaps an expired lease rather than trusting it forever, so a
+  worker that vanishes mid-job without ever reporting back does not pin the
+  device indefinitely on the strength of a lease nobody is renewing. A
+  worker's heartbeat renews the leases of **the jobs it names in that
+  heartbeat**, not every job the controller has down against it: renewal
+  follows what the worker is actually supervising, so a job the worker has
+  no process for (e.g. one whose assignment response was lost in transit)
+  stops being renewed, expires, and is reclaimed — marked `lost` with reason
+  `lease expired`, its device quarantined `unhealthy` and clearable by an
+  admin. Otherwise a worker that stayed alive but never received a job could
+  keep that job's lease renewed forever, and the expiry backstop would never
+  fire for the one case that most needs it.
 - A disconnected client does not release the device: the worker owns the
   process and reports its outcome directly to the controller.
 - A worker that stops reporting has its devices marked `unknown` after 30s
@@ -248,11 +470,15 @@ JOB                                   DEVICE       STATE    SUBMITTER           
   currently `unhealthy` **and** has no live lease; called against a device
   in any other state (e.g. `ready`) it refuses with 409 rather than
   contradict the lease table.
-- A worker that registers is a fresh process, so registration reconciles: any
-  job that worker ID still had `assigned` or `running` is marked `lost`, its
-  lease released, and its device quarantined `unhealthy` — never handed back
-  as `ready`, never left `busy` with nothing left to release it. This is
-  what makes a `kill -9` of `rc worker`, not just its ordinary shutdown, safe
-  to restart from.
+- A worker that registers is a fresh process, so registration reconciles:
+  any job that worker ID still had `assigned` or `running` is marked
+  `lost` and its lease released. Its device's fate then depends on whether
+  the registration carries proof the host rebooted (a changed boot ID): if
+  so, the device comes back `ready` — a reboot proves nothing survived; if
+  not (an ordinary worker-process restart, or a crash with no reboot), the
+  device is quarantined `unhealthy` instead, since nothing proves an
+  orphaned process isn't still pinning it. Either way this is what makes a
+  `kill -9` of `rc worker`, not just its ordinary shutdown, safe to restart
+  from — see "Device host" above for the full three-way breakdown.
 - Jobs run in their own process group, so a kill takes the whole tree with
   it, including grandchildren that detached from the job's own stdio.

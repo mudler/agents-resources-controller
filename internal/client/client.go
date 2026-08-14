@@ -15,9 +15,19 @@ import (
 	"github.com/mudler/agents-resources-controller/internal/server"
 )
 
-// ErrNoDevice mirrors the controller's 409: nothing free right now. Stage 1
-// has no queue, so the caller decides whether to retry.
+// ErrNoDevice mirrors the controller's 409: nothing free right now. A plain
+// Submit queues instead of returning this; it only surfaces when the caller
+// passes NoWait, opting out of the queue in favor of an immediate answer.
 var ErrNoDevice = errors.New("no device available")
+
+// ErrNotCancellable mirrors the controller's 409 not_cancellable from
+// POST /v1/jobs/{id}/kill: the job raced onto a different state (started
+// running, or already finished) between the caller's last look and this
+// kill attempt. Exposed as a sentinel, rather than left for callers to
+// string-match the message, because rc run needs to tell this apart from
+// an ordinary kill failure: it means the job may now actually be running
+// unattended and deserves Stage 1's honest "STILL RUNNING" warning.
+var ErrNotCancellable = errors.New("job not cancellable")
 
 type Client struct {
 	baseURL string
@@ -41,6 +51,15 @@ type SubmitOptions struct {
 	Env            map[string]string
 	Submitter      string
 	IdempotencyKey string
+	// Priority orders queued jobs on the same device: higher runs sooner.
+	Priority int
+	// MaxRuntime and IdleTimeout are watchdog ceilings enforced by the
+	// worker (task 5); zero means "use the device's configured default".
+	MaxRuntime  time.Duration
+	IdleTimeout time.Duration
+	// NoWait opts out of stage 2's queue: a busy device fails fast with
+	// ErrNoDevice instead of the job sitting queued behind it.
+	NoWait bool
 }
 
 func (c *Client) do(ctx context.Context, method, path string, body io.Reader) (*http.Response, error) {
@@ -54,9 +73,28 @@ func (c *Client) do(ctx context.Context, method, path string, body io.Reader) (*
 }
 
 func (c *Client) Submit(ctx context.Context, opts SubmitOptions) (*model.Job, error) {
+	// The wire format (SubmitRequest.MaxRuntimeSeconds) is whole seconds; a
+	// positive but sub-second value would truncate to 0 and be silently
+	// treated as "no ceiling" at the controller instead of the tiny limit
+	// actually requested. Reject it here, at the one point that can still
+	// name what the caller asked for — matching the same rule the worker's
+	// own device config enforces (internal/worker/config.go) for exactly
+	// the same reason.
+	if opts.MaxRuntime > 0 && opts.MaxRuntime < time.Second {
+		return nil, fmt.Errorf(
+			"max_runtime %s is below the one-second granularity runtime ceilings are enforced at", opts.MaxRuntime)
+	}
+	if opts.IdleTimeout > 0 && opts.IdleTimeout < time.Second {
+		return nil, fmt.Errorf(
+			"idle_timeout %s is below the one-second granularity runtime ceilings are enforced at", opts.IdleTimeout)
+	}
 	payload, err := json.Marshal(server.SubmitRequest{
 		DeviceID: opts.DeviceID, Command: opts.Command, Cwd: opts.Cwd, Env: opts.Env,
 		Submitter: opts.Submitter, IdempotencyKey: opts.IdempotencyKey,
+		Priority:           opts.Priority,
+		MaxRuntimeSeconds:  int(opts.MaxRuntime.Seconds()),
+		IdleTimeoutSeconds: int(opts.IdleTimeout.Seconds()),
+		NoWait:             opts.NoWait,
 	})
 	if err != nil {
 		return nil, err
@@ -81,6 +119,15 @@ func (c *Client) Submit(ctx context.Context, opts SubmitOptions) (*model.Job, er
 }
 
 func (c *Client) Job(ctx context.Context, id string) (*model.Job, error) {
+	view, err := c.JobView(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	return &view.Job, nil
+}
+
+// JobView fetches a job together with its queue position.
+func (c *Client) JobView(ctx context.Context, id string) (*server.JobView, error) {
 	resp, err := c.do(ctx, http.MethodGet, "/v1/jobs/"+id, nil)
 	if err != nil {
 		return nil, err
@@ -89,11 +136,142 @@ func (c *Client) Job(ctx context.Context, id string) (*model.Job, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, apiError(resp)
 	}
-	var job model.Job
-	if err := json.NewDecoder(resp.Body).Decode(&job); err != nil {
+	var view server.JobView
+	if err := json.NewDecoder(resp.Body).Decode(&view); err != nil {
 		return nil, err
 	}
-	return &job, nil
+	return &view, nil
+}
+
+const (
+	// scheduledPollInterval, scheduledPollTimeout and
+	// maxScheduledPollFailures are WaitScheduled's own retry budget —
+	// deliberately separate from WaitTerminal's pollTimeout/pollInterval/
+	// maxPollFailures below, and tuned differently. WaitTerminal's 10s
+	// per-poll bound would take well over a minute to give up on a
+	// genuinely hung controller here (each of maxPollFailures+1 attempts
+	// blocking for the full 10s) — too slow to be a reasonable
+	// human-facing wait, and (before this was split out) the reason a
+	// test covering that exact scenario was impractical to write.
+	//
+	// Instant-failing polls (connection refused, a 500 during a restart)
+	// are tolerated for roughly maxScheduledPollFailures *
+	// scheduledPollInterval = 16 * 500ms = 8s of wall clock — comfortably
+	// more than the couple of seconds an ordinary controller restart
+	// takes.
+	//
+	// A hung connection (accepted, never answered — exactly a wedged
+	// controller) is bounded per attempt by scheduledPollTimeout and
+	// detected within roughly (maxScheduledPollFailures+1) *
+	// scheduledPollTimeout + maxScheduledPollFailures *
+	// scheduledPollInterval ≈ 17s + 8s = 25s worst case — bounded well
+	// under a minute, in production as well as in the test that exercises
+	// it.
+	scheduledPollInterval    = 500 * time.Millisecond
+	scheduledPollTimeout     = 1 * time.Second
+	maxScheduledPollFailures = 16
+)
+
+// WaitScheduled polls until the job leaves the queue, calling onPosition each
+// time its position changes so the caller can show progress.
+//
+// "Leaves the queue" is exactly what it returns on, which is NOT the same as
+// "was scheduled": a queued job can also be killed or cancelled, and that
+// too ends the wait and is returned with no error. Callers must look at the
+// state they get back before announcing a job as running — see
+// cli.NewRunCmd, which reports a job that left the queue without ever
+// starting as what it is rather than printing "job X on gpu0" and then
+// streaming a log that will never have anything in it.
+//
+// Like WaitTerminal, it tolerates a bounded run of consecutive poll
+// failures — a dropped connection, a controller restarting for a couple of
+// seconds — with a fixed retry interval, resetting the count on every
+// success, rather than giving up on the very first one (see the constants
+// above for the resulting wall-clock budgets). This distinction matters
+// more here than in WaitTerminal: a caller (rc run) that sees
+// WaitScheduled give up may go on to cancel the job, since nothing is
+// running yet and there is no lease to protect — but only if the job is
+// actually still queued. A transient network blip must never be
+// indistinguishable from "genuinely done waiting", or a brief controller
+// hiccup can end up cancelling — or, worse, if the job was scheduled
+// during the blip, flagging for kill — a job that was never in trouble.
+//
+// The giveup error, when the retry budget above is exhausted, is NOT
+// distinguished from an ordinary error by its type or content — deciding
+// "the caller's own bound elapsed" by unwrapping context.DeadlineExceeded
+// from this error is unsound: each poll already runs under its own
+// scheduledPollTimeout-bounded context, so a hung controller produces
+// exactly that same error, with no caller deadline in sight at all.
+// Callers must instead check their own context's Err() directly (see
+// cli.NewRunCmd's waitCtx) to tell a real, caller-requested deadline
+// apart from this function simply giving up.
+func (c *Client) WaitScheduled(ctx context.Context, id string, onPosition func(int)) (*model.Job, error) {
+	last := -1
+	failures := 0
+	for {
+		pollCtx, cancel := context.WithTimeout(ctx, scheduledPollTimeout)
+		view, err := c.JobView(pollCtx, id)
+		cancel()
+
+		if err != nil {
+			if ctx.Err() != nil {
+				// The caller's own context ended (Ctrl-C, or its own
+				// --timeout deadline) — that is the caller's business, not
+				// a giveup we need to explain.
+				return nil, ctx.Err()
+			}
+			failures++
+			if failures > maxScheduledPollFailures {
+				return nil, fmt.Errorf(
+					"giving up waiting for job %s to be scheduled after %d consecutive poll failures: %w",
+					id, failures, err)
+			}
+		} else {
+			failures = 0
+			if view.Job.State != model.JobQueued {
+				return &view.Job, nil
+			}
+			if view.QueuePosition != last {
+				last = view.QueuePosition
+				if onPosition != nil {
+					onPosition(view.QueuePosition)
+				}
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(scheduledPollInterval):
+		}
+	}
+}
+
+// Kill cancels a queued job or terminates a running one.
+func (c *Client) Kill(ctx context.Context, id, submitter string) error {
+	payload, err := json.Marshal(map[string]string{"submitter": submitter})
+	if err != nil {
+		return err
+	}
+	resp, err := c.do(ctx, http.MethodPost, "/v1/jobs/"+id+"/kill", bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusOK {
+		return nil
+	}
+	if resp.StatusCode == http.StatusConflict {
+		var body struct {
+			Message string `json:"message"`
+		}
+		_ = json.NewDecoder(resp.Body).Decode(&body)
+		if body.Message == "" {
+			body.Message = "job not cancellable"
+		}
+		return fmt.Errorf("%w: %s", ErrNotCancellable, body.Message)
+	}
+	return apiError(resp)
 }
 
 // StreamLogs copies the job's output to out until the job finishes.

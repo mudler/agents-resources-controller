@@ -11,6 +11,7 @@ import (
 
 	"github.com/mudler/agents-resources-controller/internal/client"
 	"github.com/mudler/agents-resources-controller/internal/model"
+	"github.com/mudler/agents-resources-controller/internal/server"
 	"github.com/stretchr/testify/require"
 )
 
@@ -66,7 +67,7 @@ func TestWaitTerminalGivesUpWithClearError(t *testing.T) {
 	// The job never leaves "assigned" — e.g. no worker ever attached to
 	// the device — so WaitTerminal must give up rather than poll forever.
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(model.Job{ID: "job1", State: model.JobAssigned})
+		_ = json.NewEncoder(w).Encode(server.JobView{Job: model.Job{ID: "job1", State: model.JobAssigned}})
 	}))
 	defer ts.Close()
 
@@ -88,7 +89,7 @@ func TestWaitTerminalToleratesTransientFailure(t *testing.T) {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
-		_ = json.NewEncoder(w).Encode(model.Job{ID: "job1", State: model.JobSucceeded, ExitCode: intPtr(0)})
+		_ = json.NewEncoder(w).Encode(server.JobView{Job: model.Job{ID: "job1", State: model.JobSucceeded, ExitCode: intPtr(0)}})
 	}))
 	defer ts.Close()
 

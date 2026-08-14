@@ -23,7 +23,7 @@ import (
 func registerWorker(t *testing.T, ts *httptest.Server) string {
 	t.Helper()
 	resp := post(t, ts, "wtok", "/v1/workers/register",
-		server.RegisterRequest{Host: "gpubox", Devices: []string{"gpu0"}})
+		server.RegisterRequest{Host: "gpubox", Devices: []server.DeviceSpec{{Name: "gpu0"}}})
 	defer resp.Body.Close()
 	var reg server.RegisterResponse
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&reg))
@@ -46,18 +46,23 @@ func TestSubmitAllocatesDeviceAndReturnsJob(t *testing.T) {
 	require.Equal(t, "gpubox:gpu0", job.DeviceID)
 }
 
-// Stage 1 has no queue: a busy device is refused immediately, not parked.
+// Stage 2 queues a busy device by default (see TestSubmitQueuesWhenDeviceIsBusy
+// in queue_api_test.go); this test now covers what it was actually testing —
+// a caller that opts out of the queue with NoWait still gets an immediate
+// 409, not a parked job.
 func TestSubmitOnBusyDeviceReturns409(t *testing.T) {
-	ts, _, _, _ := newServer(t)
+	ts, st, _, _ := newServer(t)
 	registerWorker(t, ts)
 
 	first := post(t, ts, "ctok", "/v1/jobs", server.SubmitRequest{
 		DeviceID: "gpubox:gpu0", Command: []string{"./bench"}, Submitter: "agent-a",
 	})
 	first.Body.Close()
+	_, err := st.ScheduleOnce()
+	require.NoError(t, err)
 
 	second := post(t, ts, "ctok", "/v1/jobs", server.SubmitRequest{
-		DeviceID: "gpubox:gpu0", Command: []string{"./bench"}, Submitter: "agent-b",
+		DeviceID: "gpubox:gpu0", Command: []string{"./bench"}, Submitter: "agent-b", NoWait: true,
 	})
 	defer second.Body.Close()
 	require.Equal(t, http.StatusConflict, second.StatusCode)
@@ -286,10 +291,10 @@ func TestSubmitWakesWaitingWorkerLongPoll(t *testing.T) {
 		require.Less(t, r.dur, 2*time.Second,
 			"poke should wake the long-poll well before the 10s wait window elapses")
 
-		var assignments []server.Assignment
-		require.NoError(t, json.NewDecoder(r.resp.Body).Decode(&assignments))
-		require.Len(t, assignments, 1)
-		require.Equal(t, "gpubox:gpu0", assignments[0].DeviceID)
+		var poll server.PollResponse
+		require.NoError(t, json.NewDecoder(r.resp.Body).Decode(&poll))
+		require.Len(t, poll.Assignments, 1)
+		require.Equal(t, "gpubox:gpu0", poll.Assignments[0].DeviceID)
 	case <-time.After(5 * time.Second):
 		t.Fatal("long-poll did not return after submit poked the worker")
 	}

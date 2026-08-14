@@ -35,40 +35,10 @@ const waitTerminalBound = 30 * time.Second
 // then prove the device is reusable and that a second claim is refused while
 // the first is live.
 func TestEndToEndClaimRunRelease(t *testing.T) {
-	dir := t.TempDir()
-	c := clock.Real()
-
-	st, err := store.Open(filepath.Join(dir, "rc.db"), c)
-	require.NoError(t, err)
-	defer st.Close()
-
-	logs, err := logstore.New(filepath.Join(dir, "logs"))
-	require.NoError(t, err)
-
-	srv := server.New(server.Config{
-		Store: st, Logs: logs, Clock: c,
-		Tokens: map[string]string{"wtok": "worker", "ctok": "client"},
-	})
-	ts := httptest.NewServer(srv.Handler())
-	defer ts.Close()
+	cl, _, device := newFleet(t, 0)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-
-	wk := worker.New(worker.Config{
-		ControllerURL: ts.URL, Token: "wtok", Host: "testbox", Devices: []string{"dev0"},
-		HeartbeatInterval: time.Second, PollWait: time.Second,
-	})
-	workerDone := make(chan error, 1)
-	go func() { workerDone <- wk.Start(ctx) }()
-
-	cl := client.New(ts.URL, "ctok")
-
-	// 1. The worker registers and its device becomes visible.
-	require.Eventually(t, func() bool {
-		state, err := cl.State(ctx)
-		return err == nil && len(state.Devices) == 1
-	}, 15*time.Second, 100*time.Millisecond, "worker never registered its device")
 
 	// 2. A job is submitted and handed to the worker. sleep 5, not 1: the
 	// busy/holder assertions below run a few HTTP round trips after this
@@ -77,22 +47,25 @@ func TestEndToEndClaimRunRelease(t *testing.T) {
 	// the safe direction (a flake would read as failure, never a false
 	// pass), but still worth avoiding.
 	job, err := cl.Submit(ctx, client.SubmitOptions{
-		DeviceID:  "testbox:dev0",
+		DeviceID:  device,
 		Command:   []string{"sh", "-c", "echo hello-from-device; sleep 5"},
 		Submitter: "agent-a",
 	})
 	require.NoError(t, err, "first submit for the free device must succeed")
-	require.Equal(t, "testbox:dev0", job.DeviceID)
+	require.Equal(t, device, job.DeviceID)
 
 	// 3. THE CORE INVARIANT: while that job holds the device, a second submit
-	// for the same device must be refused, not queued and not silently
-	// accepted onto a second worker slot. This is the entire reason the
-	// project exists — two jobs must never hold one GPU.
+	// for the same device must never be handed the device too — not silently
+	// accepted onto a second worker slot. Stage 2 queues a busy device by
+	// default rather than refusing outright, so this uses NoWait to assert
+	// the sharper claim: even opting out of the queue, the device does not
+	// change hands. This is the entire reason the project exists — two jobs
+	// must never hold one GPU.
 	_, err = cl.Submit(ctx, client.SubmitOptions{
-		DeviceID: "testbox:dev0", Command: []string{"true"}, Submitter: "agent-b",
+		DeviceID: device, Command: []string{"true"}, Submitter: "agent-b", NoWait: true,
 	})
 	require.ErrorIs(t, err, client.ErrNoDevice,
-		"a second submit for a held device must be refused with ErrNoDevice, not accepted or queued")
+		"a second submit for a held device must be refused with ErrNoDevice, not accepted")
 
 	// Confirm the state view agrees: the device is busy and held by agent-a,
 	// not just that the second Submit call happened to fail.
@@ -126,7 +99,7 @@ func TestEndToEndClaimRunRelease(t *testing.T) {
 
 	// ...and a later submit for the same device succeeds, landing a distinct job.
 	again, err := cl.Submit(ctx, client.SubmitOptions{
-		DeviceID: "testbox:dev0", Command: []string{"true"}, Submitter: "agent-b",
+		DeviceID: device, Command: []string{"true"}, Submitter: "agent-b",
 	})
 	require.NoError(t, err, "submit onto a freed device must succeed")
 	require.NotEqual(t, job.ID, again.ID)
@@ -135,16 +108,10 @@ func TestEndToEndClaimRunRelease(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, model.JobSucceeded, final2.State)
 
-	// Clean shutdown: the worker has no in-flight job left, so Start should
-	// return promptly once ctx is cancelled, with context.Canceled as its
-	// (expected, non-error) exit.
-	cancel()
-	select {
-	case err := <-workerDone:
-		require.ErrorIs(t, err, context.Canceled)
-	case <-time.After(10 * time.Second):
-		t.Fatal("worker did not shut down within 10s of context cancellation")
-	}
+	// Clean shutdown (the worker has no in-flight job left here, so Start
+	// should return promptly with context.Canceled as its expected,
+	// non-error exit) is asserted by newFleet's own t.Cleanup, not here —
+	// see harness_test.go.
 }
 
 // TestWorkerRestartQuarantinesDeviceInsteadOfFalselyReady reproduces the
@@ -183,7 +150,7 @@ func TestWorkerRestartQuarantinesDeviceInsteadOfFalselyReady(t *testing.T) {
 	defer cancelWk()
 
 	wk := worker.New(worker.Config{
-		ControllerURL: ts.URL, Token: "wtok", Host: "restartbox", Devices: []string{"dev0"},
+		ControllerURL: ts.URL, Token: "wtok", Host: "restartbox", Devices: []worker.DeviceConfig{{Name: "dev0"}},
 		HeartbeatInterval: time.Second, PollWait: time.Second,
 	})
 	go func() { _ = wk.Start(wkCtx) }()
@@ -233,9 +200,12 @@ func TestWorkerRestartQuarantinesDeviceInsteadOfFalselyReady(t *testing.T) {
 	require.Equal(t, model.JobLost, final.State)
 
 	// And the invariant holds end to end: nothing can claim the quarantined
-	// device until an operator clears it.
+	// device until an operator clears it. NoWait for the same reason as
+	// above: a quarantined device is never free, so even the queue-opt-out
+	// path must fail rather than park a job behind a device that will never
+	// become schedulable again on its own.
 	_, err = cl.Submit(ctx, client.SubmitOptions{
-		DeviceID: "restartbox:dev0", Command: []string{"true"}, Submitter: "agent-b",
+		DeviceID: "restartbox:dev0", Command: []string{"true"}, Submitter: "agent-b", NoWait: true,
 	})
 	require.ErrorIs(t, err, client.ErrNoDevice,
 		"a quarantined device must refuse a new claim, not silently hand out a GPU nobody has proven is clean")
@@ -248,7 +218,11 @@ func TestWorkerRestartQuarantinesDeviceInsteadOfFalselyReady(t *testing.T) {
 // local job.
 func registerRestart(t *testing.T, baseURL, token, host string, devices []string) {
 	t.Helper()
-	payload, err := json.Marshal(map[string]any{"host": host, "devices": devices})
+	specs := make([]server.DeviceSpec, 0, len(devices))
+	for _, name := range devices {
+		specs = append(specs, server.DeviceSpec{Name: name})
+	}
+	payload, err := json.Marshal(server.RegisterRequest{Host: host, Devices: specs})
 	require.NoError(t, err)
 	req, err := http.NewRequest(http.MethodPost, baseURL+"/v1/workers/register", bytes.NewReader(payload))
 	require.NoError(t, err)

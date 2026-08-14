@@ -4,7 +4,15 @@ token: replace-with-worker-token
 # Names should end in the GPU's index (gpu0, gpu1, ...): the worker derives
 # CUDA_VISIBLE_DEVICES from that trailing integer. See README.md.
 devices:
-  - gpu0
+  # Object form: max_runtime is a per-device runtime ceiling. The controller
+  # rejects (not clamps) a job that asks for more than this, and the worker
+  # enforces it as a wall-clock watchdog once a job is running. A job that
+  # requests no ceiling of its own inherits this one.
+  - name: gpu0
+    max_runtime: 6h
+  # Plain name form still works, exactly as before — shorthand for
+  # {name: gpu1} with no ceiling, so jobs on gpu1 run unbounded unless they
+  # set their own --max-runtime.
   - gpu1
 heartbeat_interval: 10s
 poll_wait: 30s

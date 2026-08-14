@@ -18,13 +18,36 @@ import (
 // knob on the wire that silently did nothing was worse than not having the
 // knob; the internal column and default stay, ready for the stage that
 // actually enforces them.
+// MinPriority and MaxPriority bound SubmitRequest.Priority. The spec is
+// explicit that priority is "bounded to a small range so it stays a nudge
+// rather than a scheduling language": unbounded values invite callers to
+// encode a policy in the number (1000 for "production", 9999 for "really
+// production"), and since there is no preemption, a big number buys nothing
+// a small one does not — it only makes every later submitter bid higher.
+// Out-of-range submissions are rejected rather than clamped, so a caller who
+// asked for 500 is never quietly given 10 and left believing otherwise.
+const (
+	MinPriority = -10
+	MaxPriority = 10
+)
+
 type SubmitRequest struct {
-	DeviceID       string            `json:"device_id"`
-	Command        []string          `json:"command"`
-	Cwd            string            `json:"cwd,omitempty"`
-	Env            map[string]string `json:"env,omitempty"`
-	Submitter      string            `json:"submitter"`
-	IdempotencyKey string            `json:"idempotency_key,omitempty"`
+	DeviceID           string            `json:"device_id"`
+	Command            []string          `json:"command"`
+	Cwd                string            `json:"cwd,omitempty"`
+	Env                map[string]string `json:"env,omitempty"`
+	Submitter          string            `json:"submitter"`
+	IdempotencyKey     string            `json:"idempotency_key,omitempty"`
+	Priority           int               `json:"priority,omitempty"`
+	MaxRuntimeSeconds  int               `json:"max_runtime_seconds,omitempty"`
+	IdleTimeoutSeconds int               `json:"idle_timeout_seconds,omitempty"`
+	NoWait             bool              `json:"no_wait,omitempty"`
+}
+
+// JobView is a job plus the queue position a client needs to show progress.
+type JobView struct {
+	Job           model.Job `json:"job"`
+	QueuePosition int       `json:"queue_position,omitempty"`
 }
 
 type DeviceView struct {
@@ -39,6 +62,7 @@ type DeviceView struct {
 type StateResponse struct {
 	Devices []DeviceView `json:"devices"`
 	Jobs    []model.Job  `json:"jobs"`
+	Queued  []model.Job  `json:"queued"`
 }
 
 func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
@@ -51,7 +75,7 @@ func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.DeviceID == "" {
-		writeErr(w, http.StatusBadRequest, "bad_request", "device_id required (selectors arrive in stage 2)")
+		writeErr(w, http.StatusBadRequest, "bad_request", "device_id required (device selectors are not implemented yet; address a device by its exact ID)")
 		return
 	}
 	if req.Submitter == "" {
@@ -60,27 +84,105 @@ func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "bad_request", "submitter required")
 		return
 	}
+	if req.Priority < MinPriority || req.Priority > MaxPriority {
+		writeErr(w, http.StatusBadRequest, "priority_out_of_range",
+			fmt.Sprintf("priority %d is out of range: it must be between %d and %d — priority is a nudge within one device's queue, not a scheduling language",
+				req.Priority, MinPriority, MaxPriority))
+		return
+	}
 
-	// LeaseTTL is left zero: Allocate applies its own internal default (see
-	// store.AllocateRequest.LeaseTTL). Stage 1 has no expiry enforcement, so
-	// there is nothing for a client-supplied value to control yet.
-	job, err := s.cfg.Store.Allocate(store.AllocateRequest{
+	// Submitting always enqueues: ScheduleOnce below is the only place a
+	// device changes hands, so there is no check-then-act race between
+	// "is this device free?" and grabbing it.
+	job, err := s.cfg.Store.Enqueue(store.EnqueueRequest{
 		DeviceID: req.DeviceID, Command: req.Command, Cwd: req.Cwd, Env: req.Env,
 		Submitter: req.Submitter, IdempotencyKey: req.IdempotencyKey,
+		Priority:    req.Priority,
+		MaxRuntime:  time.Duration(req.MaxRuntimeSeconds) * time.Second,
+		IdleTimeout: time.Duration(req.IdleTimeoutSeconds) * time.Second,
 	})
-	if errors.Is(err, store.ErrNoDevice) {
-		// No queue in stage 1: say so immediately rather than block.
+	if errors.Is(err, store.ErrRuntimeAboveCeiling) {
+		writeErr(w, http.StatusBadRequest, "runtime_above_ceiling", err.Error())
+		return
+	}
+	if errors.Is(err, store.ErrUnknownDevice) {
+		writeErr(w, http.StatusBadRequest, "unknown_device", err.Error())
+		return
+	}
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "store_error", "could not queue job")
+		return
+	}
+
+	// Make one scheduling pass so a free device starts immediately rather
+	// than waiting for the loop's next tick.
+	assigned, err := s.cfg.Store.ScheduleOnce()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "store_error",
+			s.abandonQueuedJob(job.ID, "submit failed: could not schedule", "could not schedule"))
+		return
+	}
+	for _, a := range assigned {
+		s.notify.poke(a.WorkerID)
+	}
+
+	current, err := s.cfg.Store.Job(job.ID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "store_error",
+			s.abandonQueuedJob(job.ID, "submit failed: could not read job", "could not read job"))
+		return
+	}
+
+	// --no-wait keeps stage 1's behaviour: never sit in a queue.
+	if req.NoWait && current.State == model.JobQueued {
+		cancelled, err := s.cfg.Store.CancelQueued(current.ID, "no-wait: device busy")
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, "store_error", "could not cancel")
+			return
+		}
+		if !cancelled {
+			// Lost the race: something — this request's own ScheduleOnce
+			// pass above, a concurrent submit, or rc serve's ticking
+			// scheduler loop — assigned the device to this exact job
+			// between the Job() read above and this cancel attempt.
+			// NoWait asked not to sit in a queue; it did not ask to have a
+			// job that is now actually running hidden behind a 409 while
+			// it holds a GPU with no client watching it. Report it exactly
+			// as an ordinary submit would.
+			reloaded, err := s.cfg.Store.Job(current.ID)
+			if err != nil {
+				writeErr(w, http.StatusInternalServerError, "store_error", "could not read job")
+				return
+			}
+			s.publishJob(reloaded.ID, reloaded.State)
+			writeJSON(w, http.StatusCreated, reloaded)
+			return
+		}
+		s.publishJob(current.ID, model.JobKilled)
 		writeErr(w, http.StatusConflict, "no_device_available",
 			fmt.Sprintf("%s is not free", req.DeviceID))
 		return
 	}
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
-		return
-	}
 
-	s.notify.poke(job.WorkerID)
-	writeJSON(w, http.StatusCreated, job)
+	s.publishJob(current.ID, current.State)
+	writeJSON(w, http.StatusCreated, current)
+}
+
+// abandonQueuedJob is called from the submit error paths that run after
+// Enqueue has already created a queued job: it makes a best-effort attempt
+// to cancel that job before the caller sees an error. Without this, a
+// transient failure from a later step (ScheduleOnce, the read-back) — which
+// the client sees as a failed submit it may reasonably retry elsewhere —
+// would leave the job sitting in the queue to be picked up and run later by
+// rc serve's scheduler loop with no client ever attached to it. It returns
+// the message to report: the original failure alone, or, if the cancel
+// itself also failed, both failures rather than letting the cancel error
+// swallow the original one.
+func (s *Server) abandonQueuedJob(jobID, cancelReason, failureMsg string) string {
+	if _, err := s.cfg.Store.CancelQueued(jobID, cancelReason); err != nil {
+		return fmt.Sprintf("%s, and could not cancel the queued job: %v", failureMsg, err)
+	}
+	return failureMsg
 }
 
 func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {
@@ -89,7 +191,81 @@ func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {
 		writeJobLookupError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, job)
+	pos, err := s.cfg.Store.QueuePosition(job.ID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "store_error", "could not read queue position")
+		return
+	}
+	writeJSON(w, http.StatusOK, JobView{Job: *job, QueuePosition: pos})
+}
+
+type KillRequest struct {
+	Submitter string `json:"submitter"`
+}
+
+// handleKill cancels a queued job outright, or asks the worker to terminate a
+// running one by flagging it and letting the worker's poll observe the kill
+// flag (task 5). Ownership is checked against the submitter unless the caller
+// holds an admin token.
+func (s *Server) handleKill(w http.ResponseWriter, r *http.Request) {
+	var req KillRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	jobID := r.PathValue("id")
+
+	job, err := s.cfg.Store.Job(jobID)
+	if err != nil {
+		writeJobLookupError(w, err)
+		return
+	}
+	if !isAdmin(r) && job.Submitter != req.Submitter {
+		writeErr(w, http.StatusForbidden, "not_job_owner",
+			"only the submitter or an admin may kill this job")
+		return
+	}
+
+	// An admin token may kill a job it does not own — that is what "admin"
+	// means here — but the recorded reason must say so plainly rather than
+	// crediting an empty or unrelated req.Submitter value, which would read
+	// back as a mystery to whoever investigates the job later.
+	reason := "killed by " + req.Submitter
+	if isAdmin(r) {
+		reason = "killed by admin override"
+		if req.Submitter != "" {
+			reason += " (as " + req.Submitter + ")"
+		}
+	}
+
+	switch job.State {
+	case model.JobQueued:
+		ok, err := s.cfg.Store.CancelQueued(jobID, reason)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, "store_error", "could not cancel")
+			return
+		}
+		if !ok {
+			writeErr(w, http.StatusConflict, "not_cancellable", "job already started")
+			return
+		}
+		s.publishJob(jobID, model.JobKilled)
+	case model.JobAssigned, model.JobRunning:
+		flagged, err := s.cfg.Store.RequestKill(jobID)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, "store_error", "could not request kill")
+			return
+		}
+		if !flagged {
+			writeErr(w, http.StatusConflict, "not_cancellable", "job already finished")
+			return
+		}
+		s.notify.poke(job.WorkerID)
+		s.publishJob(jobID, job.State)
+	default:
+		writeErr(w, http.StatusConflict, "not_cancellable", "job already finished")
+		return
+	}
+	w.WriteHeader(http.StatusOK)
 }
 
 // writeJobLookupError maps a Store.Job error to the right client-facing
@@ -127,7 +303,12 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, StateResponse{Devices: views, Jobs: jobs})
+	queued, err := s.cfg.Store.QueuedJobs()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, StateResponse{Devices: views, Jobs: jobs, Queued: queued})
 }
 
 // deviceViews joins devices to their live lease so a caller sees who holds
@@ -187,19 +368,30 @@ func (s *Server) handleClearDevice(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusConflict, "device_not_cleared", "device has a live lease and was not cleared")
 		return
 	}
+	s.publishDevices()
 	w.WriteHeader(http.StatusOK)
 }
+
+// logWriteTimeout bounds every write to a log stream, mirroring
+// eventWriteTimeout on the SSE side. A log reader that cannot accept a chunk
+// within this is wedged, not merely slow: the alternative to disconnecting it
+// is holding its subscriber, goroutine and fd open forever.
+//
+// A var, not a const, solely so an internal test can shrink it and prove the
+// bound is real without a ten-second test — the same trick, for the same
+// reason, as internal/worker's terminalReportAttemptTimeout.
+var logWriteTimeout = 10 * time.Second
 
 // handleStreamLogs streams a job's output as newline-delimited chunks and
 // ends when the job reaches a terminal state.
 func (s *Server) handleStreamLogs(w http.ResponseWriter, r *http.Request) {
 	jobID := r.PathValue("id")
 
-	flusher, ok := w.(http.Flusher)
-	if !ok {
+	if _, ok := w.(http.Flusher); !ok {
 		writeErr(w, http.StatusInternalServerError, "unsupported", "streaming unsupported")
 		return
 	}
+	rc := http.NewResponseController(w)
 
 	// The job must exist before anything is started: Follow would otherwise
 	// O_CREATE a log file for an unknown ID and the watcher below would spin
@@ -243,12 +435,36 @@ func (s *Server) handleStreamLogs(w http.ResponseWriter, r *http.Request) {
 	// buffers them. Without this a client blocks with no response at all
 	// until the first log chunk arrives, which may be never for a job that
 	// has not produced output yet.
-	flusher.Flush()
+	if !flushLogs(rc) {
+		return
+	}
 
 	for chunk := range chunks {
+		// Every write is bounded, for the same reason the SSE stream's are
+		// (see writeSSE): a wedged peer — a suspended laptop, a blackholed
+		// route — blocks w.Write forever, and r.Context().Done() cannot
+		// preempt a write already in flight. The handler would sit in that
+		// write for the life of the process, so the deferred unsubscribe in
+		// logstore never runs and the subscriber, its goroutine and its fd
+		// leak. `rc attach` makes long-lived log streams routine, so this is
+		// an ordinary case rather than an exotic one.
+		if err := rc.SetWriteDeadline(time.Now().Add(logWriteTimeout)); err != nil {
+			return
+		}
 		if _, err := w.Write(chunk); err != nil {
 			return
 		}
-		flusher.Flush()
+		if !flushLogs(rc) {
+			return
+		}
 	}
+}
+
+// flushLogs flushes under the same bounded deadline every log write gets, so
+// the header flush cannot wedge either.
+func flushLogs(rc *http.ResponseController) bool {
+	if err := rc.SetWriteDeadline(time.Now().Add(logWriteTimeout)); err != nil {
+		return false
+	}
+	return rc.Flush() == nil
 }

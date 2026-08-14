@@ -2,15 +2,45 @@ package store
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/mudler/agents-resources-controller/internal/model"
 )
 
+// A quarantine reason records WHY a device was taken out of the pool, which
+// is the only thing that makes host-reboot recovery safe to apply after the
+// fact. A reboot proves no process survived; it proves nothing about the
+// hardware. So a device quarantined because a process might still be pinning
+// it — the worker vanished, its lease lapsed, or registration reconciled a
+// job it left in flight — is answered by proof of a reboot and goes back to
+// ready, while one quarantined by a self-reported fault stays out until a
+// human clears it, power cycle or no power cycle.
+//
+// An empty reason means "cause unknown" (a row quarantined before this was
+// recorded, i.e. before the migration that added the column). Unknown is
+// treated as not revivable: the failure of leaving a healthy device out of
+// the pool is a human clearing it, and the failure of the opposite is an OOM
+// on hardware nobody checked.
+const (
+	quarantineFault        = "fault"         // self-reported by the host (SetDeviceState)
+	quarantineWorkerLost   = "worker_lost"   // the worker stopped reporting entirely
+	quarantineLeaseExpired = "lease_expired" // the lease lapsed with nobody renewing it
+	quarantineRegistration = "registration"  // a re-registering worker left a job in flight
+)
+
+// rebootClearableReasons are the quarantine causes a proven boot-ID change
+// answers. Anything else — a fault, or an unrecorded cause — survives the
+// reboot untouched.
+var rebootClearableReasons = []any{
+	quarantineWorkerLost, quarantineLeaseExpired, quarantineRegistration,
+}
+
 type SweepResult struct {
 	DevicesUnknown   []string `json:"devices_unknown"`
 	DevicesUnhealthy []string `json:"devices_unhealthy"`
 	JobsLost         []string `json:"jobs_lost"`
+	LeasesExpired    []string `json:"leases_expired"`
 }
 
 // Sweep demotes devices whose worker has stopped reporting. A device is never
@@ -72,7 +102,16 @@ func (s *Store) Sweep(grace, unhealthyAfter time.Duration) (SweepResult, error) 
 	}
 
 	for _, d := range pending {
-		if _, err := tx.Exec(`UPDATE devices SET state = ? WHERE id = ?`, string(d.state), d.id); err != nil {
+		// A demotion to unknown is not a quarantine — the device may well come
+		// back on the next heartbeat — so it carries no reason. A demotion to
+		// unhealthy records worker loss, which a proven reboot can answer.
+		reason := ""
+		if d.state == model.DeviceUnhealthy {
+			reason = quarantineWorkerLost
+		}
+		if _, err := tx.Exec(
+			`UPDATE devices SET state = ?, quarantine_reason = ? WHERE id = ?`,
+			string(d.state), reason, d.id); err != nil {
 			return res, fmt.Errorf("demote %s: %w", d.id, err)
 		}
 	}
@@ -120,18 +159,125 @@ func (s *Store) Sweep(grace, unhealthyAfter time.Duration) (SweepResult, error) 
 		}
 	}
 
+	// A lease past its expiry is released, but its device is quarantined
+	// rather than freed: expiry tells us the holder stopped renewing, not
+	// that the hardware is idle. expires_at is a deadline, not a "still
+	// live until" marker: at now == expires_at the TTL has fully elapsed,
+	// so <= (not <) is correct here.
+	expRows, err := tx.Query(
+		`SELECT id, job_id, device_id FROM leases
+		 WHERE released_at IS NULL AND expires_at <= ?`, now.Unix())
+	if err != nil {
+		return res, err
+	}
+	type expired struct{ leaseID, jobID, deviceID string }
+	var stale []expired
+	for expRows.Next() {
+		var e expired
+		if err := expRows.Scan(&e.leaseID, &e.jobID, &e.deviceID); err != nil {
+			expRows.Close()
+			return res, err
+		}
+		stale = append(stale, e)
+	}
+	expRows.Close()
+	if err := expRows.Err(); err != nil {
+		return res, err
+	}
+
+	for _, e := range stale {
+		// Released by the lease's own id, not job_id: job_id defaults to ""
+		// and a future lease kind (interactive holds) will have no job at
+		// all, so two live leases could otherwise share a job_id and
+		// expiring one would release the other.
+		if _, err := tx.Exec(
+			`UPDATE leases SET released_at = ? WHERE id = ? AND released_at IS NULL`,
+			now.Unix(), e.leaseID); err != nil {
+			return res, err
+		}
+		// An already-unhealthy device keeps the reason it was quarantined
+		// with: a hardware fault reported earlier must not be relabelled as a
+		// mere expired lease, or a later reboot would revive it.
+		if _, err := tx.Exec(
+			`UPDATE devices SET state = ?,
+			   quarantine_reason = CASE WHEN state = ? THEN quarantine_reason ELSE ? END
+			 WHERE id = ?`,
+			string(model.DeviceUnhealthy), string(model.DeviceUnhealthy),
+			quarantineLeaseExpired, e.deviceID); err != nil {
+			return res, err
+		}
+		if e.jobID != "" {
+			result, err := tx.Exec(
+				`UPDATE jobs SET state = ?, kill_reason = ?, finished_at = ?
+				 WHERE id = ? AND state IN (?, ?)`,
+				string(model.JobLost), "lease expired", now.Unix(), e.jobID,
+				string(model.JobAssigned), string(model.JobRunning))
+			if err != nil {
+				return res, err
+			}
+			// Only report what actually changed: the guard above can miss
+			// (the job already finished through another path), and
+			// unconditionally appending would over-report a job as newly
+			// lost when nothing about it changed here.
+			n, err := result.RowsAffected()
+			if err != nil {
+				return res, err
+			}
+			if n > 0 {
+				res.LeasesExpired = append(res.LeasesExpired, e.jobID)
+			}
+		} else {
+			// A job-less lease (a future interactive hold) has nothing else
+			// to report, but its own expiry is still real — report the
+			// lease's identity rather than dropping it silently.
+			res.LeasesExpired = append(res.LeasesExpired, e.leaseID)
+		}
+	}
+
 	if err := tx.Commit(); err != nil {
 		return res, err
 	}
 	return res, nil
 }
 
-// RecordHeartbeat refreshes a worker and restores its unknown devices. A
-// device whose lease is still live returns to busy, NOT to ready: the job it
-// was demoted with is still running on it. Promoting a leased device to ready
-// would offer an occupied GPU to the next claimant. Devices marked unhealthy
-// stay out until explicitly cleared.
-func (s *Store) RecordHeartbeat(workerID string, at time.Time) error {
+// leaseRenewWindow is how far past each heartbeat a live job's lease is
+// pushed forward. It must comfortably outlast both the heartbeat interval
+// and the sweep interval (10s each, see internal/cli/serve.go) — expiry
+// exists to catch a worker that has genuinely stopped reporting, not to put
+// a clock on honest work that is still heartbeating on schedule. 15 minutes
+// leaves many missed heartbeats' worth of slack before a live job's lease
+// could ever lapse.
+const leaseRenewWindow = 15 * time.Minute
+
+// RecordHeartbeat refreshes a worker, restores its unknown devices, and
+// renews the lease of every job the worker reports it is actually
+// supervising. A device whose lease is still live returns to busy, NOT to
+// ready: the job it was demoted with is still running on it. Promoting a
+// leased device to ready would offer an occupied GPU to the next claimant.
+// Devices marked unhealthy stay out until explicitly cleared.
+//
+// Lease renewal here is what makes expiry (Sweep) safe: without it, any job
+// running longer than its lease TTL would be killed and its device
+// quarantined while still healthy.
+//
+// runningJobIDs is the crucial input, and the reason this is not simply
+// "renew everything this worker owns". A job can be recorded assigned/running
+// on a worker that never actually received it — handleAssignments commits the
+// running transition before writing the response, so a lost response (a
+// controller restart mid-write, a proxy, a decode error at the worker) leaves
+// the controller believing a job is running that the worker has no process
+// for and will never report on. Renewing on the strength of the worker merely
+// being alive kept that job's lease alive forever: the device stayed busy,
+// its holder never changed, and lease expiry — the backstop the design
+// promises — could never fire, leaving no way to recover the hardware short
+// of restarting the worker and clearing the device by hand.
+//
+// So renewal follows reality: only the leases of jobs the worker names are
+// pushed forward. A job the worker is not running stops being renewed, its
+// lease lapses, and Sweep reclaims it — marking the job lost and quarantining
+// the device, which is exactly the intended behaviour for a job nobody can
+// account for.
+func (s *Store) RecordHeartbeat(workerID string, at time.Time, runningJobIDs []string) error {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
@@ -141,6 +287,28 @@ func (s *Store) RecordHeartbeat(workerID string, at time.Time) error {
 	if _, err := tx.Exec(
 		`UPDATE workers SET last_heartbeat_at = ? WHERE id = ?`, at.Unix(), workerID); err != nil {
 		return err
+	}
+	if len(runningJobIDs) > 0 {
+		// The worker's claim is still checked against the controller's own
+		// records: a named job must belong to this worker and still be
+		// assigned/running, so naming someone else's job renews nothing.
+		args := []any{
+			at.Add(leaseRenewWindow).Unix(), workerID,
+			string(model.JobAssigned), string(model.JobRunning),
+		}
+		placeholders := make([]string, len(runningJobIDs))
+		for i, id := range runningJobIDs {
+			placeholders[i] = "?"
+			args = append(args, id)
+		}
+		if _, err := tx.Exec(fmt.Sprintf(
+			`UPDATE leases SET expires_at = ?
+			 WHERE released_at IS NULL
+			   AND job_id IN (SELECT id FROM jobs
+			                  WHERE worker_id = ? AND state IN (?, ?) AND id IN (%s))`,
+			strings.Join(placeholders, ", ")), args...); err != nil {
+			return err
+		}
 	}
 	if _, err := tx.Exec(
 		`UPDATE devices SET state = ?, last_heartbeat_at = ?
@@ -170,7 +338,7 @@ func (s *Store) RecordHeartbeat(workerID string, at time.Time) error {
 // refusal is never reported as success.
 func (s *Store) ClearDevice(id string) (bool, error) {
 	res, err := s.db.Exec(
-		`UPDATE devices SET state = ? WHERE id = ? AND state = ?
+		`UPDATE devices SET state = ?, quarantine_reason = '' WHERE id = ? AND state = ?
 		   AND id NOT IN (SELECT device_id FROM leases WHERE released_at IS NULL)`,
 		string(model.DeviceReady), id, string(model.DeviceUnhealthy))
 	if err != nil {

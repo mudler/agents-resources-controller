@@ -15,6 +15,18 @@ import (
 // queue, so the caller is told immediately rather than parked.
 var ErrNoDevice = errors.New("no device available")
 
+// errJobNoLongerQueued means the job assignQueued was asked to assign is no
+// longer in state queued (e.g. cancelled between the scheduling pass reading
+// its snapshot and reaching this job). It is distinct from ErrNoDevice: the
+// device may well be free, and the caller must not reserve it for a job that
+// no longer exists, nor let it block whoever is behind it in the queue.
+var errJobNoLongerQueued = errors.New("job no longer queued")
+
+const (
+	defaultLeaseTTL       = 5 * time.Minute
+	leaseGraceOverRuntime = 10 * time.Minute
+)
+
 type AllocateRequest struct {
 	DeviceID       string // Stage 1: exact device ID. Selectors arrive in Stage 2.
 	Command        []string
@@ -27,6 +39,17 @@ type AllocateRequest struct {
 
 // Allocate claims a device and creates its job in ONE transaction. Either the
 // device flips ready -> busy and the job and lease exist, or nothing happened.
+//
+// It bypasses the queue entirely: there is no queued state, no priority, no
+// reservation, and no interaction with ScheduleOnce. That made it stage 1's
+// only allocation path; since stage 2, production code must go through
+// Enqueue followed by ScheduleOnce instead, which is the only route that
+// keeps "who gets a device next" consistent with what a client seeing its
+// queue position was told. Allocate is not deleted because the store's own
+// tests still use it to set up a device already busy without needing a
+// scheduling pass — but a second, queue-bypassing way to hand out a device
+// is exactly the kind of thing that turns into a race if production code
+// ever calls it again, so: do not wire this into any handler.
 func (s *Store) Allocate(req AllocateRequest) (*model.Job, error) {
 	if len(req.Command) == 0 {
 		return nil, errors.New("command required")
@@ -177,19 +200,22 @@ func (s *Store) Release(jobID string, state model.JobState, exitCode *int, reaso
 
 func (s *Store) Job(id string) (*model.Job, error) {
 	var (
-		j                 model.Job
-		cmdJSON, envJSON  string
-		started, finished sql.NullInt64
-		exitCode          sql.NullInt64
-		idem              sql.NullString
-		submitted         int64
+		j                                           model.Job
+		cmdJSON, envJSON                            string
+		started, finished                           sql.NullInt64
+		exitCode                                    sql.NullInt64
+		idem                                        sql.NullString
+		submitted                                   int64
+		priority, maxRuntime, idleTimeout, queuedAt int64
 	)
 	err := s.db.QueryRow(
 		`SELECT id, selector, command, cwd, env, submitter, idempotency_key, state,
-		        device_id, worker_id, exit_code, kill_reason, submitted_at, started_at, finished_at
+		        device_id, worker_id, exit_code, kill_reason, submitted_at, started_at, finished_at,
+		        priority, max_runtime, idle_timeout, queued_at
 		 FROM jobs WHERE id = ?`, id,
 	).Scan(&j.ID, &j.Selector, &cmdJSON, &j.Cwd, &envJSON, &j.Submitter, &idem, &j.State,
-		&j.DeviceID, &j.WorkerID, &exitCode, &j.KillReason, &submitted, &started, &finished)
+		&j.DeviceID, &j.WorkerID, &exitCode, &j.KillReason, &submitted, &started, &finished,
+		&priority, &maxRuntime, &idleTimeout, &queuedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -213,7 +239,84 @@ func (s *Store) Job(id string) (*model.Job, error) {
 		t := time.Unix(finished.Int64, 0).UTC()
 		j.FinishedAt = &t
 	}
+	j.Priority = int(priority)
+	j.MaxRuntimeSeconds = int(maxRuntime)
+	j.IdleTimeoutSeconds = int(idleTimeout)
+	if queuedAt > 0 {
+		t := time.Unix(queuedAt, 0).UTC()
+		j.QueuedAt = &t
+	}
 	return &j, nil
+}
+
+// assignQueued moves a queued job onto its device in ONE transaction:
+// device ready -> busy, job queued -> assigned, lease inserted. Returns
+// ErrNoDevice when the device is not free, leaving the job queued so it
+// blocks whoever is behind it — and errJobNoLongerQueued when the job itself
+// has moved on (e.g. cancelled) between the caller's snapshot and now, which
+// must not block anyone since there is no job left to reserve the device for.
+func (s *Store) assignQueued(jobID, deviceID string) (*model.Job, error) {
+	now := s.clock.Now()
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	var workerID string
+	err = tx.QueryRow(
+		`SELECT worker_id FROM devices WHERE id = ? AND state = ?`,
+		deviceID, string(model.DeviceReady)).Scan(&workerID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNoDevice
+	}
+	if err != nil {
+		return nil, fmt.Errorf("select device: %w", err)
+	}
+
+	var submitter string
+	var ttl int64
+	if err := tx.QueryRow(
+		`SELECT submitter, max_runtime FROM jobs WHERE id = ? AND state = ?`,
+		jobID, string(model.JobQueued)).Scan(&submitter, &ttl); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, errJobNoLongerQueued
+		}
+		return nil, err
+	}
+
+	if _, err := tx.Exec(
+		`UPDATE devices SET state = ? WHERE id = ? AND state = ?`,
+		string(model.DeviceBusy), deviceID, string(model.DeviceReady)); err != nil {
+		return nil, fmt.Errorf("mark device busy: %w", err)
+	}
+	if _, err := tx.Exec(
+		`UPDATE jobs SET state = ?, worker_id = ? WHERE id = ?`,
+		string(model.JobAssigned), workerID, jobID); err != nil {
+		return nil, fmt.Errorf("assign job: %w", err)
+	}
+
+	// A job lease outlives its runtime ceiling by a margin so the worker's own
+	// watchdog fires first; expiry is the backstop for a worker that vanishes.
+	expiry := now.Add(defaultLeaseTTL)
+	if ttl > 0 {
+		expiry = now.Add(time.Duration(ttl)*time.Second + leaseGraceOverRuntime)
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO leases (id, device_id, holder, job_id, acquired_at, expires_at)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		uuid.NewString(), deviceID, submitter, jobID, now.Unix(), expiry.Unix()); err != nil {
+		return nil, fmt.Errorf("insert lease: %w", err)
+	}
+	if _, err := tx.Exec(`DELETE FROM reservations WHERE device_id = ?`, deviceID); err != nil {
+		return nil, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return s.Job(jobID)
 }
 
 // MarkRunning records that the worker has actually spawned the process.

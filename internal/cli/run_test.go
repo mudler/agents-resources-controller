@@ -9,6 +9,7 @@ import (
 
 	"github.com/mudler/agents-resources-controller/internal/cli"
 	"github.com/mudler/agents-resources-controller/internal/model"
+	"github.com/mudler/agents-resources-controller/internal/server"
 	"github.com/stretchr/testify/require"
 )
 
@@ -45,7 +46,7 @@ func TestRunExitsWithJobExitCode(t *testing.T) {
 				case r.URL.Path == "/v1/jobs/job1/logs":
 					w.WriteHeader(http.StatusOK)
 				case r.URL.Path == "/v1/jobs/job1":
-					_ = json.NewEncoder(w).Encode(job)
+					_ = json.NewEncoder(w).Encode(server.JobView{Job: job})
 				default:
 					http.NotFound(w, r)
 				}

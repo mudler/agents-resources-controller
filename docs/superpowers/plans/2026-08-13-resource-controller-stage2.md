@@ -984,6 +984,14 @@ func TestLiveLeaseIsNotExpired(t *testing.T) {
 func TestRebootReturnsDevicesToReady(t *testing.T) {
 	s, c := newStore(t)
 
+	// Establish a known prior boot. Without this the stored boot ID is empty,
+	// which is NOT proof of a reboot and must quarantine — see
+	// TestMissingBootIDQuarantines.
+	require.NoError(t, s.UpsertWorker(
+		model.Worker{ID: "w1", Host: "gpubox", BootID: "boot-1", LastHeartbeatAt: c.Now()},
+		[]model.Device{{ID: "gpubox:gpu0", Host: "gpubox", Name: "gpu0", WorkerID: "w1"}},
+	))
+
 	job, err := s.Allocate(req("agent-a"))
 	require.NoError(t, err)
 

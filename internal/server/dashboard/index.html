@@ -1,0 +1,311 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>resource controller</title>
+<style>
+  :root {
+    --bg:#fbfbfd; --panel:#fff; --ink:#16181d; --muted:#6b7280; --line:#e5e7eb;
+    --ready:#15803d; --busy:#b45309; --unknown:#7c3aed; --unhealthy:#b91c1c;
+    --unhealthy-bg:#fef2f2; --stale:#c2410c; --stale-bg:#fff7ed; --warn:#b45309;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg:#0f1115; --panel:#171a21; --ink:#e8eaed; --muted:#9aa1ab; --line:#262b34;
+      --ready:#4ade80; --busy:#fbbf24; --unknown:#c4b5fd; --unhealthy:#f87171;
+      --unhealthy-bg:#2a1010; --stale:#fb923c; --stale-bg:#2a1608; --warn:#fbbf24;
+    }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+         font:14px/1.5 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
+  header { display:flex; gap:12px; align-items:center; justify-content:space-between;
+           padding:14px 20px; border-bottom:1px solid var(--line); }
+  h1 { font-size:15px; margin:0; font-weight:600; letter-spacing:.01em; }
+  .hstat { display:flex; gap:14px; align-items:center; font-size:12px; }
+  main { padding:20px; max-width:1200px; margin:0 auto; }
+  h2 { font-size:12px; text-transform:uppercase; letter-spacing:.08em;
+       color:var(--muted); margin:24px 0 10px; font-weight:600; }
+  .grid { display:grid; gap:12px; grid-template-columns:repeat(auto-fill,minmax(280px,1fr)); }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px; }
+  /* .stale (a busy device whose worker has gone quiet past the 30s grace) is
+     a middle alarm tier: louder than a healthy card — thicker border, tinted
+     background, bold text — so an operator scanning many cards cannot
+     mistake a ghost lease for a live one, but visually weaker than .alert
+     (device confirmed unhealthy) so the strongest signal stays reserved for
+     the worst state. */
+  .card.stale { border:2px solid var(--stale); background:var(--stale-bg); }
+  .card.stale .state { color:var(--stale); }
+  .card.stale .meta { color:var(--stale); font-weight:700; }
+  .card.alert { border:2px solid var(--unhealthy); background:var(--unhealthy-bg);
+                box-shadow:0 0 0 1px var(--unhealthy); }
+  .card.alert .meta { color:var(--unhealthy); font-weight:700; }
+  .dev { display:flex; justify-content:space-between; align-items:baseline; gap:8px; }
+  .name { font-weight:600; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
+  .state { font-size:12px; font-weight:600; }
+  .ready{color:var(--ready)} .busy{color:var(--busy)}
+  .unknown{color:var(--unknown)} .unhealthy{color:var(--unhealthy)}
+  .meta { color:var(--muted); font-size:12px; margin-top:6px; }
+  #updated { color:var(--muted); }
+  #updated.warn { color:var(--warn); font-weight:600; }
+  #updated.stale { color:var(--unhealthy); font-weight:700; }
+  .cmd { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px;
+         margin-top:6px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  table { width:100%; border-collapse:collapse; }
+  th,td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); font-size:13px; }
+  th { color:var(--muted); font-weight:600; font-size:11px; text-transform:uppercase; letter-spacing:.06em; }
+  td.mono { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px; }
+  .wrap { overflow-x:auto; }
+  input { background:var(--panel); color:var(--ink); border:1px solid var(--line);
+          border-radius:7px; padding:7px 10px; font:inherit; min-width:260px; }
+  button { background:var(--ink); color:var(--bg); border:0; border-radius:7px;
+           padding:7px 13px; font:inherit; font-weight:600; cursor:pointer; }
+  .empty { color:var(--muted); padding:14px 0; }
+  #err { color:var(--unhealthy); font-size:12px; }
+  #gate { padding:40px 20px; max-width:460px; margin:0 auto; }
+  .hide { display:none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>resource controller</h1>
+  <div class="hstat">
+    <span id="updated"></span>
+    <span id="err"></span>
+  </div>
+</header>
+
+<div id="gate">
+  <h2>client token</h2>
+  <p class="meta">Held for this tab only, never stored on disk.</p>
+  <form id="gateForm">
+    <input id="token" type="password" autocomplete="off" placeholder="paste a client token" required>
+    <button type="submit">connect</button>
+  </form>
+</div>
+
+<main id="app" class="hide">
+  <h2>devices</h2>
+  <div class="grid" id="devices"></div>
+
+  <h2>queue</h2>
+  <div class="wrap"><table id="queue">
+    <thead><tr><th>#</th><th>job</th><th>device</th><th>submitter</th><th>command</th></tr></thead>
+    <tbody></tbody>
+  </table></div>
+  <div class="empty hide" id="queueEmpty">nothing waiting</div>
+
+  <h2>running</h2>
+  <div class="wrap"><table id="jobs">
+    <thead><tr><th>job</th><th>device</th><th>state</th><th>submitter</th><th>command</th></tr></thead>
+    <tbody></tbody>
+  </table></div>
+  <div class="empty hide" id="jobsEmpty">nothing running</div>
+</main>
+
+<script>
+(function () {
+  var token = sessionStorage.getItem("rc_token") || "";
+  var gate = document.getElementById("gate");
+  var app = document.getElementById("app");
+  var err = document.getElementById("err");
+  var updated = document.getElementById("updated");
+
+  // pollTimer and es are the two "keep this page live" handles. Both must be
+  // torn down whenever the page returns to the gate (rejected token) and
+  // whenever start() runs again (a corrected token after a typo): without
+  // that, each failed attempt leaves its own interval running forever,
+  // hammering /v1/state with 401s that update nothing on screen.
+  var pollTimer = null;
+  var es = null;
+  var lastFetchAt = null;
+  var freshnessTimer = null;
+
+  document.getElementById("gateForm").addEventListener("submit", function (e) {
+    e.preventDefault();
+    token = document.getElementById("token").value.trim();
+    sessionStorage.setItem("rc_token", token);
+    start();
+  });
+
+  function fail(message) { err.textContent = message; }
+
+  // stopLive tears down every timer and connection that keeps the page
+  // updating on its own. Called before (re)starting and whenever the token
+  // is rejected, so nothing outlives the session that opened it.
+  function stopLive() {
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+    if (freshnessTimer) { clearInterval(freshnessTimer); freshnessTimer = null; }
+    if (es) { es.close(); es = null; }
+  }
+
+  function returnToGate() {
+    stopLive();
+    sessionStorage.removeItem("rc_token");
+    gate.classList.remove("hide");
+    app.classList.add("hide");
+  }
+
+  function fetchState() {
+    return fetch("/v1/state", { headers: { Authorization: "Bearer " + token } })
+      .then(function (r) {
+        if (r.status === 401 || r.status === 403) {
+          returnToGate();
+          throw new Error("token rejected");
+        }
+        if (!r.ok) throw new Error("state: " + r.status);
+        return r.json();
+      });
+  }
+
+  function ago(seconds) {
+    if (seconds < 60) return seconds + "s";
+    if (seconds < 3600) return Math.floor(seconds / 60) + "m" + (seconds % 60) + "s";
+    return Math.floor(seconds / 3600) + "h" + Math.floor((seconds % 3600) / 60) + "m";
+  }
+
+  function renderDevices(views) {
+    var box = document.getElementById("devices");
+    box.textContent = "";
+    (views || []).forEach(function (v) {
+      var d = v.device;
+      var stale = v.heartbeat_age_seconds > 30;
+      // A stale heartbeat on a device nobody holds is quiet-worrying; a
+      // stale heartbeat on a device that still lists a holder is a ghost
+      // lease — the exact "who has gpu0 right now, and has it gone quiet"
+      // question this page exists to answer. That case gets the loud
+      // .stale tier; unhealthy (worker confirmed gone, see Sweep) stays the
+      // loudest tier of all.
+      var staleHeld = stale && !!v.holder;
+      var card = document.createElement("div");
+      card.className = "card" + (d.state === "unhealthy" ? " alert" : staleHeld ? " stale" : "");
+
+      var head = document.createElement("div");
+      head.className = "dev";
+      var name = document.createElement("span");
+      name.className = "name";
+      name.textContent = d.id;
+      var state = document.createElement("span");
+      state.className = "state " + d.state;
+      state.textContent = d.state;
+      head.appendChild(name); head.appendChild(state);
+      card.appendChild(head);
+
+      var meta = document.createElement("div");
+      meta.className = "meta";
+      var bits = [];
+      if (v.holder) bits.push("held by " + v.holder + " for " + ago(v.elapsed_seconds));
+      if (stale) bits.push((staleHeld ? "⚠ no contact " : "no contact ") + ago(v.heartbeat_age_seconds));
+      meta.textContent = bits.join(" · ") || "idle";
+      card.appendChild(meta);
+
+      if (v.command && v.command.length) {
+        var cmd = document.createElement("div");
+        cmd.className = "cmd";
+        cmd.textContent = v.command.join(" ");
+        card.appendChild(cmd);
+      }
+      box.appendChild(card);
+    });
+  }
+
+  function fillTable(id, emptyId, rows, cells) {
+    var body = document.querySelector("#" + id + " tbody");
+    body.textContent = "";
+    (rows || []).forEach(function (row, i) {
+      var tr = document.createElement("tr");
+      cells(row, i).forEach(function (text, idx) {
+        var td = document.createElement("td");
+        if (idx === 0 || idx === 1) td.className = "mono";
+        td.textContent = text;
+        tr.appendChild(td);
+      });
+      body.appendChild(tr);
+    });
+    var empty = document.getElementById(emptyId);
+    var none = !rows || rows.length === 0;
+    empty.classList.toggle("hide", !none);
+    document.getElementById(id).classList.toggle("hide", none);
+  }
+
+  function render(state) {
+    err.textContent = "";
+    // Only reachable after fetchState() has already succeeded, so this is
+    // also the point at which we know the token is good enough to open the
+    // event stream — see connectEvents's own comment for why that ordering
+    // matters.
+    connectEvents();
+    renderDevices(state.devices);
+    fillTable("queue", "queueEmpty", state.queued, function (j, i) {
+      return [String(i + 1), j.id.slice(0, 8), j.device_id, j.submitter, (j.command || []).join(" ")];
+    });
+    fillTable("jobs", "jobsEmpty", state.jobs, function (j) {
+      return [j.id.slice(0, 8), j.device_id, j.state, j.submitter, (j.command || []).join(" ")];
+    });
+  }
+
+  // updateFreshness renders "updated Ns ago" from the last successful
+  // fetch, independent of whether the most recent poll succeeded — a
+  // controller that has gone unreachable must not leave the page looking
+  // current. It ticks on its own timer (see start()) so the age keeps
+  // climbing even between 5s polls, and degrades visually the longer the
+  // snapshot has sat unrefreshed: this is the other half of "who has gpu0
+  // right now" — the page must admit when "right now" isn't recent.
+  function updateFreshness() {
+    if (!lastFetchAt) { updated.textContent = ""; updated.className = ""; return; }
+    var age = Math.floor((Date.now() - lastFetchAt) / 1000);
+    updated.textContent = "updated " + ago(age) + " ago";
+    updated.className = age > 30 ? "stale" : (age > 10 ? "warn" : "");
+  }
+
+  function refresh() {
+    return fetchState()
+      .then(function (state) {
+        lastFetchAt = Date.now();
+        updateFreshness();
+        render(state);
+      })
+      .catch(function (e) { fail(e.message); });
+  }
+
+  // connectEvents opens the SSE nudge only after a fetchState() call has
+  // already proven the token works: opening it eagerly (as part of start(),
+  // before the first response lands) raced the stream's own auth failure
+  // against fetchState's, and whichever settled last clobbered the other's
+  // error message on screen. Deferring it to render() — which only ever
+  // runs after a successful fetch — removes the race outright rather than
+  // papering over it with a message priority check.
+  function connectEvents() {
+    if (es) return; // already connected
+    try {
+      es = new EventSource("/v1/events?token=" + encodeURIComponent(token));
+      es.onmessage = refresh;
+      // A rejected token already produced a more specific "token rejected"
+      // message via fetchState's catch and returned to the gate (which
+      // closes this stream). If err is still empty, nothing more specific
+      // has explained the drop, so this generic message is the right one.
+      es.onerror = function () {
+        if (!err.textContent) fail("event stream dropped; polling");
+      };
+    } catch (e) { /* polling remains the fallback */ }
+  }
+
+  function start() {
+    stopLive(); // re-entrant: a corrected token after a rejected one must
+                // not stack a second poller/stream on top of a leftover one
+    gate.classList.add("hide");
+    app.classList.remove("hide");
+    lastFetchAt = null;
+    updateFreshness();
+    refresh(); // connectEvents() runs from inside render(), i.e. only once
+               // this first call actually succeeds — see its comment
+    pollTimer = setInterval(refresh, 5000);
+    freshnessTimer = setInterval(updateFreshness, 1000);
+  }
+
+  if (token) start();
+})();
+</script>
+</body>
+</html>

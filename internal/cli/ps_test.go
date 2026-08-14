@@ -102,3 +102,49 @@ func TestRenderDevicesShowsHolderElapsedAndStaleness(t *testing.T) {
 	require.NotContains(t, gpu2, "no contact",
 		"an unhealthy device with a fresh heartbeat must not also be reported as silent")
 }
+
+// TestRenderJobsListsQueuedJobsWithPositions covers the minor that `rc ps`
+// showed only active jobs, which left a queued job's ID unobtainable — and
+// `rc kill`, which the README points operators at, needs an ID. Position
+// comes from the order the controller already returns the queue in, counted
+// per device, so it matches what the job's own queue_position would say.
+func TestRenderJobsListsQueuedJobsWithPositions(t *testing.T) {
+	var out bytes.Buffer
+
+	err := cli.RenderJobs(&out, &server.StateResponse{
+		Jobs: []model.Job{{
+			ID: "running-1", DeviceID: "gpubox:gpu0", State: model.JobRunning,
+			Submitter: "agent-a", Command: []string{"./bench"},
+		}},
+		// Scheduling order, as /v1/state returns it: two jobs waiting on gpu0
+		// and one on gpu1, whose own queue starts at 1 again.
+		Queued: []model.Job{
+			{ID: "queued-1", DeviceID: "gpubox:gpu0", State: model.JobQueued, Submitter: "agent-b", Command: []string{"./train"}},
+			{ID: "queued-2", DeviceID: "gpubox:gpu0", State: model.JobQueued, Submitter: "agent-c", Command: []string{"./eval"}},
+			{ID: "queued-3", DeviceID: "gpubox:gpu1", State: model.JobQueued, Submitter: "agent-d", Command: []string{"./other"}},
+		},
+	})
+	require.NoError(t, err)
+
+	got := out.String()
+	require.Contains(t, lineFor(t, got, "running-1"), "running")
+
+	first := lineFor(t, got, "queued-1")
+	require.Contains(t, first, "queued (#1)")
+	require.Contains(t, first, "agent-b")
+	require.Contains(t, first, "./train")
+
+	require.Contains(t, lineFor(t, got, "queued-2"), "queued (#2)")
+	require.Contains(t, lineFor(t, got, "queued-3"), "queued (#1)",
+		"position is per device: another device's queue starts at 1 again")
+}
+
+// The table is buffered until Flush, so a dropped Flush error would let
+// `rc ps | head` print nothing and still exit 0.
+func TestRenderJobsPropagatesWriteError(t *testing.T) {
+	wantErr := errors.New("disk full")
+	err := cli.RenderJobs(failWriter{wantErr}, &server.StateResponse{
+		Jobs: []model.Job{{ID: "job1", DeviceID: "gpubox:gpu0", State: model.JobRunning}},
+	})
+	require.ErrorIs(t, err, wantErr)
+}

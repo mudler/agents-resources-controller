@@ -29,7 +29,7 @@ func TestHeartbeatRestoresUnknownDeviceToReady(t *testing.T) {
 	_, err := s.Sweep(30*time.Second, 5*time.Minute)
 	require.NoError(t, err)
 
-	require.NoError(t, s.RecordHeartbeat("w1", c.Now()))
+	require.NoError(t, s.RecordHeartbeat("w1", c.Now(), nil))
 
 	devices, err := s.Devices()
 	require.NoError(t, err)
@@ -49,7 +49,8 @@ func TestHeartbeatRestoresLeasedDeviceToBusyNotReady(t *testing.T) {
 	_, err = s.Sweep(30*time.Second, 5*time.Minute)
 	require.NoError(t, err)
 
-	require.NoError(t, s.RecordHeartbeat("w1", c.Now()))
+	// The worker is back and still supervising the job, so it names it.
+	require.NoError(t, s.RecordHeartbeat("w1", c.Now(), []string{job.ID}))
 
 	devices, err := s.Devices()
 	require.NoError(t, err)
@@ -106,7 +107,7 @@ func TestClearDeviceMakesUnhealthyDeviceSchedulableAgain(t *testing.T) {
 	cleared, err := s.ClearDevice("gpubox:gpu0")
 	require.NoError(t, err)
 	require.True(t, cleared)
-	require.NoError(t, s.RecordHeartbeat("w1", c.Now()))
+	require.NoError(t, s.RecordHeartbeat("w1", c.Now(), nil))
 
 	job, err := s.Allocate(req("agent-b"))
 	require.NoError(t, err)

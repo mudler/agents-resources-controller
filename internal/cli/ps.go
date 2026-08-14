@@ -72,23 +72,49 @@ func NewDevicesCmd() *cobra.Command {
 	return cmd
 }
 
+// RenderJobs prints the active jobs followed by the queue. Queued jobs are
+// listed because `rc ps` is the only way to find a job's ID, and `rc kill`
+// (which the README tells operators to reach for) needs one: a queued job
+// nobody can name is a job nobody can cancel except by waiting for it to
+// start first.
+//
+// Position is computed here rather than fetched per job: state.Queued already
+// arrives in scheduling order (priority, then FIFO), so counting along it per
+// device gives the same 1-based, per-device position the controller reports
+// for a single job — without one HTTP request per queued job.
+//
+// It returns tabwriter's Flush error for the same reason RenderDevices does:
+// the whole table is buffered until Flush, so a discarded error means a
+// silently empty `rc ps` on a broken pipe.
+func RenderJobs(w io.Writer, state *server.StateResponse) error {
+	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "JOB\tDEVICE\tSTATE\tSUBMITTER\tCOMMAND")
+	for _, j := range state.Jobs {
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n",
+			j.ID, j.DeviceID, j.State, j.Submitter, strings.Join(j.Command, " "))
+	}
+
+	position := map[string]int{}
+	for _, j := range state.Queued {
+		position[j.DeviceID]++
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n",
+			j.ID, j.DeviceID, fmt.Sprintf("queued (#%d)", position[j.DeviceID]),
+			j.Submitter, strings.Join(j.Command, " "))
+	}
+	return tw.Flush()
+}
+
 func NewPsCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "ps",
-		Short: "Show running jobs",
+		Short: "Show running and queued jobs",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c := client.New(controllerURL(), controllerToken())
 			state, err := c.State(cmd.Context())
 			if err != nil {
 				return err
 			}
-			tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 4, 2, ' ', 0)
-			fmt.Fprintln(tw, "JOB\tDEVICE\tSTATE\tSUBMITTER\tCOMMAND")
-			for _, j := range state.Jobs {
-				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n",
-					j.ID, j.DeviceID, j.State, j.Submitter, strings.Join(j.Command, " "))
-			}
-			return tw.Flush()
+			return RenderJobs(cmd.OutOrStdout(), state)
 		},
 	}
 }
