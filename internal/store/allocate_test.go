@@ -36,6 +36,22 @@ func req(submitter string) store.AllocateRequest {
 	}
 }
 
+// nowOf exposes the fake clock's current time to tests that need to stamp a
+// row directly.
+func nowOf(s *store.Store) time.Time { return s.Now() }
+
+// registerSecondDevice adds gpubox:gpu1 to the worker newStore created.
+func registerSecondDevice(t *testing.T, s *store.Store) {
+	t.Helper()
+	require.NoError(t, s.UpsertWorker(
+		model.Worker{ID: "w1", Host: "gpubox", BootID: "boot-1", LastHeartbeatAt: s.Now()},
+		[]model.Device{
+			{ID: "gpubox:gpu0", Host: "gpubox", Name: "gpu0", WorkerID: "w1"},
+			{ID: "gpubox:gpu1", Host: "gpubox", Name: "gpu1", WorkerID: "w1"},
+		},
+	))
+}
+
 func TestAllocateGrantsDeviceOnce(t *testing.T) {
 	s, _ := newStore(t)
 

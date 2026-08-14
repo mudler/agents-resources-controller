@@ -265,9 +265,10 @@ func (s *Store) assignQueued(jobID, deviceID string) (*model.Job, error) {
 	defer tx.Rollback()
 
 	var workerID string
+	var deviceCeiling int64
 	err = tx.QueryRow(
-		`SELECT worker_id FROM devices WHERE id = ? AND state = ?`,
-		deviceID, string(model.DeviceReady)).Scan(&workerID)
+		`SELECT worker_id, max_runtime FROM devices WHERE id = ? AND state = ?`,
+		deviceID, string(model.DeviceReady)).Scan(&workerID, &deviceCeiling)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNoDevice
 	}
@@ -286,14 +287,24 @@ func (s *Store) assignQueued(jobID, deviceID string) (*model.Job, error) {
 		return nil, err
 	}
 
+	// A pinned job already had the device's ceiling applied at submit time
+	// in Enqueue. A selector job could not know which device it would land
+	// on, so it inherits the landing device's ceiling only now, and only if
+	// it asked for none of its own.
+	if ttl == 0 && deviceCeiling > 0 {
+		ttl = deviceCeiling
+	}
+
 	if _, err := tx.Exec(
 		`UPDATE devices SET state = ? WHERE id = ? AND state = ?`,
 		string(model.DeviceBusy), deviceID, string(model.DeviceReady)); err != nil {
 		return nil, fmt.Errorf("mark device busy: %w", err)
 	}
+	// device_id is set here (not only at Enqueue) because a selector job's
+	// row carries no device_id until it lands on one.
 	if _, err := tx.Exec(
-		`UPDATE jobs SET state = ?, worker_id = ? WHERE id = ?`,
-		string(model.JobAssigned), workerID, jobID); err != nil {
+		`UPDATE jobs SET state = ?, device_id = ?, worker_id = ?, max_runtime = ? WHERE id = ?`,
+		string(model.JobAssigned), deviceID, workerID, ttl, jobID); err != nil {
 		return nil, fmt.Errorf("assign job: %w", err)
 	}
 

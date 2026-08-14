@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/mudler/agents-resources-controller/internal/model"
+	"github.com/mudler/agents-resources-controller/internal/selector"
 )
 
 // ErrRuntimeAboveCeiling means the job asked for more wall clock than the
@@ -22,8 +24,14 @@ var ErrRuntimeAboveCeiling = errors.New("requested runtime exceeds the device ce
 // long) so a caller — and the HTTP layer — can answer each differently.
 var ErrUnknownDevice = errors.New("unknown device")
 
+// ErrNoMatchingDevice means the selector matches no device that exists. We
+// reject at submit rather than queue forever: a selector matching nothing is
+// far more often a typo than a bet on a host registering later.
+var ErrNoMatchingDevice = errors.New("no device matches the selector")
+
 type EnqueueRequest struct {
 	DeviceID       string
+	Selector       string
 	Command        []string
 	Cwd            string
 	Env            map[string]string
@@ -63,6 +71,32 @@ func (s *Store) Enqueue(req EnqueueRequest) (*model.Job, error) {
 	if req.Submitter == "" {
 		return nil, errors.New("submitter required")
 	}
+
+	switch {
+	case req.DeviceID != "" && req.Selector != "":
+		return nil, errors.New("give either device_id or selector, not both")
+	case req.DeviceID == "" && req.Selector == "":
+		return nil, errors.New("device_id or selector required")
+	}
+
+	// Selector resolution runs before the transaction opens: MatchingDevices
+	// issues its own queries against s.db, and with MaxOpenConns(1) doing
+	// that while a tx already holds the only connection would deadlock.
+	if req.Selector != "" {
+		sel, err := selector.Parse(req.Selector)
+		if err != nil {
+			return nil, fmt.Errorf("selector: %w", err)
+		}
+		matches, err := s.MatchingDevices(sel.String())
+		if err != nil {
+			return nil, err
+		}
+		if len(matches) == 0 {
+			return nil, fmt.Errorf("%w: %s", ErrNoMatchingDevice, sel.String())
+		}
+		req.Selector = sel.String() // store the normalised form
+	}
+
 	now := s.clock.Now()
 
 	tx, err := s.db.Begin()
@@ -85,23 +119,27 @@ func (s *Store) Enqueue(req EnqueueRequest) (*model.Job, error) {
 		}
 	}
 
-	var ceiling int64
-	err = tx.QueryRow(`SELECT max_runtime FROM devices WHERE id = ?`, req.DeviceID).Scan(&ceiling)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, fmt.Errorf("%w: %q", ErrUnknownDevice, req.DeviceID)
-	}
-	if err != nil {
-		return nil, err
-	}
-	if ceiling > 0 {
-		limit := time.Duration(ceiling) * time.Second
-		if req.MaxRuntime == 0 || req.MaxRuntime > limit {
-			if req.MaxRuntime > limit {
-				return nil, fmt.Errorf("%w: %s allows at most %s",
-					ErrRuntimeAboveCeiling, req.DeviceID, limit)
+	// A selector job's ceiling is resolved at assignment time instead: it
+	// inherits whatever device it lands on, which is not known yet.
+	if req.DeviceID != "" {
+		var ceiling int64
+		err = tx.QueryRow(`SELECT max_runtime FROM devices WHERE id = ?`, req.DeviceID).Scan(&ceiling)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, fmt.Errorf("%w: %q", ErrUnknownDevice, req.DeviceID)
+		}
+		if err != nil {
+			return nil, err
+		}
+		if ceiling > 0 {
+			limit := time.Duration(ceiling) * time.Second
+			if req.MaxRuntime == 0 || req.MaxRuntime > limit {
+				if req.MaxRuntime > limit {
+					return nil, fmt.Errorf("%w: %s allows at most %s",
+						ErrRuntimeAboveCeiling, req.DeviceID, limit)
+				}
+				// No request: inherit the device's ceiling.
+				req.MaxRuntime = limit
 			}
-			// No request: inherit the device's ceiling.
-			req.MaxRuntime = limit
 		}
 	}
 
@@ -124,8 +162,8 @@ func (s *Store) Enqueue(req EnqueueRequest) (*model.Job, error) {
 		`INSERT INTO jobs (id, selector, command, cwd, env, submitter, idempotency_key,
 		                   state, device_id, worker_id, submitted_at, queued_at,
 		                   priority, max_runtime, idle_timeout)
-		 VALUES (?, '', ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?)`,
-		id, string(cmdJSON), req.Cwd, string(envJSON), req.Submitter, key,
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?)`,
+		id, req.Selector, string(cmdJSON), req.Cwd, string(envJSON), req.Submitter, key,
 		string(model.JobQueued), req.DeviceID, now.Unix(), now.Unix(),
 		req.Priority, int64(req.MaxRuntime.Seconds()), int64(req.IdleTimeout.Seconds()),
 	); err != nil {
@@ -136,6 +174,32 @@ func (s *Store) Enqueue(req EnqueueRequest) (*model.Job, error) {
 		return nil, err
 	}
 	return s.Job(id)
+}
+
+// MatchingDevices returns the device IDs whose effective labels satisfy the
+// selector, sorted by ID so scheduling is deterministic.
+func (s *Store) MatchingDevices(sel string) ([]string, error) {
+	parsed, err := selector.Parse(sel)
+	if err != nil {
+		return nil, fmt.Errorf("selector: %w", err)
+	}
+	snap, err := s.LabelSnapshot()
+	if err != nil {
+		return nil, err
+	}
+	devices, err := s.Devices()
+	if err != nil {
+		return nil, err
+	}
+
+	var out []string
+	for _, d := range devices {
+		if parsed.Match(snap[d.ID]) {
+			out = append(out, d.ID)
+		}
+	}
+	sort.Strings(out)
+	return out, nil
 }
 
 // ScheduleOnce makes one scheduling pass: for each queued job in priority then
@@ -160,28 +224,59 @@ func (s *Store) ScheduleOnce() ([]model.Job, error) {
 	reserved := map[string]bool{} // device -> a queued job ahead of us holds it
 
 	for _, job := range queued {
-		if reserved[job.DeviceID] {
-			continue // someone ahead of us is waiting for this device
-		}
-
-		out, err := s.assignQueued(job.ID, job.DeviceID)
-		switch {
-		case err == nil:
-			assigned = append(assigned, *out)
-		case errors.Is(err, ErrNoDevice):
-			// Not free: hold it for this job so later jobs cannot jump ahead.
-			reserved[job.DeviceID] = true
-			if err := s.reserve(job.ID, job.DeviceID); err != nil {
+		candidates := []string{job.DeviceID}
+		if job.Selector != "" {
+			var err error
+			candidates, err = s.MatchingDevices(job.Selector)
+			if err != nil {
 				return nil, err
 			}
-		case errors.Is(err, errJobNoLongerQueued):
-			// This job vanished (e.g. cancelled) between QueuedJobs and here.
-			// There is no job left to reserve the device for, so skip it
-			// entirely: reserve nothing, and let whoever is behind it in the
-			// queue — for the same device or otherwise — proceed this pass
-			// rather than idle a free device until the next tick.
-		default:
-			return nil, err
+		}
+
+		// Someone ahead of us is holding one of these devices. Note the
+		// existing `reserved` is a map[string]bool — each queued job is
+		// visited once per pass, so a job can never encounter its own
+		// reservation and no owner needs recording.
+		blocked := false
+		for _, deviceID := range candidates {
+			if reserved[deviceID] {
+				blocked = true
+				break
+			}
+		}
+		if blocked {
+			continue
+		}
+
+		placed := false
+		for _, deviceID := range candidates {
+			out, err := s.assignQueued(job.ID, deviceID)
+			switch {
+			case err == nil:
+				assigned = append(assigned, *out)
+				placed = true
+			case errors.Is(err, ErrNoDevice):
+				continue // this one is busy; try the next candidate
+			case errors.Is(err, errJobNoLongerQueued):
+				placed = true // vanished; reserve nothing on its behalf
+			default:
+				return nil, err
+			}
+			if placed {
+				break
+			}
+		}
+		if placed {
+			continue
+		}
+
+		// Nothing free: hold every candidate for this job so later jobs
+		// cannot jump ahead of it.
+		for _, deviceID := range candidates {
+			reserved[deviceID] = true
+			if err := s.reserve(job.ID, deviceID); err != nil {
+				return nil, err
+			}
 		}
 	}
 	return assigned, nil
@@ -226,8 +321,11 @@ func (s *Store) QueuedJobs() ([]model.Job, error) {
 	return out, nil
 }
 
-// QueuePosition is 1-based among jobs waiting for the same device; 0 means the
-// job is not queued.
+// QueuePosition is 1-based. For a pinned job it counts jobs ahead of it
+// waiting for the same device. A selector job's candidate set can change
+// between scheduling passes (labels change, devices come and go), so it
+// counts every queued job ahead of it in scheduling order instead — an
+// upper bound on its wait, not an exact slot. 0 means the job is not queued.
 func (s *Store) QueuePosition(jobID string) (int, error) {
 	job, err := s.Job(jobID)
 	if err != nil {
@@ -241,13 +339,21 @@ func (s *Store) QueuePosition(jobID string) (int, error) {
 		queuedAt = job.QueuedAt.Unix()
 	}
 	// Tie-break on rowid, not id: see the comment on QueuedJobs for why.
+	deviceFilter := "device_id = ?"
+	args := []any{string(model.JobQueued)}
+	if job.Selector != "" {
+		deviceFilter = "1 = 1"
+	} else {
+		args = append(args, job.DeviceID)
+	}
+	args = append(args, job.Priority, job.Priority, queuedAt, queuedAt, job.ID)
+
 	var ahead int
 	err = s.db.QueryRow(
 		`SELECT COUNT(*) FROM jobs
-		 WHERE state = ? AND device_id = ?
+		 WHERE state = ? AND `+deviceFilter+`
 		   AND (priority > ? OR (priority = ? AND (queued_at < ? OR (queued_at = ? AND rowid < (SELECT rowid FROM jobs WHERE id = ?)))))`,
-		string(model.JobQueued), job.DeviceID,
-		job.Priority, job.Priority, queuedAt, queuedAt, job.ID,
+		args...,
 	).Scan(&ahead)
 	if err != nil {
 		return 0, err

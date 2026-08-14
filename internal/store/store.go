@@ -51,6 +51,10 @@ func Open(path string, c clock.Clock) (*Store, error) {
 
 func (s *Store) Close() error { return s.db.Close() }
 
+// Now returns the controller's current time as seen through its Clock, so
+// tests using a fake clock can stamp rows consistently with the store.
+func (s *Store) Now() time.Time { return s.clock.Now() }
+
 // UpsertWorker registers a worker and its declared devices. A worker that
 // registers is a fresh process announcing it has no running jobs — nothing
 // a brand-new process could be supervising survives a restart — so
