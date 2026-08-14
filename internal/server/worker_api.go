@@ -6,11 +6,13 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/mudler/agents-resources-controller/internal/model"
+	"github.com/mudler/agents-resources-controller/internal/store"
 )
 
 // maxLogChunk bounds a single log upload. A worker whose chunk exceeds this
@@ -49,6 +51,9 @@ type Assignment struct {
 	Env                map[string]string `json:"env,omitempty"`
 	MaxRuntimeSeconds  int               `json:"max_runtime_seconds,omitempty"`
 	IdleTimeoutSeconds int               `json:"idle_timeout_seconds,omitempty"`
+	// Submitter carries the job's submitter so a lease lifecycle hook's
+	// RC_SUBMITTER can name them.
+	Submitter string `json:"submitter,omitempty"`
 }
 
 // PollResponse is the envelope handleAssignments answers a long-poll with: it
@@ -68,6 +73,17 @@ type PollResponse struct {
 // unrelated liveness signal.
 type HeartbeatRequest struct {
 	RunningJobIDs []string `json:"running_job_ids,omitempty"`
+}
+
+// FaultRequest is what a worker sends when a lease lifecycle hook fails —
+// today, an on_acquire hook that exited non-zero or timed out. Reason is
+// free text (the hook's own tail output) kept for the controller's own
+// logs; it is not persisted on the device row, which already has a fixed
+// quarantine_reason vocabulary (see internal/store/reaper.go) — the
+// operator-facing "why" lives on the job's own failure report instead,
+// where `rc ps` already surfaces it.
+type FaultRequest struct {
+	Reason string `json:"reason"`
 }
 
 type StatusRequest struct {
@@ -234,6 +250,7 @@ func (s *Server) handleAssignments(w http.ResponseWriter, r *http.Request) {
 				out = append(out, Assignment{
 					JobID: j.ID, DeviceID: j.DeviceID, Command: j.Command, Cwd: j.Cwd, Env: j.Env,
 					MaxRuntimeSeconds: j.MaxRuntimeSeconds, IdleTimeoutSeconds: j.IdleTimeoutSeconds,
+					Submitter: j.Submitter,
 				})
 			}
 			writeJSON(w, http.StatusOK, PollResponse{Assignments: out, Kills: kills})
@@ -248,6 +265,44 @@ func (s *Server) handleAssignments(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+}
+
+// handleDeviceFault is the first (and, as of this feature, only) producer of
+// a "fault" quarantine: a worker whose on_acquire hook failed calls this
+// instead of ever starting the job, so the controller takes the device out
+// of the pool immediately rather than handing it to the next assignment.
+// SetDeviceState already records DeviceUnhealthy set through this path with
+// quarantine reason "fault" — the one cause rebootClearableReasons
+// (internal/store/reaper.go) deliberately excludes, since a reboot proves no
+// process survived but nothing about the hardware (or, here, the service
+// the hook could not stop). Only an admin's explicit
+// POST /v1/devices/{id}/clear puts it back.
+func (s *Server) handleDeviceFault(w http.ResponseWriter, r *http.Request) {
+	var req FaultRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	id := r.PathValue("id")
+	if req.Reason == "" {
+		writeErr(w, http.StatusBadRequest, "bad_request", "reason required")
+		return
+	}
+	if err := s.cfg.Store.SetDeviceState(id, model.DeviceUnhealthy, s.cfg.Clock.Now()); err != nil {
+		// A device ID this controller has never heard of must not answer 200:
+		// the worker would log a successful quarantine having changed nothing,
+		// and the device (whatever its real ID is) stays schedulable while
+		// everyone believes it was taken out of the pool. Say plainly that
+		// nothing matched.
+		if errors.Is(err, store.ErrDeviceNotFound) {
+			writeErr(w, http.StatusNotFound, "not_found", "device not found")
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
+		return
+	}
+	slog.Warn("device quarantined: fault", "device", id, "reason", req.Reason)
+	s.publishDevices()
+	w.WriteHeader(http.StatusOK)
 }
 
 func (s *Server) handleAppendLogs(w http.ResponseWriter, r *http.Request) {

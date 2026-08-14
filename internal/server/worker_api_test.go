@@ -595,6 +595,119 @@ func TestJobStatusForUnknownJobReturns404(t *testing.T) {
 	require.Equal(t, http.StatusNotFound, sr.StatusCode)
 }
 
+// TestDeviceFaultQuarantinesUnhealthy pins the new route's contract: a
+// worker reporting a fault (an acquire hook that failed) must land the
+// device in the same unhealthy state SetDeviceState already produces for a
+// self-reported fault.
+func TestDeviceFaultQuarantinesUnhealthy(t *testing.T) {
+	ts, _, _, _ := newServer(t)
+
+	post(t, ts, "wtok", "/v1/workers/register",
+		server.RegisterRequest{Host: "gpubox", Devices: []server.DeviceSpec{{Name: "gpu0"}}}).Body.Close()
+
+	resp := post(t, ts, "wtok", "/v1/devices/gpubox:gpu0/fault", map[string]string{"reason": "on_acquire failed: exit 1"})
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	dr := get(t, ts, "ctok", "/v1/devices")
+	defer dr.Body.Close()
+	var views []server.DeviceView
+	require.NoError(t, json.NewDecoder(dr.Body).Decode(&views))
+	require.Len(t, views, 1)
+	require.Equal(t, model.DeviceUnhealthy, views[0].Device.State)
+}
+
+// TestDeviceFaultOutlivesAReboot pins the reason it must be "fault" and not
+// some other quarantine cause: only "fault" is NOT in rebootClearableReasons
+// (internal/store/reaper.go), so a subsequent reboot (a changed boot ID at
+// re-registration) must leave the device unhealthy — unlike worker_lost,
+// lease_expired, or registration, all of which a proven reboot does clear.
+func TestDeviceFaultOutlivesAReboot(t *testing.T) {
+	ts, _, _, _ := newServer(t)
+
+	post(t, ts, "wtok", "/v1/workers/register",
+		server.RegisterRequest{Host: "gpubox", BootID: "boot-1", Devices: []server.DeviceSpec{{Name: "gpu0"}}}).Body.Close()
+
+	post(t, ts, "wtok", "/v1/devices/gpubox:gpu0/fault", map[string]string{"reason": "on_acquire failed"}).Body.Close()
+
+	// The host reboots: a changed boot ID is the one thing that proves
+	// nothing survived, and normally clears a quarantine.
+	post(t, ts, "wtok", "/v1/workers/register",
+		server.RegisterRequest{Host: "gpubox", BootID: "boot-2", Devices: []server.DeviceSpec{{Name: "gpu0"}}}).Body.Close()
+
+	dr := get(t, ts, "ctok", "/v1/devices")
+	defer dr.Body.Close()
+	var views []server.DeviceView
+	require.NoError(t, json.NewDecoder(dr.Body).Decode(&views))
+	require.Len(t, views, 1)
+	require.Equal(t, model.DeviceUnhealthy, views[0].Device.State,
+		"a fault must outlive a reboot: a reboot proves no process survived, not that the hardware is sound")
+}
+
+// TestDeviceFaultOnUnknownDeviceIs404 guards the fix for a route that
+// answered 200 having changed nothing: SetDeviceState's UPDATE simply
+// matches no row for an ID this controller has never seen, which SQL does
+// not consider an error. The worker then logs a successful quarantine for a
+// device that is still perfectly schedulable — the worst combination there
+// is, since nobody goes looking for a device everyone believes was taken
+// out of the pool.
+func TestDeviceFaultOnUnknownDeviceIs404(t *testing.T) {
+	ts, _, _, _ := newServer(t)
+
+	post(t, ts, "wtok", "/v1/workers/register",
+		server.RegisterRequest{Host: "gpubox", Devices: []server.DeviceSpec{{Name: "gpu0"}}}).Body.Close()
+
+	resp := post(t, ts, "wtok", "/v1/devices/gpubox:typo0/fault", map[string]string{"reason": "on_acquire failed"})
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusNotFound, resp.StatusCode,
+		"a fault report that matched no device must never read as success")
+
+	// The real device is untouched: nothing was quarantined by accident.
+	dr := get(t, ts, "ctok", "/v1/devices")
+	defer dr.Body.Close()
+	var views []server.DeviceView
+	require.NoError(t, json.NewDecoder(dr.Body).Decode(&views))
+	require.Len(t, views, 1)
+	require.Equal(t, model.DeviceReady, views[0].Device.State)
+}
+
+// TestUnknownTokenCannotReportDeviceFault pins the other half of the fault
+// route's auth: an unrecognised (or missing) token is refused outright,
+// before the handler can quarantine anything.
+func TestUnknownTokenCannotReportDeviceFault(t *testing.T) {
+	ts, _, _, _ := newServer(t)
+	resp := post(t, ts, "nope", "/v1/devices/gpubox:gpu0/fault", map[string]string{"reason": "x"})
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+}
+
+// TestAdminTokenMayReportDeviceFault pins the deliberate exception in the
+// role model: admin outranks every role, on worker routes included, so an
+// operator standing in for a host (or a verify probe run by hand) can
+// quarantine a device without a worker token. This is the documented rule
+// in require(), not an oversight — a test says so, so a future reader does
+// not "fix" it into a 403.
+func TestAdminTokenMayReportDeviceFault(t *testing.T) {
+	ts, _, _, _ := newServer(t)
+
+	post(t, ts, "wtok", "/v1/workers/register",
+		server.RegisterRequest{Host: "gpubox", Devices: []server.DeviceSpec{{Name: "gpu0"}}}).Body.Close()
+
+	resp := post(t, ts, "atok", "/v1/devices/gpubox:gpu0/fault", map[string]string{"reason": "operator standing in"})
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+}
+
+// TestClientTokenCannotReportDeviceFault mirrors
+// TestClientTokenCannotRegisterWorker: the fault route is worker-token only,
+// the same as every other route a device host itself calls.
+func TestClientTokenCannotReportDeviceFault(t *testing.T) {
+	ts, _, _, _ := newServer(t)
+	resp := post(t, ts, "ctok", "/v1/devices/gpubox:gpu0/fault", map[string]string{"reason": "x"})
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusForbidden, resp.StatusCode)
+}
+
 func TestOversizedLogChunkIsRejected(t *testing.T) {
 	ts, _, logs, _ := newServer(t)
 

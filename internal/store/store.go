@@ -19,6 +19,11 @@ import (
 //go:embed schema.sql
 var schema string
 
+// ErrDeviceNotFound means the device ID named by a caller matches no row.
+// It exists so an update that changed nothing can never be mistaken for one
+// that did: see SetDeviceState.
+var ErrDeviceNotFound = errors.New("device not found")
+
 type Store struct {
 	db    *sql.DB
 	clock clock.Clock
@@ -260,16 +265,33 @@ func (s *Store) restoreRebootedDevicesLocked(tx *sql.Tx, workerID string) error 
 // hand out — which is recorded as such: a fault outlives a reboot, unlike a
 // quarantine that merely reflects a process nobody can account for. Any other
 // state clears the reason along with the quarantine it explained.
+//
+// A device ID that matches no row yields ErrDeviceNotFound rather than a
+// silent success. An UPDATE that changes zero rows is not an error to SQL,
+// but it is very much one here: the caller believes it has just quarantined
+// a device, and a worker that logs a successful fault report having changed
+// nothing is the worst possible outcome — the device stays schedulable and
+// nobody is looking for it.
 func (s *Store) SetDeviceState(id string, state model.DeviceState, at time.Time) error {
 	reason := ""
 	if state == model.DeviceUnhealthy {
 		reason = quarantineFault
 	}
-	_, err := s.db.Exec(
+	res, err := s.db.Exec(
 		`UPDATE devices SET state = ?, quarantine_reason = ?, last_heartbeat_at = ? WHERE id = ?`,
 		string(state), reason, at.Unix(), id,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf("%w: %s", ErrDeviceNotFound, id)
+	}
+	return nil
 }
 
 func (s *Store) Devices() ([]model.Device, error) {
