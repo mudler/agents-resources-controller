@@ -3,6 +3,15 @@ token: replace-with-worker-token
 # host defaults to the machine's hostname; device IDs become <host>:<name>.
 # Names should end in the GPU's index (gpu0, gpu1, ...): the worker derives
 # CUDA_VISIBLE_DEVICES from that trailing integer. See README.md.
+
+# hooks: is host-level defaults for the lease lifecycle hooks below. Either
+# field may be omitted; an omitted field falls back to the built-in default
+# (timeout: 60s, release_linger: 30s). A device's own timeout/release_linger
+# overrides these per device.
+hooks:
+  timeout: 60s
+  release_linger: 30s
+
 devices:
   # Object form: max_runtime is a per-device runtime ceiling. The controller
   # rejects (not clamps) a job that asks for more than this, and the worker
@@ -10,9 +19,37 @@ devices:
   # requests no ceiling of its own inherits this one.
   - name: gpu0
     max_runtime: 6h
+    # on_acquire/on_release run (in their own process group, under the same
+    # timeout supervision a job gets) when this device transitions between
+    # free and held. Point them at whatever needs the VRAM out of the way —
+    # here, stopping/starting a local inference server. Both are optional
+    # and independent; a device can set either, neither, or both.
+    on_acquire: /etc/rc/hooks/stop-localai.sh
+    on_release: /etc/rc/hooks/start-localai.sh
+    # release_linger delays on_release this long after a job ends before it
+    # actually runs. If another job lands on this device before the linger
+    # expires, the pending on_release is cancelled and that next job's own
+    # on_acquire is skipped too — the device was never actually idle, so
+    # stopping and restarting the service in between would be pure churn.
+    # Net effect: a burst of back-to-back jobs on one device produces exactly
+    # one on_acquire (before the first job) and one on_release (once the
+    # device has been genuinely idle for release_linger) — not one pair per
+    # job. The linger only delays the hook, never the next job: a queued job
+    # starts the instant the device is free, whether or not on_release has
+    # fired yet.
+    #
+    # IMPORTANT: on_release must be idempotent — safe to run when the
+    # service it targets is already stopped. Every worker start (a fresh
+    # process, a crash recovery, a plain restart) runs the on_release hook
+    # of every device that declares one, once, before the worker ever polls
+    # for work, specifically so a crashed or forcibly restarted worker heals
+    # its own node instead of leaving a service down that a live job no
+    # longer holds.
+    release_linger: 45s
   # Plain name form still works, exactly as before — shorthand for
-  # {name: gpu1} with no ceiling, so jobs on gpu1 run unbounded unless they
-  # set their own --max-runtime.
+  # {name: gpu1} with no ceiling and no hooks, so jobs on gpu1 run unbounded
+  # unless they set their own --max-runtime, and nothing runs on acquire or
+  # release.
   - gpu1
 heartbeat_interval: 10s
 poll_wait: 30s

@@ -12,7 +12,8 @@ Exclusive device leases, supervised job execution, live log streaming, fleet
 visibility, a queue with priorities, per-device runtime watchdogs, lease
 expiry, boot-identity recovery, server-side cancellation (`rc kill`),
 re-attaching to a running job's output (`rc attach`), a live SSE event
-stream, and a read-only web dashboard.
+stream, a read-only web dashboard, and lease lifecycle hooks (stop/start a
+service like LocalAI or ollama around a job's hold on a device).
 
 **Not built yet**, so you will not find them documented below:
 
@@ -217,6 +218,70 @@ unset rather than guess wrong — silently setting the wrong index would let a
 job touch a GPU it was never leased, which is worse than setting nothing. An
 operator-supplied `CUDA_VISIBLE_DEVICES` already present in the job's own
 `env` is never overridden.
+
+### Lease lifecycle hooks
+
+A device is often not empty just because no job holds it: an inference
+server (LocalAI, ollama) can sit on the VRAM a job needs. `on_acquire` /
+`on_release` on a device in `worker.yaml` let the worker stop that service
+before a job touches the device and start it again once the device is
+genuinely idle:
+
+```yaml
+hooks:                    # host-level defaults, both optional
+  timeout: 60s             # built-in default if omitted
+  release_linger: 30s      # built-in default if omitted
+devices:
+  - name: gpu0
+    on_acquire: /etc/rc/hooks/stop-localai.sh
+    on_release: /etc/rc/hooks/start-localai.sh
+    timeout: 60s            # per-device override of hooks.timeout
+    release_linger: 45s     # per-device override of hooks.release_linger
+```
+
+`on_acquire` and `on_release` are both optional and independent — a device
+can set either, neither, or both. Each is a path to a script, run under the
+same process-group supervision a job gets (its own process group, killed
+whole if it runs past `timeout`), with `RC_EVENT` (`acquire` or `release`),
+`RC_DEVICE`, `RC_JOB_ID`, `RC_SUBMITTER`, and `CUDA_VISIBLE_DEVICES` (derived
+the same way a job's is) in its environment.
+
+**The release is lingered, not immediate, and that is what makes "held" a
+per-device state instead of a per-job event.** When a job ends, the worker
+doesn't run `on_release` right away — it arms a timer for `release_linger`
+later. If another job lands on the same device before that timer fires, the
+pending release is cancelled *and* that next job's own `on_acquire` is
+skipped: the device was never actually released, so stopping and restarting
+the service in between would be pure churn. Net effect: a burst of
+back-to-back jobs on one device produces exactly one `on_acquire` (before
+the first job touches it) and one `on_release` (once the device has
+genuinely sat idle for `release_linger`) — not one pair per job. The linger
+only delays the hook, never the next job: a queued job is scheduled and
+starts the instant the device frees up, whether or not `on_release` has run
+yet.
+
+**An `on_acquire` failure (non-zero exit or a timeout) fails the job before
+it ever runs**, with the hook's own output as the failure reason (so it
+shows up in `rc ps`), and quarantines the device via
+`POST /v1/devices/{id}/fault` — a `fault` quarantine, the one kind a proven
+reboot deliberately does **not** clear (see "Device host" above): a reboot
+proves no process survived, but proves nothing about failing hardware or a
+service the hook could not stop. Only an admin's explicit
+`POST /v1/devices/{id}/clear` puts it back in the pool.
+
+**An `on_release` failure is logged loudly but never quarantines the
+device.** The job that held it is already done, the device is genuinely
+free, and a service failing to come back up is an operator problem to
+notice — not a reason to pull hardware out of the pool.
+
+**At startup, before its first poll, the worker runs the `on_release` hook
+of every device that declares one.** This is unconditional — it runs on
+every start, not just after a crash — so a worker that crashed mid-job (or
+was `kill -9`'d, or the host itself crashed) heals its own node's stopped
+service without anyone having to notice and intervene. **This is exactly
+why the release hook must be idempotent — safe to run when the service is
+already up:** the worker starting up has no way to know whether the service
+it targets is already running or not, and runs the hook regardless.
 
 ## Client
 
@@ -482,3 +547,13 @@ from — still requires the header and rejects a query-string token.
   from — see "Device host" above for the full three-way breakdown.
 - Jobs run in their own process group, so a kill takes the whole tree with
   it, including grandchildren that detached from the job's own stdio.
+- A device with an `on_acquire` hook that fails is quarantined `unhealthy`
+  by the worker itself, via `POST /v1/devices/{id}/fault` (worker-token
+  only) — the same store path `SetDeviceState` uses, recorded with
+  quarantine reason `fault`. `fault` is the one quarantine reason a proven
+  reboot (a changed boot ID at registration) does not clear automatically —
+  see "Device host" above — so it always takes an admin's explicit
+  `POST /v1/devices/{id}/clear`. The failure reason itself (the hook's tail
+  output) travels only in the job's own failure report, surfaced by `rc ps`;
+  it is not stored on the device row, which only ever records the fixed
+  reason `fault`.
