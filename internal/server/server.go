@@ -41,6 +41,7 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
 	mux.Handle("POST /v1/workers/register", s.require("worker", s.handleRegister))
+	mux.Handle("POST /v1/workers/{id}/labels", s.require("worker", s.handlePushLabels))
 	mux.Handle("GET /v1/workers/{id}/assignments", s.require("worker", s.handleAssignments))
 	mux.Handle("POST /v1/workers/{id}/heartbeat", s.require("worker", s.handleHeartbeat))
 	mux.Handle("POST /v1/jobs/{id}/logs", s.require("worker", s.handleAppendLogs))
