@@ -605,10 +605,33 @@ func labelsPayload(res ProbeResult) map[string]map[string]string {
 			// were none configured) and nothing failed anywhere this
 			// pass, so an empty result here is trustworthy.
 			out[name] = m
+			continue
 		}
-		// else: something that can produce device-scoped facts failed
-		// this pass, so this device's empty result proves nothing about
-		// it — omit it so applyDeviceFacts leaves it untouched.
+		// Something that can produce device-scoped facts failed this
+		// pass (including, as of fix round 2, nvidia-smi simply not being
+		// on PATH — see nvidiaLabels' doc comment for the ruling behind
+		// treating absence the same as an error), so this device's empty
+		// result proves nothing about it. Omit it entirely so
+		// applyDeviceFacts (server-side) leaves whatever is already
+		// stored for it untouched, and say so loudly: an operator staring
+		// at a device that stopped updating needs this line, not a
+		// silent gap in the logs.
+		//
+		// Two limitations accepted alongside this ruling, not overlooked:
+		//   - A preserved label never expires on its own. A device that
+		//     genuinely lost its GPU (decommissioned, card pulled) keeps
+		//     advertising it indefinitely until either its probe starts
+		//     reporting again (clearing the stale keys the normal way) or
+		//     an operator intervenes by hand. No staleness/TTL mechanism
+		//     is built here — that belongs with the verify-probe work
+		//     planned for the next stage, not invented ad hoc in this fix.
+		//   - Failed is a single pass-wide bool (see ProbeResult.Failed),
+		//     not attributed to any one probe or device, so ONE flaky
+		//     drop-in anywhere on the host freezes every OTHER empty
+		//     device's labels too, not just the one the flaky probe was
+		//     ever meant to cover. Accepted for now.
+		slog.Warn("device's probe source failed or was unavailable this pass; preserving its previously detected labels instead of clearing them",
+			"device", name)
 	}
 	return out
 }

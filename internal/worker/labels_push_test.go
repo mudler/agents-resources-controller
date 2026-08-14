@@ -1,12 +1,15 @@
 package worker_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -292,4 +295,150 @@ func TestPushLabelsOmitsADeviceWhoseProbeStartsFailing(t *testing.T) {
 	require.False(t, hasGPU0Key,
 		"a device whose probe started failing must be OMITTED from the labels push, not sent as {} — "+
 			"sending {} would have the controller clear its previously detected vram/model facts")
+}
+
+// TestPushLabelsPreservesGPULabelsWhenNvidiaSmiBinaryDisappears is the
+// fix-round-2 ruling, measured exactly the way the re-reviewer measured the
+// gap: PATH loses nvidia-smi ENTIRELY (not merely erroring), through the
+// REAL nvidiaLabels/gatherLabels path, against a controller that already
+// holds real GPU facts for gpu0. Before fix round 2, exec.LookPath failing
+// was treated as ordinary absence (failed=false), so this exact scenario —
+// a driver-package upgrade that removes the nvidia-smi binary rather than
+// merely breaking it — sent gpu0 as an explicit, present empty map and the
+// controller cleared its vram/model facts. This test drives a real
+// nvidia-smi fake binary present on PATH for the worker's first pass
+// (captured in the register body, proving the harness actually exercises
+// nvidiaLabels and not some other path), then removes it from PATH entirely
+// before the next probe-interval push, and asserts gpu0 is omitted from
+// that push's labels map — preserved — while the host-wide facts and the
+// explanatory log line are both still present.
+func TestPushLabelsPreservesGPULabelsWhenNvidiaSmiBinaryDisappears(t *testing.T) {
+	binDir := t.TempDir()
+	fake := filepath.Join(binDir, "nvidia-smi")
+	script := "#!/bin/sh\n" + `echo "NVIDIA A100-SXM4-80GB, 81920, 550.54.15"` + "\n"
+	require.NoError(t, os.WriteFile(fake, []byte(script), 0o755))
+	emptyPathDir := t.TempDir() // PATH pointing nowhere useful: nvidia-smi resolves to nothing
+
+	originalPath := os.Getenv("PATH")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+originalPath)
+
+	// Capture slog output so the "log must say why" half of the fix-round-2
+	// instruction is actually pinned, not just asserted by reading the code.
+	var logBuf logCapture
+	origLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, nil)))
+	t.Cleanup(func() { slog.SetDefault(origLogger) })
+
+	registered := make(chan registerBody, 1)
+	pushed := make(chan map[string]any, 16)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/workers/register":
+			var body registerBody
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			select {
+			case registered <- body:
+			default:
+			}
+			_ = json.NewEncoder(w).Encode(map[string]string{"worker_id": "w1"})
+		case "/v1/workers/w1/labels":
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			select {
+			case pushed <- body:
+			default:
+			}
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	wk := worker.New(worker.Config{
+		ControllerURL:     ts.URL,
+		Token:             "t",
+		Host:              "gpubox",
+		Devices:           []worker.DeviceConfig{{Name: "gpu0"}},
+		HeartbeatInterval: 500 * time.Millisecond,
+		PollWait:          50 * time.Millisecond,
+		ProbeInterval:     150 * time.Millisecond,
+	})
+	go func() { _ = wk.Start(ctx) }()
+
+	var regBody registerBody
+	select {
+	case regBody = <-registered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("register never reached the controller")
+	}
+	require.Equal(t, "81920M", regBody.Labels["gpu0"]["vram"],
+		"sanity: the first pass must have captured real facts through the REAL nvidia-smi binary")
+	require.Equal(t, "NVIDIA A100-SXM4-80GB", regBody.Labels["gpu0"]["model"])
+
+	// Drain anything already queued before flipping PATH, so what we read
+	// next is guaranteed to reflect the change, not a stale push.
+drain:
+	for {
+		select {
+		case <-pushed:
+		default:
+			break drain
+		}
+	}
+
+	// "A driver-package upgrade removes nvidia-smi": PATH no longer
+	// resolves it at all, not merely errors.
+	t.Setenv("PATH", emptyPathDir)
+
+	deadline := time.After(15 * time.Second)
+	for {
+		select {
+		case pushBody := <-pushed:
+			labels, _ := pushBody["labels"].(map[string]any)
+			if labels == nil {
+				continue // an entirely-empty pass; keep waiting for a real one
+			}
+			_, hasGPU0Key := labels["gpu0"]
+			if hasGPU0Key {
+				continue // still reflects a push from before the PATH change
+			}
+			_, hasHostKey := labels[""]
+			require.True(t, hasHostKey, "host-wide built-in facts must still be present")
+			goto foundOmission
+		case <-deadline:
+			t.Fatal("gpu0 was never omitted from a push after nvidia-smi disappeared from PATH entirely")
+		}
+	}
+foundOmission:
+
+	require.Contains(t, logBuf.String(), "gpu0",
+		"an operator needs a log line naming the device whose labels were preserved, not a silent gap")
+	require.True(t,
+		strings.Contains(logBuf.String(), "preserving") || strings.Contains(logBuf.String(), "failed or was unavailable"),
+		"the log must say WHY gpu0's labels were preserved, not just that something happened; got: %s", logBuf.String())
+}
+
+// logCapture is a trivial io.Writer collecting everything written to it,
+// used to assert on log output without depending on slog's exact handler
+// formatting beyond "the text shows up somewhere".
+type logCapture struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (l *logCapture) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.Write(p)
+}
+
+func (l *logCapture) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.String()
 }

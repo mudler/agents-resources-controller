@@ -57,18 +57,27 @@ func TestNvidiaLabelsParsesPresentDriver(t *testing.T) {
 	}
 }
 
-// TestNvidiaLabelsAbsentIsNotAnError confirms exec.LookPath failing (no
-// nvidia-smi on PATH) yields nil facts and failed=false — the documented
-// behavior for a box with no NVIDIA GPUs: ordinary absence, not a failure
-// that would make gatherLabels withhold a device's other, unrelated facts.
-func TestNvidiaLabelsAbsentIsNotAnError(t *testing.T) {
+// TestNvidiaLabelsAbsentIsTreatedAsAFailure pins the fix-round-2 ruling:
+// exec.LookPath failing (no nvidia-smi on PATH at all) now reports
+// failed=true, the same as nvidia-smi being present but broken. This
+// INVERTS the original Task 5 stance (ordinary absence, not a failure),
+// deliberately: a real controller holding prior GPU labels for a device
+// loses them the moment a driver-package upgrade removes the nvidia-smi
+// BINARY (as opposed to merely breaking it) if this case were still
+// treated as "no failure" — see TestPushLabelsPreservesGPULabelsWhenNvidiaSmiBinaryIsMissing
+// for the end-to-end proof. gatherLabels has no way to tell "this box
+// never had an NVIDIA GPU" apart from "this box's nvidia-smi just
+// vanished" from a single stateless pass, and a fleet-wide wipe (every
+// selector job refused at submit) was judged worse than one device
+// advertising a card that is actually gone.
+func TestNvidiaLabelsAbsentIsTreatedAsAFailure(t *testing.T) {
 	t.Setenv("PATH", t.TempDir())
 	facts, failed := nvidiaLabels(context.Background(), 5*time.Second)
 	if facts != nil {
 		t.Errorf("expected nil facts when nvidia-smi is absent, got %#v", facts)
 	}
-	if failed {
-		t.Error("nvidia-smi merely absent from PATH must not be reported as a failure")
+	if !failed {
+		t.Error("nvidia-smi absent from PATH must be reported as a failure (fix round 2 ruling), not ordinary absence")
 	}
 }
 

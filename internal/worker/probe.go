@@ -26,14 +26,16 @@ type ProbeResult struct {
 	Host   map[string]string
 	Device map[string]map[string]string
 
-	// Failed reports whether at least one probe CAPABLE of producing
-	// device-scoped facts actually ran and failed this pass: nvidia-smi
-	// found on PATH but erroring, timing out, or emitting something that
-	// doesn't parse, or a drop-in probe doing the same. It is deliberately
-	// left false when nvidia-smi is simply not found on PATH (see
-	// nvidiaLabels' own doc comment: that is ordinary absence, not
-	// failure, unchanged from Task 5) and false when ProbeDir has no
-	// entries at all.
+	// Failed reports whether this pass could not confirm at least one
+	// source of device-scoped facts: nvidia-smi found on PATH but erroring,
+	// timing out, or emitting something that doesn't parse; nvidia-smi
+	// simply not found on PATH at all (fix round 2 — see nvidiaLabels' doc
+	// comment for the ruling: absence is now treated the same as failure,
+	// not as ordinary "no GPUs here"); or a drop-in probe doing either. It
+	// is false only when every configured source genuinely ran and
+	// confirmed there was nothing to report, or when ProbeDir has no
+	// entries and nvidia-smi is on PATH and ran cleanly (empty, but
+	// confirmed).
 	//
 	// This is what lets a caller (see labelsPayload) tell "this device's
 	// probe ran and confirmed there is nothing to report" — which
@@ -418,19 +420,36 @@ func kernelRelease() (string, bool) {
 	return release, true
 }
 
-// nvidiaLabels reports GPU facts from nvidia-smi when it is on PATH; when it
-// is absent, this returns (nil, false) and that is not a failure — a box
-// with no NVIDIA GPUs simply has no GPU labels. The second return, failed,
-// is true only when nvidia-smi WAS found but its invocation or output was
-// no good (a non-zero exit, a timeout, output that doesn't parse) — the
-// "driver upgrade broke nvidia-smi" case, which is the common real-world
-// shape of an nvidia-smi that starts failing: the binary stays on PATH, it
-// just stops working ("Failed to initialize NVML: Driver/library version
-// mismatch" being the canonical example). That distinction is what lets
-// gatherLabels tell "there really are no GPUs to report" apart from
-// "something that reports GPUs broke this pass", so a caller (see
-// ProbeResult.Failed / labelsPayload) doesn't clear a device's previously
-// detected GPU facts just because this one pass couldn't reproduce them.
+// nvidiaLabels reports GPU facts from nvidia-smi when it is on PATH. The
+// second return, failed, is true whenever this pass could not confirm
+// whether GPU facts exist at all — nvidia-smi missing from PATH (fix round
+// 2: this used to be treated as ordinary absence, see below for why that
+// changed) just as much as nvidia-smi found but erroring, timing out, or
+// producing garbage (a non-zero exit, a timeout, output that doesn't parse
+// — the "driver upgrade broke nvidia-smi" case, where the binary stays on
+// PATH and just stops working: "Failed to initialize NVML: Driver/library
+// version mismatch" is the canonical example).
+//
+// Fix round 2 ruling: an EARLIER version of this function returned
+// (nil, false) — "not a failure" — when nvidia-smi was simply not on PATH,
+// on the theory that a box with no NVIDIA GPUs simply has no GPU labels.
+// Measured against a real controller holding prior GPU labels, that let a
+// driver-package upgrade that removes the nvidia-smi BINARY (as opposed to
+// merely breaking it) wipe every affected device's vram/gpu facts the
+// moment PATH stopped resolving it — identical in effect to nvidia-smi
+// erroring, which was already treated as a failure. There is no way for
+// gatherLabels to tell "this box never had an NVIDIA GPU" apart from "this
+// box's nvidia-smi just vanished" from a single stateless pass, and the
+// two failure modes are not the same size: a wipe is fleet-wide and
+// immediate (every device loses its GPU labels at once, every vram/gpu
+// selector then matches nothing, and every selector job is refused at
+// submit across the whole fleet), while treating this as a failure and
+// preserving costs at most one device advertising a card that is actually
+// gone — recoverable by an operator, and bounded to that device. Ruled:
+// preserve. See ProbeResult.Failed and labelsPayload for where that
+// preservation actually happens, and their comments for the two
+// limitations accepted alongside this ruling (no staleness/expiry on a
+// preserved label, and Failed being a single pass-wide bool).
 //
 // nvidia-smi is run through the SAME Run() process-group supervision every
 // other spawned process in this package gets: its own process group,
@@ -458,7 +477,15 @@ func kernelRelease() (string, bool) {
 func nvidiaLabels(ctx context.Context, timeout time.Duration) (facts map[string]string, failed bool) {
 	smi, err := exec.LookPath("nvidia-smi")
 	if err != nil {
-		return nil, false
+		// Absent from PATH is now treated the same as "found but broken":
+		// see this function's doc comment for the fix-round-2 ruling. Only
+		// logged at Debug, not Warn — on the (common) box that genuinely
+		// has no NVIDIA GPU and never will, this fires on every single
+		// pass forever, and a permanent Warn line for a permanent,
+		// expected condition is exactly the kind of alert fatigue that
+		// trains an operator to ignore this log stream.
+		slog.Debug("nvidia-smi not found on PATH; GPU facts unconfirmed this pass", "err", err)
+		return nil, true
 	}
 
 	stdout := &boundedBuffer{limit: maxProbeOutputBytes}
