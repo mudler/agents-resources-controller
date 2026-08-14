@@ -595,6 +595,65 @@ func TestJobStatusForUnknownJobReturns404(t *testing.T) {
 	require.Equal(t, http.StatusNotFound, sr.StatusCode)
 }
 
+// TestDeviceFaultQuarantinesUnhealthy pins the new route's contract: a
+// worker reporting a fault (an acquire hook that failed) must land the
+// device in the same unhealthy state SetDeviceState already produces for a
+// self-reported fault.
+func TestDeviceFaultQuarantinesUnhealthy(t *testing.T) {
+	ts, _, _, _ := newServer(t)
+
+	post(t, ts, "wtok", "/v1/workers/register",
+		server.RegisterRequest{Host: "gpubox", Devices: []server.DeviceSpec{{Name: "gpu0"}}}).Body.Close()
+
+	resp := post(t, ts, "wtok", "/v1/devices/gpubox:gpu0/fault", map[string]string{"reason": "on_acquire failed: exit 1"})
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	dr := get(t, ts, "ctok", "/v1/devices")
+	defer dr.Body.Close()
+	var views []server.DeviceView
+	require.NoError(t, json.NewDecoder(dr.Body).Decode(&views))
+	require.Len(t, views, 1)
+	require.Equal(t, model.DeviceUnhealthy, views[0].Device.State)
+}
+
+// TestDeviceFaultOutlivesAReboot pins the reason it must be "fault" and not
+// some other quarantine cause: only "fault" is NOT in rebootClearableReasons
+// (internal/store/reaper.go), so a subsequent reboot (a changed boot ID at
+// re-registration) must leave the device unhealthy — unlike worker_lost,
+// lease_expired, or registration, all of which a proven reboot does clear.
+func TestDeviceFaultOutlivesAReboot(t *testing.T) {
+	ts, _, _, _ := newServer(t)
+
+	post(t, ts, "wtok", "/v1/workers/register",
+		server.RegisterRequest{Host: "gpubox", BootID: "boot-1", Devices: []server.DeviceSpec{{Name: "gpu0"}}}).Body.Close()
+
+	post(t, ts, "wtok", "/v1/devices/gpubox:gpu0/fault", map[string]string{"reason": "on_acquire failed"}).Body.Close()
+
+	// The host reboots: a changed boot ID is the one thing that proves
+	// nothing survived, and normally clears a quarantine.
+	post(t, ts, "wtok", "/v1/workers/register",
+		server.RegisterRequest{Host: "gpubox", BootID: "boot-2", Devices: []server.DeviceSpec{{Name: "gpu0"}}}).Body.Close()
+
+	dr := get(t, ts, "ctok", "/v1/devices")
+	defer dr.Body.Close()
+	var views []server.DeviceView
+	require.NoError(t, json.NewDecoder(dr.Body).Decode(&views))
+	require.Len(t, views, 1)
+	require.Equal(t, model.DeviceUnhealthy, views[0].Device.State,
+		"a fault must outlive a reboot: a reboot proves no process survived, not that the hardware is sound")
+}
+
+// TestClientTokenCannotReportDeviceFault mirrors
+// TestClientTokenCannotRegisterWorker: the fault route is worker-token only,
+// the same as every other route a device host itself calls.
+func TestClientTokenCannotReportDeviceFault(t *testing.T) {
+	ts, _, _, _ := newServer(t)
+	resp := post(t, ts, "ctok", "/v1/devices/gpubox:gpu0/fault", map[string]string{"reason": "x"})
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusForbidden, resp.StatusCode)
+}
+
 func TestOversizedLogChunkIsRejected(t *testing.T) {
 	ts, _, logs, _ := newServer(t)
 
