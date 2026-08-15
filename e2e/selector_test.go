@@ -102,12 +102,16 @@ func TestSelectorLandsOnlyOnTheMatchingDevice(t *testing.T) {
 // than that bet paying off, and an indefinitely queued job is
 // indistinguishable from a hang.
 func TestSelectorMatchingNoDeviceIsRejectedAtSubmit(t *testing.T) {
-	cl, st, device := newFleet(t, 0)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// The device's distinguishing fact arrives through registration
+	// (worker.yaml's declared labels), not through a store write behind the
+	// controller's back. That matters here more than anywhere else in this
+	// file: a fixture whose label never landed would make this test pass for
+	// the wrong reason entirely — a selector matching nothing on a device
+	// with NO labels at all, rather than one whose labels genuinely disagree.
+	// The positive control at the end is the other half of that guard.
+	cl, _, device := newFleet(t, 0, withLabels(map[string]string{"vendor": "nvidia"}))
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-
-	require.NoError(t, st.ReplaceLabels(device, model.SourceDetected,
-		map[string]string{"vendor": "nvidia"}, st.Now()))
 
 	_, err := cl.Submit(ctx, client.SubmitOptions{
 		Selector:  "vendor=intel",
@@ -123,4 +127,20 @@ func TestSelectorMatchingNoDeviceIsRejectedAtSubmit(t *testing.T) {
 	state, err := cl.State(ctx)
 	require.NoError(t, err)
 	require.Empty(t, state.Queued, "a rejected selector submit must never leave a job queued behind it")
+
+	// The positive control: the same device, selected on the label it
+	// actually carries, IS accepted and runs. Without this, every assertion
+	// above would still hold on a device carrying no labels whatsoever —
+	// which is a fixture failure wearing a passing test's clothes.
+	matched, err := cl.Submit(ctx, client.SubmitOptions{
+		Selector:  "vendor=nvidia",
+		Command:   []string{"true"},
+		Submitter: "agent-a",
+	})
+	require.NoError(t, err, "the device's declared vendor label never reached the controller")
+	require.Equal(t, device, matched.DeviceID)
+
+	final, err := cl.WaitTerminal(ctx, matched.ID, waitTerminalBound)
+	require.NoError(t, err)
+	require.Equal(t, model.JobSucceeded, final.State)
 }

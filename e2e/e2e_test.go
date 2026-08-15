@@ -160,10 +160,15 @@ func TestWorkerRestartQuarantinesDeviceInsteadOfFalselyReady(t *testing.T) {
 
 	cl := client.New(ts.URL, "ctok")
 
+	// The same registration gate newFleet uses, and for the same reason: a
+	// device row exists after the FIRST of handleRegister's four store
+	// writes, so waiting on the row alone lets this test body race the rest
+	// of that handler. See hasDetectedCPUs in harness_test.go.
 	require.Eventually(t, func() bool {
 		state, err := cl.State(ctx)
-		return err == nil && len(state.Devices) == 1
-	}, 15*time.Second, 100*time.Millisecond, "worker never registered its device")
+		return err == nil && len(state.Devices) == 1 && hasDetectedCPUs(state.Devices[0].Device)
+	}, 15*time.Second, 100*time.Millisecond,
+		"worker never finished registering its device (no detected cpus label ever landed)")
 
 	job, err := cl.Submit(ctx, client.SubmitOptions{
 		DeviceID:  "restartbox:dev0",
