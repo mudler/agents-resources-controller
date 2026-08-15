@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="resource-controller">
+  <title>resource-controller</title>
+  <!-- The slot: two jaws, one position between them. -->
+  <path d="M24 4H4v56h20v-8H12V12h12Z" fill="#6b7280"/>
+  <path d="M40 4h20v56H40v-8h12V12H40Z" fill="#6b7280"/>
+  <!-- The holder: one token, seated. Wider than the mouth, so it cannot slip out. -->
+  <circle cx="32" cy="32" r="13" fill="#c86c08"/>
+</svg>

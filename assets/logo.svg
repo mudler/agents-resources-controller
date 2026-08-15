@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 148 64" width="148" height="64" role="img" aria-label="rc — resource-controller">
+  <title>rc — resource-controller</title>
+  <g fill="#6b7280">
+    <!-- Mark: the slot, two jaws. -->
+    <path d="M24 4H4v56h20v-8H12V12h12Z"/>
+    <path d="M40 4h20v56H40v-8h12V12H40Z"/>
+    <!-- r: stem, plus a shoulder struck from (96,28) with radii 16 and 8. -->
+    <path d="M80 52V28a16 16 0 0 1 26.28-12.26l-5.14 6.13A8 8 0 0 0 88 28v24Z"/>
+    <!-- c: one ring, centre (126,32), radii 20 and 12, cut open on the same axis
+         as the slot's mouth. Both terminals are radial, so the stroke stays 8 wide. -->
+    <path d="M138.31 16.24a20 20 0 1 0 0 31.52l-4.92-6.3a12 12 0 1 1 0-18.92Z"/>
+  </g>
+  <!-- The holder. -->
+  <circle cx="32" cy="32" r="13" fill="#c86c08"/>
+</svg>

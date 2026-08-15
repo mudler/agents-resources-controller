@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" fill="currentColor" role="img" aria-label="resource-controller">
+  <title>resource-controller</title>
+  <!-- The slot: two jaws, one position between them. -->
+  <path d="M24 4H4v56h20v-8H12V12h12Z"/>
+  <path d="M40 4h20v56H40v-8h12V12H40Z"/>
+  <!-- The holder. Nothing touches, so the mark still reads in one colour. -->
+  <circle cx="32" cy="32" r="13"/>
+</svg>
