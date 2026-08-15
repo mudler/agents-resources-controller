@@ -15,6 +15,13 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// iptr is the *int twin of server.ptr's *string: DescribeResponse.
+// SheetAgeSeconds is a pointer specifically so a present, explicit zero can
+// be told apart from an absent field (an older controller that predates
+// this field) — every test that wants a real age has to build one of these
+// rather than write a bare int literal.
+func iptr(i int) *int { return &i }
+
 // describeServer stands up a stub controller answering exactly one describe
 // response for gpubox:gpu0, so each test only has to build the response it
 // cares about.
@@ -151,7 +158,7 @@ func TestDescribeShowsStaleSheetAge(t *testing.T) {
 		Device:          model.Device{ID: "gpubox:gpu0", State: model.DeviceReady},
 		Sheet:           "shared rack A1, ask #infra before recabling",
 		SheetUpdatedAt:  time.Now().Add(-100 * 24 * time.Hour),
-		SheetAgeSeconds: 100 * 24 * 60 * 60,
+		SheetAgeSeconds: iptr(100 * 24 * 60 * 60),
 		SheetIsHostWide: false,
 	})
 
@@ -178,7 +185,7 @@ func TestDescribeSheetAgeComesFromServerNotLocalClock(t *testing.T) {
 		Device:          model.Device{ID: "gpubox:gpu0", State: model.DeviceReady},
 		Sheet:           "shared rack A1, ask #infra before recabling",
 		SheetUpdatedAt:  time.Now().Add(-1 * time.Minute),
-		SheetAgeSeconds: 3 * 60 * 60,
+		SheetAgeSeconds: iptr(3 * 60 * 60),
 		SheetIsHostWide: false,
 	})
 
@@ -199,6 +206,12 @@ func TestDescribeSheetAgeComesFromServerNotLocalClock(t *testing.T) {
 // possible label, when it is actually the least trustworthy one on the
 // page (a clock disagreement, not a recent confirmation). The rendering
 // must say so, not go quiet about it.
+//
+// The assertion is the exact phrase, not a loose Contains("future"): an
+// earlier version of formatAge built this case by appending " in the
+// future (clock skew?)" onto its OWN "...ago" output, rendering the
+// self-contradictory "5m ago in the future (clock skew?)" — which also
+// contains "future", so a looser assertion here would not have caught it.
 func TestDescribeFutureStampedLabelIsNotRenderedAsFresh(t *testing.T) {
 	ts := describeServer(t, server.DescribeResponse{
 		Device: model.Device{ID: "gpubox:gpu0", State: model.DeviceReady},
@@ -211,10 +224,113 @@ func TestDescribeFutureStampedLabelIsNotRenderedAsFresh(t *testing.T) {
 	out, err := runDescribe(t, ts)
 	require.NoError(t, err)
 	section := sectionBetween(t, out, "LABELS", "USAGE SHEET")
+	require.Contains(t, section, "5m in the future (clock skew?)",
+		"a future-stamped label's anomaly must be visible, worded so it never also reads as an age")
+	require.NotContains(t, section, "ago",
+		"the future-stamped phrasing must not also claim an age, which is what made the pre-fix wording self-contradictory")
+}
+
+// TestDescribeFutureStampedSheetIsNotRenderedAsFresh is the sheet-side twin
+// of TestDescribeFutureStampedLabelIsNotRenderedAsFresh. Its absence was a
+// real gap: with the OLD (self-contradictory) "%s ago in the future"
+// wording, a loose require.Contains(section, "3h ago") assertion here would
+// have passed on BOTH the correct rendering and a regression that
+// reintroduced the `d < 0 { d = 0 }` clamp on the server (silently making
+// SheetAgeSeconds 0), because "3h ago" was never checked to be the WHOLE
+// story. This pins the exact phrase, closing that hole.
+func TestDescribeFutureStampedSheetIsNotRenderedAsFresh(t *testing.T) {
+	ts := describeServer(t, server.DescribeResponse{
+		Device:          model.Device{ID: "gpubox:gpu0", State: model.DeviceReady},
+		Sheet:           "shared rack A1, ask #infra before recabling",
+		SheetUpdatedAt:  time.Now().Add(10 * time.Minute),
+		SheetAgeSeconds: iptr(-10 * 60),
+		SheetIsHostWide: false,
+	})
+
+	out, err := runDescribe(t, ts)
+	require.NoError(t, err)
+	section := sectionBetween(t, out, "USAGE SHEET", "RECENT JOBS")
+	require.Contains(t, section, "10m in the future (clock skew?)",
+		"a future-stamped sheet's anomaly must be visible, worded so it never also reads as an age")
+	require.NotContains(t, section, "ago")
+}
+
+// TestDescribeLabelAgeUnknownWhenServerOmitsIt is FIX 1's load-bearing
+// case: a label with a real, 90-day-old UpdatedAt but NO entry in
+// LabelAgeSeconds — the shape an older controller (one that predates this
+// field) sends a newer CLI. Before this fix, ages[key] on a plain lookup
+// returns the map's zero value, 0, for a missing key exactly as it would
+// for a real, explicit 0 — rendering "0s ago" for a 90-day-old fact. That
+// is this task's own "a month-old label reads as fresh" defect, just
+// triggered by version skew instead of clock skew.
+func TestDescribeLabelAgeUnknownWhenServerOmitsIt(t *testing.T) {
+	ts := describeServer(t, server.DescribeResponse{
+		Device: model.Device{ID: "gpubox:gpu0", State: model.DeviceReady},
+		Labels: []model.Label{
+			{Key: "vram", Value: "80G", Source: model.SourceDetected, UpdatedAt: time.Now().Add(-90 * 24 * time.Hour)},
+		},
+		// LabelAgeSeconds deliberately omitted (nil map): this is the shape
+		// json.Decode produces for a controller response that never had this
+		// field at all, not a device with zero labels.
+	})
+
+	out, err := runDescribe(t, ts)
+	require.NoError(t, err)
+	section := sectionBetween(t, out, "LABELS", "USAGE SHEET")
 	require.NotContains(t, section, "0s ago",
-		"a future-stamped label must not be laundered into looking like the freshest possible reading")
-	require.Contains(t, section, "future",
-		"a future-stamped label's anomaly must be visible in the rendered text")
+		"a label with no reported age must never render as the freshest possible reading")
+	require.Contains(t, section, "age unknown",
+		"a label with no reported age must say so explicitly")
+}
+
+// TestDescribeSheetAgeUnknownWhenServerOmitsIt is the sheet-side twin: a
+// real, non-empty sheet with a genuine, hour-old SheetUpdatedAt but a nil
+// SheetAgeSeconds (the same older-controller shape). Same defect, same fix:
+// render an explicit unknown, never "0s ago".
+func TestDescribeSheetAgeUnknownWhenServerOmitsIt(t *testing.T) {
+	ts := describeServer(t, server.DescribeResponse{
+		Device:         model.Device{ID: "gpubox:gpu0", State: model.DeviceReady},
+		Sheet:          "shared rack A1, ask #infra before recabling",
+		SheetUpdatedAt: time.Now().Add(-time.Hour),
+		// SheetAgeSeconds deliberately left nil.
+	})
+
+	out, err := runDescribe(t, ts)
+	require.NoError(t, err)
+	section := sectionBetween(t, out, "USAGE SHEET", "RECENT JOBS")
+	require.NotContains(t, section, "0s ago",
+		"a sheet with no reported age must never render as the freshest possible reading")
+	require.Contains(t, section, "age unknown",
+		"a sheet with no reported age must say so explicitly")
+}
+
+// TestDescribeShowsNoneOnFileForRealisticEmptySheet pins FIX 6: the shape a
+// REAL worker sends for a host with no host.md at all is NOT "empty body,
+// zero timestamp" — sheetPayload (internal/worker/worker.go) sends a
+// non-nil pointer to "" in that case, which applyDeviceFacts stores as a
+// real row with a real, non-zero timestamp. Gating "(none on file)" on
+// updatedAt.IsZero(), as an earlier version of renderSheet did, meant that
+// guard NEVER fired for this — the single most common real-world shape —
+// and instead rendered a phantom "host-wide note, updated 1h ago" followed
+// by a blank line. The guard must be body-only.
+func TestDescribeShowsNoneOnFileForRealisticEmptySheet(t *testing.T) {
+	ts := describeServer(t, server.DescribeResponse{
+		Device: model.Device{ID: "gpubox:gpu0", State: model.DeviceReady},
+		Sheet:  "",
+		// A REAL, non-zero timestamp — exactly what a real worker's
+		// registration leaves for a host with no host.md at all.
+		SheetUpdatedAt:  time.Now().Add(-time.Hour),
+		SheetAgeSeconds: nil,
+		SheetIsHostWide: true,
+	})
+
+	out, err := runDescribe(t, ts)
+	require.NoError(t, err)
+	section := sectionBetween(t, out, "USAGE SHEET", "RECENT JOBS")
+	require.Contains(t, section, "(none on file)")
+	require.NotContains(t, section, "updated",
+		"an empty sheet must not render a phantom 'updated ... ago' line just because a real timestamp happens to be attached to its emptiness")
+	require.NotContains(t, section, "host-wide note")
 }
 
 // TestDescribeLabelsHostWideSheetDistinctlyFromDeviceSheet pins the other
@@ -256,7 +372,7 @@ func TestDescribeJSONOutputParsesBackIntoDescribeResponse(t *testing.T) {
 		LabelAgeSeconds: map[string]int{"vram/" + model.SourceDetected: 240},
 		Sheet:           "notes",
 		SheetUpdatedAt:  time.Now().Add(-time.Hour).Truncate(time.Second),
-		SheetAgeSeconds: 3600,
+		SheetAgeSeconds: iptr(3600),
 		SheetIsHostWide: true,
 		RecentJobs: []model.Job{
 			{ID: "job0", DeviceID: "gpubox:gpu0", State: model.JobSucceeded, Command: []string{"./bench"}},

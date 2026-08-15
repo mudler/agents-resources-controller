@@ -74,7 +74,7 @@ func RenderDescribe(w io.Writer, out *server.DescribeResponse) error {
 
 	fmt.Fprintln(tw)
 	fmt.Fprintln(tw, "USAGE SHEET")
-	renderSheet(tw, out.Sheet, out.SheetUpdatedAt, out.SheetAgeSeconds, out.SheetIsHostWide)
+	renderSheet(tw, out.Sheet, out.SheetAgeSeconds, out.SheetIsHostWide)
 
 	fmt.Fprintln(tw)
 	fmt.Fprintln(tw, "RECENT JOBS")
@@ -87,10 +87,24 @@ func RenderDescribe(w io.Writer, out *server.DescribeResponse) error {
 	return tw.Flush()
 }
 
+// unknownAge is what renders in place of a computed duration when the
+// controller reported no age at all for something that does exist — a map
+// miss for a label, or a nil SheetAgeSeconds for a non-empty sheet. That
+// combination means an older controller answered a newer CLI's request
+// (this field did not exist on the wire yet), not that the fact is fresh:
+// a Go map miss and a nil *int's zero value are indistinguishable from a
+// real zero without checking presence first, and rendering that as "0s
+// ago" would recreate this task's own defect — a stale fact reading as
+// current — with version skew standing in for clock skew.
+const unknownAge = "age unknown (controller may be out of date)"
+
 // renderLabels renders each label's age from ages, keyed by
 // key+"/"+source exactly as DescribeResponse.LabelAgeSeconds documents —
 // never by re-deriving it from the label's own UpdatedAt against this
 // process's clock, which is the whole defect this field exists to fix.
+// Looked up with the two-value map form specifically: ages[key] alone
+// cannot tell "the controller said 0" from "the controller said nothing",
+// and a plain lookup would render the latter as the former — see unknownAge.
 func renderLabels(w io.Writer, labels []model.Label, ages map[string]int) {
 	if len(labels) == 0 {
 		fmt.Fprintln(w, "  (none)")
@@ -107,18 +121,30 @@ func renderLabels(w io.Writer, labels []model.Label, ages map[string]int) {
 		return sourceRank[sorted[i].Source] < sourceRank[sorted[j].Source]
 	})
 	for _, l := range sorted {
-		age := ages[l.Key+"/"+l.Source]
-		fmt.Fprintf(w, "  %s=%s\t%s %s\n", l.Key, l.Value, l.Source, formatAge(time.Duration(age)*time.Second))
+		ageText := unknownAge
+		if age, ok := ages[l.Key+"/"+l.Source]; ok {
+			ageText = formatAge(time.Duration(age) * time.Second)
+		}
+		fmt.Fprintf(w, "  %s=%s\t%s %s\n", l.Key, l.Value, l.Source, ageText)
 	}
 }
 
 // renderSheet renders the sheet's age from ageSeconds — the controller's
 // own computation, per the same rule renderLabels follows — never from
-// now.Sub(updatedAt) against this process's clock. updatedAt is still used
-// to detect "no sheet at all", the one thing ageSeconds alone cannot tell
-// apart from "a sheet exactly at the controller's current clock".
-func renderSheet(w io.Writer, body string, updatedAt time.Time, ageSeconds int, hostWide bool) {
-	if body == "" && updatedAt.IsZero() {
+// now.Sub(updatedAt) against this process's clock.
+//
+// The "nothing on file" guard is on body alone, not on any timestamp: a
+// real worker's registration almost never leaves a sheet's timestamp at the
+// zero value even when there is no host.md to read (see handleDescribe's
+// own host-wide-fallback comment for why), so gating on a zero timestamp —
+// as an earlier version of this function did — left the guard untested by
+// anything a real worker produces and, in production, never fired: every
+// host simply lacking a host.md rendered a phantom "host-wide note, updated
+// 1h ago" followed by a blank line instead of "(none on file)". An empty
+// body has nothing to show regardless of what timestamp got attached to
+// recording that emptiness, so it alone is the right and sufficient signal.
+func renderSheet(w io.Writer, body string, ageSeconds *int, hostWide bool) {
+	if body == "" {
 		fmt.Fprintln(w, "  (none on file)")
 		return
 	}
@@ -129,7 +155,11 @@ func renderSheet(w io.Writer, body string, updatedAt time.Time, ageSeconds int, 
 	if hostWide {
 		scope = "host-wide note"
 	}
-	fmt.Fprintf(w, "  %s, updated %s\n", scope, formatAge(time.Duration(ageSeconds)*time.Second))
+	ageText := unknownAge
+	if ageSeconds != nil {
+		ageText = formatAge(time.Duration(*ageSeconds) * time.Second)
+	}
+	fmt.Fprintf(w, "  %s, updated %s\n", scope, ageText)
 	for _, line := range strings.Split(body, "\n") {
 		fmt.Fprintf(w, "  %s\n", line)
 	}
@@ -158,6 +188,30 @@ func renderRecentJobs(w io.Writer, jobs []model.Job, now time.Time) {
 	}
 }
 
+// ageMagnitude renders a non-negative duration's coarse size — "5m", "3h",
+// "90d" — with no directional word attached. It exists only so formatAge's
+// "ago" and "in the future" phrasings share one ladder and can never drift
+// out of step with each other (a bug fixed here: an earlier version of
+// formatAge built the future case by appending " in the future (clock
+// skew?)" onto its OWN "...ago" output, producing the self-contradictory
+// "5m ago in the future (clock skew?)" — that string was never itself
+// asserted by any test, only checked with Contains("... ago"), which the
+// broken phrasing still satisfied).
+func ageMagnitude(d time.Duration) string {
+	switch {
+	case d < time.Minute:
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	case d < time.Hour:
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh", int(d.Hours()))
+	case d < 30*24*time.Hour:
+		return fmt.Sprintf("%dd", int(d.Hours()/24))
+	default:
+		return fmt.Sprintf("%dmo", int(d.Hours()/24/30))
+	}
+}
+
 // formatAge renders a duration the way an agent deciding whether to trust a
 // fact needs to see it: coarse enough to read at a glance, but never
 // omitted — a label unconfirmed for a week and a sheet last edited months
@@ -169,21 +223,12 @@ func renderRecentJobs(w io.Writer, jobs []model.Job, now time.Time) {
 // earlier version of this function did, would render it as "0s ago": the
 // freshest possible reading, when a future-stamped fact is actually the
 // LEAST trustworthy one on the page. So it is reported as what it is
-// instead of being silently laundered into looking current.
+// instead of being silently laundered into looking current — as
+// "<magnitude> in the future (clock skew?)", never with "ago" anywhere in
+// that phrase.
 func formatAge(d time.Duration) string {
 	if d < 0 {
-		return fmt.Sprintf("%s in the future (clock skew?)", formatAge(-d))
+		return fmt.Sprintf("%s in the future (clock skew?)", ageMagnitude(-d))
 	}
-	switch {
-	case d < time.Minute:
-		return fmt.Sprintf("%ds ago", int(d.Seconds()))
-	case d < time.Hour:
-		return fmt.Sprintf("%dm ago", int(d.Minutes()))
-	case d < 24*time.Hour:
-		return fmt.Sprintf("%dh ago", int(d.Hours()))
-	case d < 30*24*time.Hour:
-		return fmt.Sprintf("%dd ago", int(d.Hours()/24))
-	default:
-		return fmt.Sprintf("%dmo ago", int(d.Hours()/24/30))
-	}
+	return ageMagnitude(d) + " ago"
 }

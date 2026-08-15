@@ -86,6 +86,21 @@ type DeviceView struct {
 	Command             []string `json:"command,omitempty"`
 	ElapsedSeconds      int      `json:"elapsed_seconds"`
 	HeartbeatAgeSeconds int      `json:"heartbeat_age_seconds"`
+	// OldestLabelAgeSeconds is how long ago this device's least-recently-
+	// confirmed label (across both sources) was last seen, computed by the
+	// controller against its own clock — see DescribeResponse.LabelAgeSeconds
+	// for the full reasoning, which applies here verbatim: the dashboard
+	// (internal/server/dashboard/index.html) used to compute this in the
+	// BROWSER via Date.parse(label.updated_at) against Date.now(), and its
+	// own comment documented the resulting exposure honestly — a browser
+	// clock skewed by more than an hour could show a false staleness
+	// warning, or hide a real one, on the one age on that page that was not
+	// already immune to it the way HeartbeatAgeSeconds and ElapsedSeconds
+	// are. nil when the device has no labels at all (nothing to date); never
+	// clamped at zero, so a future-stamped label reports a negative value
+	// rather than being laundered into looking like the freshest possible
+	// reading — matching formatAge's rule on the CLI side.
+	OldestLabelAgeSeconds *int `json:"oldest_label_age_seconds,omitempty"`
 }
 
 type StateResponse struct {
@@ -121,23 +136,46 @@ type DescribeResponse struct {
 	//
 	// Keyed by key+"/"+source. That join is unambiguous even though a label
 	// KEY may itself contain "/" (labels come from a worker's YAML config or
-	// a probe script, neither of which constrains the key's charset):
-	// store.ReplaceLabels rejects any source other than the two literal,
-	// equal-length, distinct strings model.SourceDetected ("detected") and
-	// model.SourceDeclared ("declared"), so for two entries to collide on
-	// this join their combined strings would need equal length AND matching
-	// characters in the final 9 bytes ("/detected" vs "/declared", which
-	// differ) — impossible regardless of what the key contains. A future
-	// third source value must preserve this (equal length, and not a suffix
-	// of another source) or switch the join to an unambiguous delimiter.
+	// a probe script, neither of which constrains the key's charset): the
+	// necessary and sufficient condition for key+"/"+source to never collide,
+	// for ANY key content, is that no SOURCE value itself contains "/". (Equal
+	// length of the source strings, which an earlier version of this comment
+	// claimed was what mattered, is irrelevant — brute-forced over 599,186
+	// pairs: a hypothetical third source of "probed", "x", or "nvidia-smi"
+	// stays collision-free despite different lengths, while one shaped like
+	// "a/declared" produces 585 collisions despite being unrelated in length
+	// to the other two. The reason: a collision needs the "/" between some
+	// key and its source to itself have come FROM a source string, which is
+	// only possible if some source contains one.) store.ReplaceLabels
+	// enforces this today by construction — the only two source values it
+	// accepts, model.SourceDetected ("detected") and model.SourceDeclared
+	// ("declared"), neither contains "/" — but a future third source value
+	// MUST preserve "no source may contain a '/'", or this join must switch
+	// to a delimiter no source can ever contain.
+	//
+	// A label absent from this map (Go's comma-ok miss, not a present zero)
+	// means the controller did not report an age for it — most likely an
+	// older controller talking to a newer CLI that added this field after
+	// the controller shipped. Do not render that as "0s ago": that is
+	// indistinguishable from the freshest possible label and is exactly the
+	// failure this field exists to prevent, just triggered by version skew
+	// instead of clock skew. Render it as an explicit unknown instead.
 	LabelAgeSeconds map[string]int `json:"label_age_seconds,omitempty"`
 	Sheet           string         `json:"sheet,omitempty"`
 	SheetUpdatedAt  time.Time      `json:"sheet_updated_at,omitempty"`
 	// SheetAgeSeconds is SheetUpdatedAt's age, computed by the controller
-	// for the same clock-skew reason as LabelAgeSeconds above. Zero when
-	// there is no sheet at all (SheetUpdatedAt is the zero time) rather than
-	// the multi-decade figure a naive now.Sub of the zero time would give.
-	SheetAgeSeconds int `json:"sheet_age_seconds"`
+	// for the same clock-skew reason as LabelAgeSeconds above. A *int, not a
+	// plain int, for the same version-skew reason LabelAgeSeconds's map-miss
+	// carries meaning: an older controller's response simply omits this
+	// field, which decodes to a nil pointer, distinguishable from a real,
+	// explicit age of zero. nil also when there is no sheet at all (Sheet is
+	// "") — not because SheetUpdatedAt happens to be its zero value, which a
+	// real worker's registration almost never leaves it as (see
+	// handleDescribe's own host-wide-fallback comment: a real worker sends
+	// an explicit, non-zero-timestamped empty sheet for a host with no
+	// host.md), but because an empty sheet has no meaningful age to report
+	// regardless of what timestamp got attached to recording that emptiness.
+	SheetAgeSeconds *int `json:"sheet_age_seconds,omitempty"`
 	// SheetIsHostWide is true when Sheet fell back to the host-wide note
 	// because this device has none of its own — an agent reading "don't run
 	// more than two jobs here" needs to know whether that applies to the
@@ -241,9 +279,14 @@ func (s *Server) handleDescribe(w http.ResponseWriter, r *http.Request) {
 	for _, l := range labels {
 		labelAges[l.Key+"/"+l.Source] = int(now.Sub(l.UpdatedAt).Seconds())
 	}
-	sheetAge := 0
-	if !sheetAt.IsZero() {
-		sheetAge = int(now.Sub(sheetAt).Seconds())
+	// Gated on the sheet actually having a body, not on sheetAt.IsZero() —
+	// see SheetAgeSeconds's doc comment for why that timestamp is almost
+	// never zero in practice, and DescribeResponse.SheetAgeSeconds's field
+	// comment for the full reasoning.
+	var sheetAge *int
+	if sheet != "" {
+		v := int(now.Sub(sheetAt).Seconds())
+		sheetAge = &v
 	}
 
 	writeJSON(w, http.StatusOK, DescribeResponse{
@@ -677,6 +720,25 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, StateResponse{Devices: views, Jobs: jobs, Queued: queued})
 }
 
+// oldestLabelAge returns how long ago the least-recently-confirmed label in
+// labels was last seen, against now — nil when there are no labels at all,
+// since there is nothing to date. Unclamped: see
+// DeviceView.OldestLabelAgeSeconds's doc comment for why a future-stamped
+// label must report a negative age rather than be floored to zero.
+func oldestLabelAge(labels []model.Label, now time.Time) *int {
+	if len(labels) == 0 {
+		return nil
+	}
+	oldest := labels[0].UpdatedAt
+	for _, l := range labels[1:] {
+		if l.UpdatedAt.Before(oldest) {
+			oldest = l.UpdatedAt
+		}
+	}
+	age := int(now.Sub(oldest).Seconds())
+	return &age
+}
+
 // deviceViews joins devices to their live lease so a caller sees who holds
 // what and how stale the information is — the thing a lock file cannot say.
 func (s *Server) deviceViews() ([]DeviceView, error) {
@@ -717,8 +779,9 @@ func (s *Server) deviceViews() ([]DeviceView, error) {
 	for _, d := range devices {
 		d.Labels = labels[d.ID]
 		v := DeviceView{
-			Device:              d,
-			HeartbeatAgeSeconds: int(now.Sub(d.LastHeartbeatAt).Seconds()),
+			Device:                d,
+			HeartbeatAgeSeconds:   int(now.Sub(d.LastHeartbeatAt).Seconds()),
+			OldestLabelAgeSeconds: oldestLabelAge(d.Labels, now),
 		}
 		if l, ok := byDevice[d.ID]; ok {
 			v.Holder = l.holder

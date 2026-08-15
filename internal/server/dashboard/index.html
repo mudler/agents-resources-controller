@@ -354,27 +354,23 @@
   // detected label while rendering with the declared chip's outline).
   function isDetectedSource(source) { return source === "detected"; }
 
-  // oldestLabelAgeSeconds finds how long ago the least-recently-confirmed
-  // label on a device was last seen, in seconds, or null if the device has
-  // no labels at all.
+  // oldestLabelAgeSeconds used to find how long ago the least-recently-
+  // confirmed label on a device was last seen by parsing every label's
+  // updated_at with Date.parse and measuring against Date.now() — the ONE
+  // age on this whole page that was not immune to this browser's own
+  // clock, unlike heartbeat_age_seconds and elapsed_seconds, which the
+  // server already reduces to a seconds count before either ever reaches
+  // this page. A browser clock skewed by more than an hour could show a
+  // false staleness warning here, or hide a real one.
   //
-  // Unlike heartbeat_age_seconds and elapsed_seconds — which the server
-  // already reduces to a seconds count before it ever reaches this page, so
-  // they are immune to this browser's own clock — a label only carries an
-  // absolute updated_at timestamp on the wire, so this function measures it
-  // against Date.now(), the same way updateFreshness's "updated Ns ago"
-  // does. A browser clock skewed by more than an hour can therefore show a
-  // false staleness warning here (or hide a real one) without any of the
-  // other ages on this page being affected at all.
-  function oldestLabelAgeSeconds(labels) {
-    if (!labels || !labels.length) return null;
-    var oldest = null;
-    labels.forEach(function (l) {
-      var t = Date.parse(l.updated_at);
-      if (!isNaN(t) && (oldest === null || t < oldest)) oldest = t;
-    });
-    if (oldest === null) return null;
-    return Math.max(0, Math.floor((Date.now() - oldest) / 1000));
+  // It now just reads oldest_label_age_seconds straight off the DeviceView
+  // (v) the server already computed it on — against ITS OWN clock, the
+  // same way heartbeat_age_seconds always has been — so this page carries
+  // no age of its own computation anymore. null when the device has no
+  // labels (the server's own nil for that case, via a JSON field that is
+  // simply absent).
+  function oldestLabelAgeSeconds(v) {
+    return (typeof v.oldest_label_age_seconds === "number") ? v.oldest_label_age_seconds : null;
   }
 
   // renderLabelChips shows every label as a "key=value" chip, detected and
@@ -383,8 +379,11 @@
   // detected one that actually wins rather than being overwritten away.
   // Every value comes from a probe script or an operator's worker.yaml —
   // both untrusted as far as this page is concerned — so each chip's text
-  // is set via textContent, never innerHTML.
-  function renderLabelChips(box, labels) {
+  // is set via textContent, never innerHTML. Takes the whole DeviceView (v)
+  // rather than a bare labels array so it can also read v's own
+  // oldest_label_age_seconds for the staleness warning below.
+  function renderLabelChips(box, v) {
+    var labels = v.device.labels;
     box.textContent = "";
     if (!labels || !labels.length) {
       var none = document.createElement("div");
@@ -407,7 +406,7 @@
     });
     box.appendChild(chips);
 
-    var age = oldestLabelAgeSeconds(labels);
+    var age = oldestLabelAgeSeconds(v);
     if (age !== null && age > 3600) {
       var stale = document.createElement("div");
       stale.className = "labels-stale";
@@ -480,7 +479,7 @@
       }
 
       var labelsBox = document.createElement("div");
-      renderLabelChips(labelsBox, d.labels);
+      renderLabelChips(labelsBox, v);
       card.appendChild(labelsBox);
 
       // Only an unhealthy device can be cleared — ClearDevice refuses

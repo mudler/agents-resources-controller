@@ -163,6 +163,23 @@ func TestDashboardShipsNoTokenLiteral(t *testing.T) {
 	}
 }
 
+// TestDashboardComputesLabelAgeServerSideNotViaDateParse pins the fix for
+// the one age on this page that used to be computed in the browser: an
+// operator's own clock, not the controller's, used to decide whether a
+// device's labels looked stale, via Date.parse(label.updated_at) measured
+// against Date.now(). The page must now read oldest_label_age_seconds
+// straight off each DeviceView instead.
+//
+// Asserted as the call syntax "Date.parse(" specifically, not the bare
+// substring "Date.parse" — the surrounding code's own comment explaining
+// this history necessarily still mentions the name, and a substring-only
+// assertion would fail on that prose rather than on an actual call.
+func TestDashboardComputesLabelAgeServerSideNotViaDateParse(t *testing.T) {
+	body := dashboardBody(t)
+	require.NotContains(t, body, "Date.parse(",
+		"label staleness must come from the controller's oldest_label_age_seconds, not a browser-side Date.parse call on updated_at")
+}
+
 func TestUnknownPathIs404NotTheDashboard(t *testing.T) {
 	ts, _, _, _ := newServer(t)
 
