@@ -12,20 +12,21 @@ Exclusive device leases, supervised job execution, live log streaming, fleet
 visibility, a queue with priorities, per-device runtime watchdogs, lease
 expiry, boot-identity recovery, server-side cancellation (`rc kill`),
 re-attaching to a running job's output (`rc attach`), a live SSE event
-stream, a read-only web dashboard, and lease lifecycle hooks (stop/start a
-service like LocalAI or ollama around a job's hold on a device).
+stream, a read-only web dashboard, lease lifecycle hooks (stop/start a
+service like LocalAI or ollama around a job's hold on a device), capability
+probes and labels with provenance, selectors (`--select`), per-host usage
+sheets and `rc describe`, and `rc hold`/`rc release` for claiming a device
+for a human rather than a job.
 
 **Not built yet**, so you will not find them documented below:
 
 | Not built yet | What you do instead today |
 |---|---|
-| Capability probes (`/etc/rc/probe.d/*.sh`) and device labels | List device names in `worker.yaml` |
-| Per-host usage sheet (`/etc/rc/host.md`) and `rc describe` | Keep host notes wherever you keep them now |
-| Device selectors (`--select 'vram>=40G'`) | Address a device by exact ID: `-d gpubox:gpu0` |
-| `rc hold` | Submit a placeholder job that just sleeps, then `rc kill` it |
 | Verify probes between jobs | Nothing checks VRAM was released after a job |
 | Webhook notifications | Poll `rc ps` / `rc devices`, or watch `/v1/events` |
 | Dashboard actions (kill/hold from the browser) | `rc kill` from a terminal; the dashboard is read-only |
+| A `cuda` label from the built-in GPU probe | `nvidia-smi --query-gpu` has no `cuda_version` field (see "Capability probes and labels" below); write a drop-in probe if you need it |
+| A controller-side operator annotation layered over a usage sheet | The spec allows one ("the host file wins on conflict"), but it was never built — a usage sheet is exactly what the host's `host.md`/`host.d/*.md` say, full stop; `host_docs` is keyed `(host, device_id)` with no annotation layer on top |
 
 ## Controller
 
@@ -112,6 +113,9 @@ Write `/etc/rc/worker.yaml` (see `examples/worker.yaml`):
 controller_url: https://rc.internal.example
 token: replace-with-worker-token
 # host defaults to the machine's hostname; device IDs become <host>:<name>
+probe_dir: /etc/rc/probe.d      # optional; default shown
+probe_interval: 5m               # optional; default shown
+sheet_dir: /etc/rc               # optional; default shown — host.md lives here
 devices:
   # Object form: max_runtime is a per-device runtime ceiling the controller
   # enforces at submit time and the worker enforces as a wall-clock watchdog
@@ -121,9 +125,15 @@ devices:
   # A job that requests no ceiling of its own inherits this one.
   - name: gpu0
     max_runtime: 6h
+    # Declared labels: operator-asserted facts a probe cannot detect on its
+    # own. See "Labels and probes" below for how these interact with what a
+    # probe reports for the same key.
+    labels:
+      rack: r3
+      tier: prod
   # Plain name form still works: it is shorthand for {name: gpu1} with no
-  # ceiling, so jobs on gpu1 run unbounded unless they set their own
-  # --max-runtime.
+  # ceiling, no declared labels, and no hooks, so jobs on gpu1 run unbounded
+  # unless they set their own --max-runtime.
   - gpu1
 heartbeat_interval: 10s
 poll_wait: 30s
@@ -136,11 +146,13 @@ rc worker
 # or: rc worker --config /path/to/worker.yaml
 ```
 
-That file is the whole of a node's configuration. There is no
-auto-detection: the controller knows only the device names you list, with no
-labels, no VRAM figures, no driver versions, and no per-host notes. If you
-list `gpu0` and `gpu1` on a four-GPU box, the other two do not exist as far
-as the scheduler is concerned.
+That file, plus whatever a probe detects at runtime, is the whole of a
+node's configuration. There is no device auto-discovery: the controller
+knows only the device names you list. If you list `gpu0` and `gpu1` on a
+four-GPU box, the other two do not exist as far as the scheduler is
+concerned — but VRAM, vendor, driver version and the rest of what a probe
+can see about the devices you *did* list are gathered automatically; see
+below.
 
 **Name devices after their GPU index.** The worker sets
 `CUDA_VISIBLE_DEVICES` from the trailing integer of the device name, so
@@ -218,6 +230,153 @@ unset rather than guess wrong — silently setting the wrong index would let a
 job touch a GPU it was never leased, which is worse than setting nothing. An
 operator-supplied `CUDA_VISIBLE_DEVICES` already present in the job's own
 `env` is never overridden.
+
+### Labels and probes
+
+Every device carries labels — key/value facts the scheduler can match a
+`--select` against — from two sources, both kept and both visible:
+
+- **Declared**: what an operator wrote under a device's `labels:` in
+  `worker.yaml` (see the example above). Pushed verbatim on every
+  registration; remove a key from the file and restart, and it is gone
+  server-side too.
+- **Detected**: what a probe found at runtime.
+
+**Detected always wins a same-key conflict for scheduling purposes, but
+neither value is discarded.** A `--select rack=r3` still sees the declared
+`rack`, but if a probe ever reports its own `rack` label, that detected
+value is what a selector actually matches against, and `rc describe` shows
+both side by side so a stale or wrong declared value is visible instead of
+silently masked.
+
+A device's detected labels come from two kinds of probe, both run under
+`probe_interval` (default 5m) and bounded by `probe_timeout` (default 5s):
+
+- **Built-in**, no configuration needed: `cpus`, `mem_total_bytes`,
+  `disk_free_bytes`, and `kernel` are host-wide facts gathered directly.
+  If `nvidia-smi` is on the worker's `PATH`, it also runs
+  `nvidia-smi --query-gpu=name,memory.total,memory.free,driver_version` and
+  turns each row into `gpu<N>.vendor`, `gpu<N>.model`, `gpu<N>.vram` and
+  `gpu<N>.vram_free` (both as a `K/M/G/T` quantity, e.g. `24576M`, so
+  selectors can compare them numerically), and `gpu<N>.driver` — only for
+  device names this host actually declared as `gpu<N>`.
+
+  **No `cuda` label is emitted.** `nvidia-smi --query-gpu` has no
+  `cuda_version` field; the CUDA version only appears in the plain-text
+  header of a bare `nvidia-smi`/`nvidia-smi -q` invocation, once per
+  process, not per GPU. Getting it would mean a second nvidia-smi
+  invocation per probe pass plus a text-header parse against a format
+  NVIDIA does not document as stable — judged not worth it for a label
+  this system can do without: a selector like `--select 'cuda>=12'`
+  fails loud (rejected at submit — no device matches) rather than
+  silently matching on a stale or fragile-parsed value. Write a drop-in
+  probe if you need it and are willing to own that parse.
+- **Drop-in**: any executable file in `probe_dir` (default `/etc/rc/probe.d`),
+  run in sorted filename order on top of the built-ins. Each probe must
+  write **one flat JSON object to stdout** — string, number, and boolean
+  values are accepted; `null` is dropped; a nested object or array value is
+  dropped with a warning; anything that isn't exactly one JSON object
+  (garbage, an array, a second value trailing the first) fails the whole
+  probe. A bare key (`"vendor"`) is a host-wide fact; a `"<device>.<key>"`
+  key (`"gpu0.vendor"`) targets that one device and is accepted only if
+  the name after the dot matches a device this host actually declared.
+
+**A probe that fails, times out, or emits something other than that one
+flat JSON object costs a label, never a worker.** It is logged and
+skipped; whatever else succeeded that pass is kept, and startup,
+registration, and every later probe pass proceed regardless — a wedged
+`nvidia-smi` or a broken drop-in script never blocks a worker from coming
+up or serving jobs.
+
+The one deliberate exception to "a probe that stops reporting a key just
+means that fact is gone": if `nvidia-smi` was present on `PATH` when this
+worker process started and later disappears (a driver upgrade mid-run is
+the canonical case), that device's previously-detected labels are
+**preserved** rather than cleared, because wiping them is a fleet-wide
+guess and a stale label is scoped to one device. If `nvidia-smi` was never
+present since this worker started, its absence is not a failure and
+labels clear normally, the same as any other probe that stops reporting.
+
+**Probes, like lease lifecycle hooks, run operator-supplied scripts as the
+worker user with no additional sandboxing** — the same blast radius as any
+other script the worker executes on your behalf, so trust `probe_dir`
+exactly as much as you trust `on_acquire`/`on_release`.
+
+### Selectors
+
+`--select` (on `rc run` and `rc hold`) targets a device by its labels
+instead of a device ID, e.g. `--select 'vendor=nvidia,vram>=40G'`: a
+comma-separated conjunction of terms, every term must hold. Supported
+operators are `=`, `!=`, `>=`, and `<=` (no bare `>`/`<`). When both sides
+of a comparison parse as a quantity — a plain number, or one suffixed
+`K`/`M`/`G`/`T` (case-insensitive, powers of 1024) — the comparison is
+numeric, so `vram>=40G` matches `80G` and `81920M` alike; otherwise it
+falls back to a lexicographic string comparison. A term whose key is
+absent from a device's labels never matches, `!=` included: an absent
+label is not proof the device differs.
+
+**A selector matching no device right now is rejected outright at submit
+time — not queued in case one registers later.** A typo in `--select` is
+far more common than that bet paying off, and a job queued indefinitely
+behind a selector that will never match is indistinguishable from a hang:
+
+```
+$ rc run --select 'vendor=intel' -- true
+rc: no_matching_device: no device matches the selector: vendor=intel
+```
+
+**A selector job sitting at the head of the queue reserves every device it
+currently matches, not just one.** Each scheduling pass, a queued selector
+job that cannot be placed holds all of its still-unclaimed matching
+candidates so a job behind it can never jump ahead onto one of them; a
+broad selector (`vram>=1G`, say) waiting for its ceiling or its turn can
+therefore hold up every device it matches, not just the one it eventually
+lands on. Prefer a selector narrow enough to name only the devices you
+actually want in contention with each other.
+
+`rc run --explain --select <selector>` reports which devices match, how
+many are currently free, and the queue depth, without submitting anything
+— useful for checking a selector before committing a job to it.
+
+### Usage sheets and `rc describe`
+
+A **usage sheet** is a plain Markdown file of host or per-device notes —
+whatever an operator wants the next person (or agent) to see before
+touching a device: known quirks, contact info, "don't run anything over
+4h here", whatever. The worker reads `<sheet_dir>/host.md`, a host-wide
+note, and, per device, `<sheet_dir>/host.d/<device-name>.md`, that
+device's own; either file simply being absent is not an error. `sheet_dir`
+defaults to `/etc/rc`. Each sheet is capped at **64KB**: a worker exceeding
+that truncates before pushing it (the controller also enforces the same
+cap server-side as a second line of defence), so a hand-edited `host.md`
+can never grow the database unboundedly. The cap is per sheet, not per
+registration.
+
+**There is no controller-side annotation layer over a usage sheet.** The
+design allows one — an operator annotation the controller carries on top
+of the host's own file, with the host file winning on conflict — but it
+was never built: `host_docs` is stored keyed by `(host, device_id)` alone,
+with nothing layered above it. Whatever `host.md`/`host.d/<device>.md`
+says on the host is exactly what `rc describe` shows; there is no
+separate, controller-held annotation to reconcile it against.
+
+**A device with no `host.d/<device-name>.md` of its own falls back to
+`host.md`.** Writing one `host.md` for a box is the common case, and
+`rc describe` shows it for every device on that host until (and unless)
+that device gets a sheet of its own; `sheet_is_host_wide` in the JSON
+output (and the "device note"/"host-wide note" label in the text output)
+says which one actually landed.
+
+`rc describe <device-id>` is the one command that shows everything known
+about a device before you write a command for it: its state and current
+holder, every label grouped by key with its source and how long ago it was
+last confirmed (a conflicting declared/detected pair is shown side by
+side, never one hiding the other), its usage sheet and the sheet's own
+age, and recent job history. `-o json` prints the same response as JSON
+instead of a table, for scripting. Every age shown — a label's, the
+sheet's, the heartbeat's — is "how long ago was this last confirmed", not
+"how long has this device existed"; an old label age is your signal that
+whatever probe reports it may not have run in a while.
 
 ### Lease lifecycle hooks
 
@@ -493,6 +652,37 @@ JOB                                   DEVICE       STATE        SUBMITTER       
 9d1c8a44-0f7a-4a1e-9e2e-2b4f2c0a1a77  gpubox:gpu0  queued (#1)  agent-b@builder           ./train
 ```
 
+`rc hold` claims a device for a human, not a job — "I need a shell on this
+box", not "run this command":
+
+```
+$ rc hold gpubox:gpu0 --ttl 30m --reason "manual profiling"
+rc: hold e6b8b6b0-8b7f-4e2a-9b8b-9b1c2b3a4d5e granted on gpubox:gpu0, expires around 2026-08-13T13:00:00Z
+rc: end it early with `rc release e6b8b6b0-8b7f-4e2a-9b8b-9b1c2b3a4d5e`, or Ctrl-C here
+```
+
+**Under the hood a hold is a job with `kind: hold`**, whose command a
+worker — never the client — chooses for itself (a sleeper, for its TTL).
+That is a deliberate simplification rather than a second lease mechanism:
+it reuses the exact same allocation transaction, queue, wall-clock
+watchdog, and acquire/release hooks a job already has, so taking a hold
+stands a node's inference server down exactly like a job would, and it
+needs no new code in `rc ps`, `rc devices`, or the dashboard to show up —
+`rc ps` lists it with command `hold`, and `rc devices` shows its holder and
+`--reason`. The cost: a hold occupies a real worker process for its
+duration and appears in job history like any other job.
+
+`--ttl` is required and is capped by the device's `max_runtime` exactly as
+a job's is — rejected, never silently shortened. `--select` works for a
+hold too, taking the first matching free device.
+
+**Ctrl-C on a granted hold releases it** — the opposite of `rc run`'s
+detach-only behaviour for a running job, because a hold's whole point is
+that a human is sitting there, and leaving means they're done with it.
+`rc release <job-id>` does the same thing from any terminal, and is a thin
+alias over `rc kill`: only the hold's own submitter, or an admin token, may
+end it early.
+
 ## Dashboard
 
 The controller serves a read-only web dashboard at `/` — the same address
@@ -607,3 +797,25 @@ from — still requires the header and rejects a query-string token.
   has just called unusable and the next job scheduled onto it — and a
   device ID the controller does not know answers `404`, never a `200` the
   worker would log as a quarantine that never happened.
+- A `--select` matching no device is rejected at submit with 400
+  `no_matching_device` — never queued on the chance a device registers
+  later — and a queued selector job at the head of the queue reserves
+  every device it currently matches, not just the one it eventually lands
+  on, so later-queued jobs cannot jump onto any of them in the meantime.
+  See "Selectors" above.
+- A device's declared labels (`worker.yaml`) and detected labels (a probe)
+  are both stored and both shown; a detected value wins a same-key
+  conflict for scheduling, but a declared value is never overwritten or
+  discarded — `rc describe` shows the conflict rather than hiding it. A
+  probe that fails, times out, or emits anything other than one flat JSON
+  object costs that probe's labels for that pass, never the worker's
+  ability to come up or keep serving jobs — with one exception: a device
+  whose `nvidia-smi` was present at worker startup and later disappears
+  keeps its previously-detected labels instead of losing them, since
+  wiping them is a fleet-wide guess for what is really a one-device
+  problem. See "Labels and probes" above.
+- A hold is a job (`kind: hold`) whose command a worker chooses for
+  itself, never the client — a hold submission carrying a command, `cwd`,
+  or `env` is refused outright. `--ttl` is required and is capped by the
+  device's `max_runtime` exactly as a job's is — rejected, never clamped.
+  See "Client" above.

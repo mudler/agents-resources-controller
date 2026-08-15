@@ -97,9 +97,9 @@ func (s *Server) publishJob(jobID string, state model.JobState) {
 // up eventually.
 //
 // It skips the read entirely when nobody is subscribed: deviceViews()
-// costs two or three store queries, and a controller running with no
-// dashboard open — the common case — should not pay that on every
-// registration and clear.
+// costs three store queries (Devices, Leases, AllLabels), and a controller
+// running with no dashboard open — the common case — should not pay that
+// on every registration and clear.
 func (s *Server) publishDevices() {
 	if !s.events.hasSubscribers() {
 		return

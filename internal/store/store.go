@@ -24,6 +24,9 @@ var schema string
 // that did: see SetDeviceState.
 var ErrDeviceNotFound = errors.New("device not found")
 
+// ErrWorkerNotFound means the worker ID named by a caller matches no row.
+var ErrWorkerNotFound = errors.New("worker not found")
+
 type Store struct {
 	db    *sql.DB
 	clock clock.Clock
@@ -50,6 +53,10 @@ func Open(path string, c clock.Clock) (*Store, error) {
 }
 
 func (s *Store) Close() error { return s.db.Close() }
+
+// Now returns the controller's current time as seen through its Clock, so
+// tests using a fake clock can stamp rows consistently with the store.
+func (s *Store) Now() time.Time { return s.clock.Now() }
 
 // UpsertWorker registers a worker and its declared devices. A worker that
 // registers is a fresh process announcing it has no running jobs — nothing
@@ -294,6 +301,28 @@ func (s *Store) SetDeviceState(id string, state model.DeviceState, at time.Time)
 	return nil
 }
 
+// WorkerHost returns the host a registered worker ID belongs to, so a
+// caller can verify a request naming that worker ID actually agrees about
+// which host it is — see handlePushLabels for why: without this check, a
+// worker with a typo'd or stale `host:` in worker.yaml could push labels
+// that silently land nowhere (a device ID for a host that doesn't exist)
+// while reporting success forever, or overwrite another host's labels
+// outright if the typo happens to collide with a real one.
+//
+// An ID that matches no row yields ErrWorkerNotFound rather than an empty
+// string, so "unknown worker" is never silently treated as "empty host".
+func (s *Store) WorkerHost(workerID string) (string, error) {
+	var host string
+	err := s.db.QueryRow(`SELECT host FROM workers WHERE id = ?`, workerID).Scan(&host)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", fmt.Errorf("%w: %s", ErrWorkerNotFound, workerID)
+	}
+	if err != nil {
+		return "", err
+	}
+	return host, nil
+}
+
 func (s *Store) Devices() ([]model.Device, error) {
 	rows, err := s.db.Query(
 		`SELECT id, host, name, worker_id, state, last_heartbeat_at FROM devices ORDER BY id`)
@@ -317,7 +346,7 @@ func (s *Store) Devices() ([]model.Device, error) {
 
 func (s *Store) Leases() ([]model.Lease, error) {
 	rows, err := s.db.Query(
-		`SELECT id, device_id, holder, job_id, acquired_at, expires_at
+		`SELECT id, device_id, holder, job_id, acquired_at, expires_at, kind, reason
 		 FROM leases WHERE released_at IS NULL ORDER BY acquired_at`)
 	if err != nil {
 		return nil, err
@@ -328,7 +357,7 @@ func (s *Store) Leases() ([]model.Lease, error) {
 	for rows.Next() {
 		var l model.Lease
 		var acq, exp int64
-		if err := rows.Scan(&l.ID, &l.DeviceID, &l.Holder, &l.JobID, &acq, &exp); err != nil {
+		if err := rows.Scan(&l.ID, &l.DeviceID, &l.Holder, &l.JobID, &acq, &exp, &l.Kind, &l.Reason); err != nil {
 			return nil, err
 		}
 		l.AcquiredAt = time.Unix(acq, 0).UTC()
@@ -336,6 +365,47 @@ func (s *Store) Leases() ([]model.Lease, error) {
 		out = append(out, l)
 	}
 	return out, rows.Err()
+}
+
+// RecentJobsForDevice returns up to limit jobs that have run (or are
+// running) on this device, most recent submission first — the history
+// `rc describe` shows so an agent can see what a box has actually been
+// doing, not just what it's doing right now. A device with no history, or
+// one this controller has never heard of, yields an empty slice rather than
+// an error: a freshly registered device legitimately has nothing to show.
+func (s *Store) RecentJobsForDevice(deviceID string, limit int) ([]model.Job, error) {
+	rows, err := s.db.Query(
+		`SELECT id FROM jobs WHERE device_id = ? ORDER BY submitted_at DESC, rowid DESC LIMIT ?`,
+		deviceID, limit)
+	if err != nil {
+		return nil, err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// Rows are fully drained above before Job() issues its own query: the
+	// pool is capped at one connection, so a write or read with the cursor
+	// still open would deadlock.
+	out := make([]model.Job, 0, len(ids))
+	for _, id := range ids {
+		j, err := s.Job(id)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *j)
+	}
+	return out, nil
 }
 
 // AssignedJobsFor returns jobs handed to a worker that it has not started yet.

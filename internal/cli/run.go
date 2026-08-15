@@ -61,6 +61,8 @@ func defaultSubmitter() string {
 func NewRunCmd() *cobra.Command {
 	var (
 		device      string
+		selector    string
+		explain     bool
 		cwd         string
 		as          string
 		priority    int
@@ -71,13 +73,56 @@ func NewRunCmd() *cobra.Command {
 	)
 
 	cmd := &cobra.Command{
-		Use:   "run -d <device> -- <command>...",
+		Use:   "run (-d <device> | --select <selector>) -- <command>...",
 		Short: "Claim a device, run a command on it, stream the output",
-		Args:  cobra.MinimumNArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			if device == "" {
-				return errors.New("-d/--device is required (device selectors are not implemented yet)")
+		// --explain needs no command at all — it never submits anything —
+		// so the usual "a command is required" check only applies when it
+		// is not set. explain is read here via closure, exactly like RunE
+		// below, so it reflects the flags cobra has already parsed by the
+		// time Args runs.
+		Args: func(cmd *cobra.Command, args []string) error {
+			if explain {
+				return nil
 			}
+			return cobra.MinimumNArgs(1)(cmd, args)
+		},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			// Rejected before any request is made, and before defaultSubmitter
+			// or the client are even constructed: --select and -d name two
+			// different, incompatible ways to pick a device, and letting one
+			// silently win would submit against whichever the caller did not
+			// intend.
+			if device != "" && selector != "" {
+				return fmt.Errorf("--select and -d/--device are mutually exclusive (got --select=%q and -d/--device=%q)", selector, device)
+			}
+
+			c := client.New(controllerURL(), controllerToken())
+
+			// --explain answers "what would this selector do" and stops
+			// there: it must be impossible to accidentally submit alongside
+			// it, so this branch returns before defaultSubmitter, Submit, or
+			// anything else that could create a job even runs.
+			if explain {
+				if selector == "" {
+					return errors.New("--explain requires --select (it explains a selector, not a single device)")
+				}
+				resp, err := c.Explain(cmd.Context(), selector)
+				if err != nil {
+					return err
+				}
+				return renderExplain(cmd.OutOrStdout(), resp)
+			}
+
+			if device == "" && selector == "" {
+				return errors.New("-d/--device or --select is required")
+			}
+			// target names whichever the caller gave, for messages that used
+			// to only ever have -d's value to report.
+			target := device
+			if target == "" {
+				target = selector
+			}
+
 			// A local copy: NewRunCmd's closures are shared by every RunE
 			// call on this *cobra.Command, so writing the computed default
 			// back into `as` would leak the first invocation's identity into
@@ -87,7 +132,6 @@ func NewRunCmd() *cobra.Command {
 				submitter = defaultSubmitter()
 			}
 
-			c := client.New(controllerURL(), controllerToken())
 			stderr := cmd.ErrOrStderr()
 
 			// ctx carries SIGINT/SIGTERM so Ctrl-C interrupts log streaming
@@ -104,6 +148,7 @@ func NewRunCmd() *cobra.Command {
 
 			job, err := c.Submit(ctx, client.SubmitOptions{
 				DeviceID:       device,
+				Selector:       selector,
 				Command:        args,
 				Cwd:            cwd,
 				Submitter:      submitter,
@@ -116,7 +161,7 @@ func NewRunCmd() *cobra.Command {
 			if errors.Is(err, client.ErrNoDevice) {
 				// --no-wait opts out of stage 2's queue: a busy device fails
 				// fast here instead of the job sitting queued behind it.
-				return fmt.Errorf("%s is busy and could not be queued", device)
+				return fmt.Errorf("%s is busy and could not be queued", target)
 			}
 			if err != nil {
 				return err
@@ -131,7 +176,7 @@ func NewRunCmd() *cobra.Command {
 				}
 
 				scheduled, err := c.WaitScheduled(waitCtx, job.ID, func(pos int) {
-					fmt.Fprintf(stderr, "rc: queued at position %d for %s\n", pos, device)
+					fmt.Fprintf(stderr, "rc: queued at position %d for %s\n", pos, target)
 				})
 				switch {
 				case err == nil:
@@ -157,7 +202,7 @@ func NewRunCmd() *cobra.Command {
 					// genuinely passed (when timeout<=0, waitCtx is ctx
 					// itself, already ruled out by the case above).
 					cancelQueuedJob(c, stop, stderr, job, submitter)
-					return fmt.Errorf("gave up waiting for %s: %w", device, err)
+					return fmt.Errorf("gave up waiting for %s: %w", target, err)
 				default:
 					// Any other error — most notably WaitScheduled
 					// exhausting its own retry budget against a wedged or
@@ -231,6 +276,9 @@ func NewRunCmd() *cobra.Command {
 	}
 
 	cmd.Flags().StringVarP(&device, "device", "d", "", "device ID, e.g. gpubox:gpu0")
+	cmd.Flags().StringVar(&selector, "select", "", "device selector, e.g. vram>=40G (mutually exclusive with -d)")
+	cmd.Flags().BoolVar(&explain, "explain", false,
+		"with --select, report which devices match, how many are free, and the queue depth, then exit without submitting")
 	cmd.Flags().StringVar(&cwd, "cwd", "", "working directory on the device host")
 	cmd.Flags().StringVar(&as, "as", "", "identity shown in rc ps (defaults to user@host/session)")
 	cmd.Flags().IntVar(&priority, "priority", 0, fmt.Sprintf(
@@ -351,6 +399,34 @@ func safeExitCode(code int) int {
 		return 1
 	}
 	return code
+}
+
+// renderExplain prints what `rc run --explain` promises: which devices
+// match the selector, how many of those are free right now, and how deep
+// the queue already is behind the ones that aren't — everything a caller
+// needs to decide whether to submit, without ever submitting on its behalf.
+func renderExplain(w io.Writer, resp *server.ExplainResponse) error {
+	free := make(map[string]bool, len(resp.Free))
+	for _, id := range resp.Free {
+		free[id] = true
+	}
+
+	fmt.Fprintf(w, "selector: %s\n", resp.Selector)
+	if len(resp.Matching) == 0 {
+		fmt.Fprintln(w, "matching: (no device matches this selector)")
+	} else {
+		fmt.Fprintf(w, "matching (%d):\n", len(resp.Matching))
+		for _, id := range resp.Matching {
+			status := "busy"
+			if free[id] {
+				status = "free"
+			}
+			fmt.Fprintf(w, "  %s  %s\n", id, status)
+		}
+	}
+	fmt.Fprintf(w, "free: %d/%d\n", len(resp.Free), len(resp.Matching))
+	fmt.Fprintf(w, "queue depth: %d\n", resp.QueueDepth)
+	return nil
 }
 
 func controllerURL() string {

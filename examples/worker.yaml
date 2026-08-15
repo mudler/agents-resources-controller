@@ -4,6 +4,25 @@ token: replace-with-worker-token
 # Names should end in the GPU's index (gpu0, gpu1, ...): the worker derives
 # CUDA_VISIBLE_DEVICES from that trailing integer. See README.md.
 
+# probe_dir is where this worker looks for drop-in probe executables, run in
+# sorted filename order on top of the built-ins (cpus, mem, disk, kernel, and
+# nvidia-smi's vendor/model/vram/driver if it's on PATH) to gather detected
+# device labels. Each probe writes one flat JSON object to stdout; a bare key
+# is a host-wide fact, a "<device-name>.<key>" key is device-scoped. Optional;
+# defaults to /etc/rc/probe.d.
+probe_dir: /etc/rc/probe.d
+# probe_interval is how often the whole probe pass (built-ins plus every
+# drop-in) re-runs and pushes fresh detected labels. Optional; defaults to
+# 5m. A probe that fails, times out, or emits anything other than that one
+# flat JSON object costs its own labels for that pass, never the worker.
+probe_interval: 5m
+# sheet_dir is where this worker looks for its usage-sheet documentation:
+# <sheet_dir>/host.md (host-wide, shown for every device on this host by rc
+# describe) and, per device, <sheet_dir>/host.d/<device-name>.md. Either file
+# being absent is not an error. Optional; defaults to /etc/rc. Each sheet is
+# capped at 64KB — a worker exceeding that truncates before pushing it.
+sheet_dir: /etc/rc
+
 # hooks: is host-level defaults for the lease lifecycle hooks below. Either
 # field may be omitted; an omitted field falls back to the built-in default
 # (timeout: 60s, release_linger: 30s). A device's own timeout/release_linger
@@ -46,6 +65,14 @@ devices:
     # its own node instead of leaving a service down that a live job no
     # longer holds.
     release_linger: 45s
+    # labels are this device's declared facts — operator-asserted, as
+    # opposed to what a probe detects at runtime. Both are stored and both
+    # show up in rc describe; a detected value for the same key wins for
+    # scheduling purposes, but never overwrites or hides this one. Useful
+    # for facts no probe can see on its own, like which rack a box sits in.
+    labels:
+      rack: r3
+      tier: prod
   # Plain name form still works, exactly as before — shorthand for
   # {name: gpu1} with no ceiling and no hooks, so jobs on gpu1 run unbounded
   # unless they set their own --max-runtime, and nothing runs on acquire or

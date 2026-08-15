@@ -18,6 +18,19 @@ const (
 
 	defaultHeartbeatInterval = 10 * time.Second
 	defaultPollWait          = 30 * time.Second
+
+	// defaultProbeDir, defaultProbeInterval, and defaultProbeTimeout are the
+	// documented fallbacks for probing: where drop-in probes live, how often
+	// a full pass re-runs, and how long any single probe (built-in
+	// nvidia-smi call or drop-in executable) is allowed before it is killed
+	// as a process group and skipped.
+	defaultProbeDir      = "/etc/rc/probe.d"
+	defaultProbeInterval = 5 * time.Minute
+	defaultProbeTimeout  = 5 * time.Second
+
+	// defaultSheetDir is where readSheets looks for host.md and
+	// host.d/<device>.md when the operator does not set sheet_dir.
+	defaultSheetDir = "/etc/rc"
 )
 
 type Config struct {
@@ -32,6 +45,22 @@ type Config struct {
 	// device. Both are optional; unset fields fall back to
 	// defaultHookTimeout / defaultReleaseLinger.
 	Hooks HooksConfig `yaml:"hooks"`
+	// ProbeDir is where this worker looks for drop-in probe executables,
+	// run in name order on top of the built-ins to gather device labels.
+	// Optional; falls back to defaultProbeDir.
+	ProbeDir string `yaml:"probe_dir"`
+	// ProbeInterval is how often a full probe pass re-runs while the worker
+	// is up, so a label picks up a change (a card swap, a driver upgrade)
+	// without a restart. Optional; falls back to defaultProbeInterval.
+	ProbeInterval time.Duration `yaml:"probe_interval"`
+	// ProbeTimeout bounds any single probe — a built-in nvidia-smi call or
+	// one drop-in executable — before it is killed as a process group and
+	// skipped. Optional; falls back to defaultProbeTimeout.
+	ProbeTimeout time.Duration `yaml:"probe_timeout"`
+	// SheetDir is where this worker looks for its usage-sheet documentation:
+	// <SheetDir>/host.md and <SheetDir>/host.d/<device>.md. Optional; falls
+	// back to defaultSheetDir.
+	SheetDir string `yaml:"sheet_dir"`
 }
 
 // HooksConfig is the host-level default for lease lifecycle hooks. A
@@ -59,6 +88,12 @@ type DeviceConfig struct {
 	// host declared none) once loading is complete.
 	HookTimeout   time.Duration `yaml:"timeout"`
 	ReleaseLinger time.Duration `yaml:"release_linger"`
+	// Labels are this device's declared facts — operator-asserted, as
+	// opposed to what a probe detects — keyed the same flat way a probe's
+	// output is: a bare key ("rack") or, though redundant for a per-device
+	// list, a "<device-name>.<label>" key is accepted wherever labels are
+	// merged. Optional.
+	Labels map[string]string `yaml:"labels"`
 }
 
 func (d *DeviceConfig) UnmarshalYAML(value *yaml.Node) error {
@@ -117,6 +152,18 @@ func (c Config) withDefaults() Config {
 	}
 	if c.PollWait <= 0 {
 		c.PollWait = defaultPollWait
+	}
+	if c.ProbeDir == "" {
+		c.ProbeDir = defaultProbeDir
+	}
+	if c.ProbeInterval <= 0 {
+		c.ProbeInterval = defaultProbeInterval
+	}
+	if c.ProbeTimeout <= 0 {
+		c.ProbeTimeout = defaultProbeTimeout
+	}
+	if c.SheetDir == "" {
+		c.SheetDir = defaultSheetDir
 	}
 	return c
 }

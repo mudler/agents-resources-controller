@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/mudler/agents-resources-controller/internal/model"
+	"github.com/mudler/agents-resources-controller/internal/selector"
 	"github.com/mudler/agents-resources-controller/internal/store"
 )
 
@@ -32,7 +33,11 @@ const (
 )
 
 type SubmitRequest struct {
-	DeviceID           string            `json:"device_id"`
+	DeviceID string `json:"device_id,omitempty"`
+	// Selector picks a device by its labels instead of by exact ID — give
+	// exactly one of DeviceID or Selector, never both. See
+	// store.MatchingDevices for the matching rules.
+	Selector           string            `json:"selector,omitempty"`
 	Command            []string          `json:"command"`
 	Cwd                string            `json:"cwd,omitempty"`
 	Env                map[string]string `json:"env,omitempty"`
@@ -42,7 +47,25 @@ type SubmitRequest struct {
 	MaxRuntimeSeconds  int               `json:"max_runtime_seconds,omitempty"`
 	IdleTimeoutSeconds int               `json:"idle_timeout_seconds,omitempty"`
 	NoWait             bool              `json:"no_wait,omitempty"`
+	// Kind is model.LeaseKindJob or model.LeaseKindHold; empty means job.
+	// A hold ("rc hold") is a job whose command the worker chooses for
+	// itself, never the submitter — see handleSubmit, which rejects a hold
+	// submission that carries one.
+	Kind string `json:"kind,omitempty"`
+	// Reason is why a hold was taken (e.g. "manual profiling"), surfaced by
+	// rc devices and the dashboard via the lease it is copied onto. Only
+	// meaningful for a hold.
+	Reason string `json:"reason,omitempty"`
 }
+
+// holdCommand is the fixed, meaningless-by-design command recorded on a
+// hold's job row. It is display-only — what a real worker actually runs
+// for a hold is chosen by the worker itself (internal/worker's execute),
+// never by what is stored here — so even if this value ever reached a
+// process, nothing a submitter supplied could run through it: a hold
+// submission that carries its own command is rejected outright below,
+// before this is ever used.
+var holdCommand = []string{"hold"}
 
 // JobView is a job plus the queue position a client needs to show progress.
 type JobView struct {
@@ -51,12 +74,18 @@ type JobView struct {
 }
 
 type DeviceView struct {
-	Device              model.Device `json:"device"`
-	Holder              string       `json:"holder,omitempty"`
-	JobID               string       `json:"job_id,omitempty"`
-	Command             []string     `json:"command,omitempty"`
-	ElapsedSeconds      int          `json:"elapsed_seconds"`
-	HeartbeatAgeSeconds int          `json:"heartbeat_age_seconds"`
+	Device model.Device `json:"device"`
+	Holder string       `json:"holder,omitempty"`
+	JobID  string       `json:"job_id,omitempty"`
+	// Kind is the holding lease's kind (model.LeaseKindJob or
+	// model.LeaseKindHold), empty when nothing holds the device. Read
+	// straight off the lease row, which is where task 8 labels a hold —
+	// see the design note in internal/store/allocate.go's assignQueued.
+	Kind                string   `json:"kind,omitempty"`
+	Reason              string   `json:"reason,omitempty"`
+	Command             []string `json:"command,omitempty"`
+	ElapsedSeconds      int      `json:"elapsed_seconds"`
+	HeartbeatAgeSeconds int      `json:"heartbeat_age_seconds"`
 }
 
 type StateResponse struct {
@@ -65,17 +94,289 @@ type StateResponse struct {
 	Queued  []model.Job  `json:"queued"`
 }
 
+// describeRecentJobs bounds how much job history `rc describe` shows: five
+// is enough to tell "this box just failed the last three runs" from "this
+// box is fine", without turning describe into a second `rc ps`.
+const describeRecentJobs = 5
+
+// DescribeResponse is everything an agent needs to trust (or distrust) a
+// device before writing commands for it: what it is, who holds it now, every
+// label with its provenance and age, the humans' own usage notes and how
+// stale THEY are, and its recent job history.
+type DescribeResponse struct {
+	Device              model.Device  `json:"device"`
+	Holder              string        `json:"holder,omitempty"`
+	JobID               string        `json:"job_id,omitempty"`
+	ElapsedSeconds      int           `json:"elapsed_seconds"`
+	HeartbeatAgeSeconds int           `json:"heartbeat_age_seconds"`
+	Labels              []model.Label `json:"labels,omitempty"`
+	Sheet               string        `json:"sheet,omitempty"`
+	SheetUpdatedAt      time.Time     `json:"sheet_updated_at,omitempty"`
+	// SheetIsHostWide is true when Sheet fell back to the host-wide note
+	// because this device has none of its own — an agent reading "don't run
+	// more than two jobs here" needs to know whether that applies to the
+	// whole box or just this card.
+	SheetIsHostWide bool        `json:"sheet_is_host_wide,omitempty"`
+	RecentJobs      []model.Job `json:"recent_jobs,omitempty"`
+}
+
+// ExplainResponse answers "if I submitted this selector right now, what
+// would happen" without actually submitting anything: which devices match,
+// which of those are free this instant, and how backed up the ones that
+// aren't free already are.
+type ExplainResponse struct {
+	Selector   string   `json:"selector"`
+	Matching   []string `json:"matching"`
+	Free       []string `json:"free"`
+	QueueDepth int      `json:"queue_depth"`
+}
+
+// handleDescribe answers `rc describe`: everything the routes above answer
+// piecemeal (device state, labels, sheet, history), joined for one device so
+// an agent can learn what a box is before it writes commands for it.
+func (s *Server) handleDescribe(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+
+	views, err := s.deviceViews()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
+		return
+	}
+	var view *DeviceView
+	for i := range views {
+		if views[i].Device.ID == id {
+			view = &views[i]
+			break
+		}
+	}
+	if view == nil {
+		writeErr(w, http.StatusNotFound, "not_found", "device not found")
+		return
+	}
+
+	labels, err := s.cfg.Store.LabelsFor(id)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
+		return
+	}
+
+	// Prefer the device's own sheet; a device with none of its own still
+	// gets the host-wide one, so describe never goes silent about
+	// documentation that exists just because it lives one level up. Which
+	// one actually landed is reported back (sheetIsHostWide) so the
+	// rendering — and the agent reading it — can tell "applies to this
+	// card" from "applies to the whole box".
+	//
+	// The fallback triggers on an empty body alone, NOT "empty body and a
+	// zero timestamp" as an earlier version of this check required. A real
+	// worker's readSheets always sends an explicit (if empty) per-device
+	// entry for every device it declares — a missing host.d/<name>.md reads
+	// the same as an empty one — so applyDeviceFacts stores a real,
+	// non-zero-timestamped row for a device that has never actually had its
+	// own sheet. Requiring a zero timestamp on top of an empty body meant
+	// that row's mere existence, from the device's first registration
+	// onward, permanently defeated this fallback: host.md — the single most
+	// common way to document a box — never surfaced for any of its devices.
+	// An empty body has nothing to show either way, so falling back on it
+	// alone is correct: there is no useful distinction left to make between
+	// "never registered a sheet" and "registered an empty one".
+	sheet, sheetAt, err := s.cfg.Store.HostDoc(view.Device.Host, id)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
+		return
+	}
+	sheetIsHostWide := false
+	if sheet == "" {
+		sheet, sheetAt, err = s.cfg.Store.HostDoc(view.Device.Host, "")
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
+			return
+		}
+		sheetIsHostWide = true
+	}
+
+	recent, err := s.cfg.Store.RecentJobsForDevice(id, describeRecentJobs)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, DescribeResponse{
+		Device:              view.Device,
+		Holder:              view.Holder,
+		JobID:               view.JobID,
+		ElapsedSeconds:      view.ElapsedSeconds,
+		HeartbeatAgeSeconds: view.HeartbeatAgeSeconds,
+		Labels:              labels,
+		Sheet:               sheet,
+		SheetUpdatedAt:      sheetAt,
+		SheetIsHostWide:     sheetIsHostWide,
+		RecentJobs:          recent,
+	})
+}
+
+// handleExplain answers `rc run --explain`: it runs exactly the matching
+// logic a real submit would (store.MatchingDevices — the same function
+// Enqueue and ScheduleOnce use, so explain can never disagree with what
+// actually happens), then reports device state and queue backlog, and
+// submits nothing.
+func (s *Server) handleExplain(w http.ResponseWriter, r *http.Request) {
+	sel := r.URL.Query().Get("selector")
+	if sel == "" {
+		writeErr(w, http.StatusBadRequest, "bad_request", "selector query parameter required")
+		return
+	}
+	parsed, err := selector.Parse(sel)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "bad_selector", err.Error())
+		return
+	}
+
+	// The label snapshot and device list are fetched exactly ONCE for this
+	// whole request and matched against locally — for the requested
+	// selector AND for every queued selector job below — rather than
+	// calling store.MatchingDevices (its own LabelSnapshot + Devices pair)
+	// once per queued job. At MaxOpenConns(1) every store query serialises
+	// against the scheduler and the heartbeat handler, so a deep selector
+	// queue behind a per-job round trip would let a diagnostic command —
+	// exactly the kind someone re-runs repeatedly while debugging — stall
+	// job scheduling fleet-wide. The matching logic itself is unchanged:
+	// this calls the same selector.Selector.Match that MatchingDevices
+	// calls internally, just against a shared snapshot instead of a fresh
+	// one per selector.
+	snapshot, err := s.cfg.Store.LabelSnapshot()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
+		return
+	}
+	devices, err := s.cfg.Store.Devices()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
+		return
+	}
+
+	// Devices() is already ordered by ID, so appending matches in that
+	// order keeps Matching sorted the same way store.MatchingDevices
+	// guarantees.
+	matching := make([]string, 0, len(devices))
+	free := make([]string, 0, len(devices))
+	matchSet := make(map[string]bool, len(devices))
+	for _, d := range devices {
+		if !parsed.Match(snapshot[d.ID]) {
+			continue
+		}
+		matching = append(matching, d.ID)
+		matchSet[d.ID] = true
+		if d.State == model.DeviceReady {
+			free = append(free, d.ID)
+		}
+	}
+
+	queued, err := s.cfg.Store.QueuedJobs()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
+		return
+	}
+	depth := 0
+	for _, j := range queued {
+		if j.DeviceID != "" {
+			if matchSet[j.DeviceID] {
+				depth++
+			}
+			continue
+		}
+		if j.Selector == "" {
+			continue
+		}
+		// A queued selector job could land on any of ITS candidates; it
+		// counts against this explain's depth if the two candidate sets
+		// overlap at all, matched against the same shared snapshot rather
+		// than a fresh store round trip per job.
+		jobSel, err := selector.Parse(j.Selector)
+		if err != nil {
+			continue
+		}
+		for _, d := range devices {
+			if matchSet[d.ID] && jobSel.Match(snapshot[d.ID]) {
+				depth++
+				break
+			}
+		}
+	}
+
+	writeJSON(w, http.StatusOK, ExplainResponse{
+		Selector: sel, Matching: matching, Free: free, QueueDepth: depth,
+	})
+}
+
 func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 	var req SubmitRequest
 	if !decode(w, r, &req) {
 		return
 	}
-	if len(req.Command) == 0 {
-		writeErr(w, http.StatusBadRequest, "bad_request", "command required")
+
+	kind := req.Kind
+	if kind == "" {
+		kind = model.LeaseKindJob
+	}
+	switch kind {
+	case model.LeaseKindJob:
+		if len(req.Command) == 0 {
+			writeErr(w, http.StatusBadRequest, "bad_request", "command required")
+			return
+		}
+	case model.LeaseKindHold:
+		// The sleeper a hold runs — its command, its working directory, and
+		// its environment — is the worker's choice, never the submitter's
+		// (see internal/worker's execute). This is the one place that
+		// guarantee is actually enforced: a hold submission carrying any of
+		// the three is refused outright, rejected rather than silently
+		// blanked, so "--kind hold" can never become a way to run arbitrary
+		// code (or point it at an attacker-chosen cwd, or hand it
+		// LD_PRELOAD via env) labelled as something else. Blanking instead
+		// of rejecting was considered and rejected: a client sending these
+		// for a hold is confused about what a hold is, and silently
+		// discarding two thirds of its request is worse than telling it so.
+		if len(req.Command) != 0 {
+			writeErr(w, http.StatusBadRequest, "bad_request",
+				"a hold may not specify a command: the worker supplies its own")
+			return
+		}
+		if req.Cwd != "" {
+			writeErr(w, http.StatusBadRequest, "bad_request",
+				"a hold may not specify a cwd: the worker's sleeper does not use one")
+			return
+		}
+		if len(req.Env) != 0 {
+			writeErr(w, http.StatusBadRequest, "bad_request",
+				"a hold may not specify env: the worker's sleeper does not use it")
+			return
+		}
+		if req.IdleTimeoutSeconds != 0 {
+			writeErr(w, http.StatusBadRequest, "bad_request",
+				"a hold may not specify idle_timeout_seconds: the worker's sleeper produces no output, so an idle timeout would kill the hold almost immediately")
+			return
+		}
+		// --ttl is required for a hold, capped by the device's max_runtime
+		// exactly as a job's is (checked below via the ordinary ceiling
+		// path once MaxRuntimeSeconds is known to be positive) — rejected,
+		// never clamped, never silently defaulted to "no expiry".
+		if req.MaxRuntimeSeconds <= 0 {
+			writeErr(w, http.StatusBadRequest, "bad_request", "a hold requires --ttl")
+			return
+		}
+		req.Command = holdCommand
+	default:
+		writeErr(w, http.StatusBadRequest, "bad_request",
+			fmt.Sprintf("unknown kind %q: must be %q or %q", req.Kind, model.LeaseKindJob, model.LeaseKindHold))
 		return
 	}
-	if req.DeviceID == "" {
-		writeErr(w, http.StatusBadRequest, "bad_request", "device_id required (device selectors are not implemented yet; address a device by its exact ID)")
+	switch {
+	case req.DeviceID != "" && req.Selector != "":
+		writeErr(w, http.StatusBadRequest, "bad_request", "give either device_id or selector, not both")
+		return
+	case req.DeviceID == "" && req.Selector == "":
+		writeErr(w, http.StatusBadRequest, "bad_request", "device_id or selector required")
 		return
 	}
 	if req.Submitter == "" {
@@ -90,16 +391,30 @@ func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 				req.Priority, MinPriority, MaxPriority))
 		return
 	}
+	// A malformed selector is validated here, before Enqueue, so it maps to
+	// the same 400 bad_selector handleExplain already gives — not a 500.
+	// store.Enqueue wraps selector.Parse's error as "selector: %w" with no
+	// sentinel to test for, so without this pre-check it falls through to
+	// the generic store_error 500 below: a typo'd selector would read as
+	// "the controller is broken" instead of naming the bad term.
+	if req.Selector != "" {
+		if _, err := selector.Parse(req.Selector); err != nil {
+			writeErr(w, http.StatusBadRequest, "bad_selector", err.Error())
+			return
+		}
+	}
 
 	// Submitting always enqueues: ScheduleOnce below is the only place a
 	// device changes hands, so there is no check-then-act race between
 	// "is this device free?" and grabbing it.
 	job, err := s.cfg.Store.Enqueue(store.EnqueueRequest{
-		DeviceID: req.DeviceID, Command: req.Command, Cwd: req.Cwd, Env: req.Env,
+		DeviceID: req.DeviceID, Selector: req.Selector, Command: req.Command, Cwd: req.Cwd, Env: req.Env,
 		Submitter: req.Submitter, IdempotencyKey: req.IdempotencyKey,
 		Priority:    req.Priority,
 		MaxRuntime:  time.Duration(req.MaxRuntimeSeconds) * time.Second,
 		IdleTimeout: time.Duration(req.IdleTimeoutSeconds) * time.Second,
+		Kind:        kind,
+		Reason:      req.Reason,
 	})
 	if errors.Is(err, store.ErrRuntimeAboveCeiling) {
 		writeErr(w, http.StatusBadRequest, "runtime_above_ceiling", err.Error())
@@ -107,6 +422,10 @@ func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 	}
 	if errors.Is(err, store.ErrUnknownDevice) {
 		writeErr(w, http.StatusBadRequest, "unknown_device", err.Error())
+		return
+	}
+	if errors.Is(err, store.ErrNoMatchingDevice) {
+		writeErr(w, http.StatusBadRequest, "no_matching_device", err.Error())
 		return
 	}
 	if err != nil {
@@ -322,22 +641,34 @@ func (s *Server) deviceViews() ([]DeviceView, error) {
 	if err != nil {
 		return nil, err
 	}
+	// One query for every device's labels, not one per device — see
+	// AllLabels's own doc comment for why deviceViews in particular must
+	// avoid that N+1 shape.
+	labels, err := s.cfg.Store.AllLabels()
+	if err != nil {
+		return nil, err
+	}
 	byDevice := map[string]struct {
 		holder string
 		jobID  string
+		kind   string
+		reason string
 		since  time.Time
 	}{}
 	for _, l := range leases {
 		byDevice[l.DeviceID] = struct {
 			holder string
 			jobID  string
+			kind   string
+			reason string
 			since  time.Time
-		}{l.Holder, l.JobID, l.AcquiredAt}
+		}{l.Holder, l.JobID, l.Kind, l.Reason, l.AcquiredAt}
 	}
 
 	now := s.cfg.Clock.Now()
 	out := make([]DeviceView, 0, len(devices))
 	for _, d := range devices {
+		d.Labels = labels[d.ID]
 		v := DeviceView{
 			Device:              d,
 			HeartbeatAgeSeconds: int(now.Sub(d.LastHeartbeatAt).Seconds()),
@@ -345,6 +676,8 @@ func (s *Server) deviceViews() ([]DeviceView, error) {
 		if l, ok := byDevice[d.ID]; ok {
 			v.Holder = l.holder
 			v.JobID = l.jobID
+			v.Kind = l.kind
+			v.Reason = l.reason
 			v.ElapsedSeconds = int(now.Sub(l.since).Seconds())
 			if job, err := s.cfg.Store.Job(l.jobID); err == nil {
 				v.Command = job.Command

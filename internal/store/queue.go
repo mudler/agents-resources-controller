@@ -5,10 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
+	"sort"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/mudler/agents-resources-controller/internal/model"
+	"github.com/mudler/agents-resources-controller/internal/selector"
 )
 
 // ErrRuntimeAboveCeiling means the job asked for more wall clock than the
@@ -22,8 +25,14 @@ var ErrRuntimeAboveCeiling = errors.New("requested runtime exceeds the device ce
 // long) so a caller — and the HTTP layer — can answer each differently.
 var ErrUnknownDevice = errors.New("unknown device")
 
+// ErrNoMatchingDevice means the selector matches no device that exists. We
+// reject at submit rather than queue forever: a selector matching nothing is
+// far more often a typo than a bet on a host registering later.
+var ErrNoMatchingDevice = errors.New("no device matches the selector")
+
 type EnqueueRequest struct {
 	DeviceID       string
+	Selector       string
 	Command        []string
 	Cwd            string
 	Env            map[string]string
@@ -32,6 +41,14 @@ type EnqueueRequest struct {
 	Priority       int
 	MaxRuntime     time.Duration
 	IdleTimeout    time.Duration
+	// Kind is model.LeaseKindJob or model.LeaseKindHold; empty defaults to
+	// LeaseKindJob. Validating that a hold carries no command and has a
+	// TTL is the submit handler's job (server.handleSubmit), not this
+	// layer's — Enqueue only persists what it is given.
+	Kind string
+	// Reason is why a hold was taken; carried through to the job row and,
+	// at assignment, copied onto the lease row (see assignQueued).
+	Reason string
 }
 
 // SetDeviceMaxRuntime records the ceiling a host declares for one of its
@@ -63,6 +80,62 @@ func (s *Store) Enqueue(req EnqueueRequest) (*model.Job, error) {
 	if req.Submitter == "" {
 		return nil, errors.New("submitter required")
 	}
+
+	switch {
+	case req.DeviceID != "" && req.Selector != "":
+		return nil, errors.New("give either device_id or selector, not both")
+	case req.DeviceID == "" && req.Selector == "":
+		return nil, errors.New("device_id or selector required")
+	}
+
+	// Selector resolution runs before the transaction opens: MatchingDevices
+	// issues its own queries against s.db, and with MaxOpenConns(1) doing
+	// that while a tx already holds the only connection would deadlock.
+	if req.Selector != "" {
+		sel, err := selector.Parse(req.Selector)
+		if err != nil {
+			return nil, fmt.Errorf("selector: %w", err)
+		}
+		matches, err := s.MatchingDevices(sel.String())
+		if err != nil {
+			return nil, err
+		}
+		if len(matches) == 0 {
+			return nil, fmt.Errorf("%w: %s", ErrNoMatchingDevice, sel.String())
+		}
+
+		// A pinned job is rejected below for asking more than its one named
+		// device tolerates. A selector job has no single device yet, but the
+		// same rule has to hold: if not one of today's matches can carry the
+		// requested runtime, queueing it would either wait forever (no
+		// candidate will ever qualify without a ceiling change) or, worse,
+		// land on whichever candidate ScheduleOnce reaches first regardless
+		// of ceiling. So this is rejected here too, not left to surface as a
+		// silent stall or a bypassed ceiling later.
+		if req.MaxRuntime > 0 {
+			within, err := s.ceilingFilter(matches, req.MaxRuntime)
+			if err != nil {
+				return nil, err
+			}
+			if len(within) == 0 {
+				ceiling, err := s.deviceCeilings()
+				if err != nil {
+					return nil, err
+				}
+				var best time.Duration
+				for _, id := range matches {
+					if c := ceiling[id]; c > best {
+						best = c
+					}
+				}
+				return nil, fmt.Errorf("%w: no device matching %q tolerates %s (highest declared ceiling among matches: %s)",
+					ErrRuntimeAboveCeiling, sel.String(), req.MaxRuntime, best)
+			}
+		}
+
+		req.Selector = sel.String() // store the normalised form
+	}
+
 	now := s.clock.Now()
 
 	tx, err := s.db.Begin()
@@ -85,23 +158,27 @@ func (s *Store) Enqueue(req EnqueueRequest) (*model.Job, error) {
 		}
 	}
 
-	var ceiling int64
-	err = tx.QueryRow(`SELECT max_runtime FROM devices WHERE id = ?`, req.DeviceID).Scan(&ceiling)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, fmt.Errorf("%w: %q", ErrUnknownDevice, req.DeviceID)
-	}
-	if err != nil {
-		return nil, err
-	}
-	if ceiling > 0 {
-		limit := time.Duration(ceiling) * time.Second
-		if req.MaxRuntime == 0 || req.MaxRuntime > limit {
-			if req.MaxRuntime > limit {
-				return nil, fmt.Errorf("%w: %s allows at most %s",
-					ErrRuntimeAboveCeiling, req.DeviceID, limit)
+	// A selector job's ceiling is resolved at assignment time instead: it
+	// inherits whatever device it lands on, which is not known yet.
+	if req.DeviceID != "" {
+		var ceiling int64
+		err = tx.QueryRow(`SELECT max_runtime FROM devices WHERE id = ?`, req.DeviceID).Scan(&ceiling)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, fmt.Errorf("%w: %q", ErrUnknownDevice, req.DeviceID)
+		}
+		if err != nil {
+			return nil, err
+		}
+		if ceiling > 0 {
+			limit := time.Duration(ceiling) * time.Second
+			if req.MaxRuntime == 0 || req.MaxRuntime > limit {
+				if req.MaxRuntime > limit {
+					return nil, fmt.Errorf("%w: %s allows at most %s",
+						ErrRuntimeAboveCeiling, req.DeviceID, limit)
+				}
+				// No request: inherit the device's ceiling.
+				req.MaxRuntime = limit
 			}
-			// No request: inherit the device's ceiling.
-			req.MaxRuntime = limit
 		}
 	}
 
@@ -119,15 +196,21 @@ func (s *Store) Enqueue(req EnqueueRequest) (*model.Job, error) {
 		key = req.IdempotencyKey
 	}
 
+	kind := req.Kind
+	if kind == "" {
+		kind = model.LeaseKindJob
+	}
+
 	id := uuid.NewString()
 	if _, err := tx.Exec(
 		`INSERT INTO jobs (id, selector, command, cwd, env, submitter, idempotency_key,
 		                   state, device_id, worker_id, submitted_at, queued_at,
-		                   priority, max_runtime, idle_timeout)
-		 VALUES (?, '', ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?)`,
-		id, string(cmdJSON), req.Cwd, string(envJSON), req.Submitter, key,
+		                   priority, max_runtime, idle_timeout, kind, reason)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?)`,
+		id, req.Selector, string(cmdJSON), req.Cwd, string(envJSON), req.Submitter, key,
 		string(model.JobQueued), req.DeviceID, now.Unix(), now.Unix(),
 		req.Priority, int64(req.MaxRuntime.Seconds()), int64(req.IdleTimeout.Seconds()),
+		kind, req.Reason,
 	); err != nil {
 		return nil, fmt.Errorf("insert queued job: %w", err)
 	}
@@ -136,6 +219,82 @@ func (s *Store) Enqueue(req EnqueueRequest) (*model.Job, error) {
 		return nil, err
 	}
 	return s.Job(id)
+}
+
+// MatchingDevices returns the device IDs whose effective labels satisfy the
+// selector, sorted by ID so scheduling is deterministic.
+func (s *Store) MatchingDevices(sel string) ([]string, error) {
+	parsed, err := selector.Parse(sel)
+	if err != nil {
+		return nil, fmt.Errorf("selector: %w", err)
+	}
+	snap, err := s.LabelSnapshot()
+	if err != nil {
+		return nil, err
+	}
+	devices, err := s.Devices()
+	if err != nil {
+		return nil, err
+	}
+
+	var out []string
+	for _, d := range devices {
+		if parsed.Match(snap[d.ID]) {
+			out = append(out, d.ID)
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// deviceCeilings returns every device's declared runtime ceiling, keyed by
+// ID; 0 means none declared. It reads the column directly rather than going
+// through Devices(), which deliberately does not surface it (see
+// TestRegisterAppliesDeviceRuntimeCeilings).
+func (s *Store) deviceCeilings() (map[string]time.Duration, error) {
+	rows, err := s.db.Query(`SELECT id, max_runtime FROM devices`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := map[string]time.Duration{}
+	for rows.Next() {
+		var id string
+		var sec int64
+		if err := rows.Scan(&id, &sec); err != nil {
+			return nil, err
+		}
+		out[id] = time.Duration(sec) * time.Second
+	}
+	return out, rows.Err()
+}
+
+// ceilingFilter narrows matches to the devices whose declared runtime
+// ceiling can accommodate requested. A device with no declared ceiling (0)
+// always qualifies. requested <= 0 means the job asked for no runtime of its
+// own, so nothing is filtered here — it inherits whatever ceiling the
+// device it lands on declares, same as it always has.
+//
+// This backs both Enqueue's submit-time validation and ScheduleOnce's
+// per-pass candidate list, so the two can never disagree: a device Enqueue
+// would have refused a job for is never later handed to that job by the
+// scheduler routing around the label match instead.
+func (s *Store) ceilingFilter(matches []string, requested time.Duration) ([]string, error) {
+	if requested <= 0 || len(matches) == 0 {
+		return matches, nil
+	}
+	ceiling, err := s.deviceCeilings()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(matches))
+	for _, id := range matches {
+		if c := ceiling[id]; c == 0 || c >= requested {
+			out = append(out, id)
+		}
+	}
+	return out, nil
 }
 
 // ScheduleOnce makes one scheduling pass: for each queued job in priority then
@@ -160,28 +319,81 @@ func (s *Store) ScheduleOnce() ([]model.Job, error) {
 	reserved := map[string]bool{} // device -> a queued job ahead of us holds it
 
 	for _, job := range queued {
-		if reserved[job.DeviceID] {
-			continue // someone ahead of us is waiting for this device
+		candidates := []string{job.DeviceID}
+		if job.Selector != "" {
+			matches, err := s.MatchingDevices(job.Selector)
+			if err != nil {
+				// One bad row (e.g. a malformed selector that somehow got
+				// past submit-time validation) must not wedge the whole
+				// fleet: log it and let the rest of the pass proceed.
+				slog.Error("scheduling: selector match failed for a queued job; skipping it this pass",
+					"job", job.ID, "selector", job.Selector, "err", err)
+				continue
+			}
+			candidates, err = s.ceilingFilter(matches, time.Duration(job.MaxRuntimeSeconds)*time.Second)
+			if err != nil {
+				slog.Error("scheduling: device ceiling lookup failed for a queued job; skipping it this pass",
+					"job", job.ID, "selector", job.Selector, "err", err)
+				continue
+			}
+			if len(candidates) == 0 {
+				// Visible rather than silent: without this the job just
+				// sits in state queued forever with no reservation and no
+				// trace of why, indistinguishable from a hung scheduler.
+				slog.Warn("scheduling: selector job matches no device that also tolerates its runtime this pass",
+					"job", job.ID, "selector", job.Selector)
+				continue
+			}
 		}
 
-		out, err := s.assignQueued(job.ID, job.DeviceID)
-		switch {
-		case err == nil:
-			assigned = append(assigned, *out)
-		case errors.Is(err, ErrNoDevice):
-			// Not free: hold it for this job so later jobs cannot jump ahead.
-			reserved[job.DeviceID] = true
-			if err := s.reserve(job.ID, job.DeviceID); err != nil {
+		// Prune only the candidates someone ahead of us in the queue is
+		// already holding — not the whole job. Skipping the job entirely
+		// whenever *any* candidate was reserved let a job behind it take a
+		// candidate nobody had actually claimed, defeating the reservation
+		// and starving a broad selector job behind a stream of narrower
+		// ones. Note `reserved` is a map[string]bool — each queued job is
+		// visited once per pass, so a job can never encounter its own
+		// reservation and no owner needs recording.
+		available := make([]string, 0, len(candidates))
+		for _, deviceID := range candidates {
+			if !reserved[deviceID] {
+				available = append(available, deviceID)
+			}
+		}
+		if len(available) == 0 {
+			continue // every candidate is already held by a job ahead of us
+		}
+
+		placed := false
+		for _, deviceID := range available {
+			out, err := s.assignQueued(job.ID, deviceID)
+			switch {
+			case err == nil:
+				assigned = append(assigned, *out)
+				placed = true
+			case errors.Is(err, ErrNoDevice):
+				continue // this one is busy; try the next candidate
+			case errors.Is(err, errJobNoLongerQueued):
+				placed = true // vanished; reserve nothing on its behalf
+			default:
 				return nil, err
 			}
-		case errors.Is(err, errJobNoLongerQueued):
-			// This job vanished (e.g. cancelled) between QueuedJobs and here.
-			// There is no job left to reserve the device for, so skip it
-			// entirely: reserve nothing, and let whoever is behind it in the
-			// queue — for the same device or otherwise — proceed this pass
-			// rather than idle a free device until the next tick.
-		default:
-			return nil, err
+			if placed {
+				break
+			}
+		}
+		if placed {
+			continue
+		}
+
+		// Nothing free among what nobody ahead of us had already claimed:
+		// hold all of it for this job so later jobs cannot jump ahead of it
+		// either.
+		for _, deviceID := range available {
+			reserved[deviceID] = true
+			if err := s.reserve(job.ID, deviceID); err != nil {
+				return nil, err
+			}
 		}
 	}
 	return assigned, nil
@@ -226,8 +438,11 @@ func (s *Store) QueuedJobs() ([]model.Job, error) {
 	return out, nil
 }
 
-// QueuePosition is 1-based among jobs waiting for the same device; 0 means the
-// job is not queued.
+// QueuePosition is 1-based. For a pinned job it counts jobs ahead of it
+// waiting for the same device. A selector job's candidate set can change
+// between scheduling passes (labels change, devices come and go), so it
+// counts every queued job ahead of it in scheduling order instead — an
+// upper bound on its wait, not an exact slot. 0 means the job is not queued.
 func (s *Store) QueuePosition(jobID string) (int, error) {
 	job, err := s.Job(jobID)
 	if err != nil {
@@ -241,13 +456,21 @@ func (s *Store) QueuePosition(jobID string) (int, error) {
 		queuedAt = job.QueuedAt.Unix()
 	}
 	// Tie-break on rowid, not id: see the comment on QueuedJobs for why.
+	deviceFilter := "device_id = ?"
+	args := []any{string(model.JobQueued)}
+	if job.Selector != "" {
+		deviceFilter = "1 = 1"
+	} else {
+		args = append(args, job.DeviceID)
+	}
+	args = append(args, job.Priority, job.Priority, queuedAt, queuedAt, job.ID)
+
 	var ahead int
 	err = s.db.QueryRow(
 		`SELECT COUNT(*) FROM jobs
-		 WHERE state = ? AND device_id = ?
+		 WHERE state = ? AND `+deviceFilter+`
 		   AND (priority > ? OR (priority = ? AND (queued_at < ? OR (queued_at = ? AND rowid < (SELECT rowid FROM jobs WHERE id = ?)))))`,
-		string(model.JobQueued), job.DeviceID,
-		job.Priority, job.Priority, queuedAt, queuedAt, job.ID,
+		args...,
 	).Scan(&ahead)
 	if err != nil {
 		return 0, err

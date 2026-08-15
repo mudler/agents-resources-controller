@@ -21,6 +21,15 @@ type JobSpec struct {
 	GraceCeiling time.Duration // SIGTERM -> SIGKILL window; default 10s
 	MaxRuntime   time.Duration // total wall-clock ceiling; 0 means no limit
 	IdleTimeout  time.Duration // max gap with no stdout/stderr output; 0 means no limit
+	// Stderr, if non-nil, receives the process's stderr separately from the
+	// sink passed to Run (which then carries only stdout). Nil (the
+	// default) preserves today's behavior for jobs and hooks: stdout and
+	// stderr both land in sink, combined, so a live `rc run` sees one
+	// interleaved stream. A caller that needs to parse stdout on its own —
+	// a probe emitting a single JSON object, where a stray stderr line
+	// would otherwise corrupt the parse — sets this to keep the streams
+	// apart.
+	Stderr io.Writer
 }
 
 type Result struct {
@@ -47,7 +56,13 @@ func Run(ctx context.Context, spec JobSpec, sink io.Writer) Result {
 		grace = 10 * time.Second
 	}
 
-	wd := newWatchdogWriter(sink, time.Now())
+	// clock is shared between the stdout and stderr writers below (even when
+	// they end up wrapping different underlying sinks) so the idle watchdog
+	// measures real progress on EITHER stream — a job that only ever writes
+	// to stderr must still count as producing output, exactly as it did
+	// before stdout/stderr could be split.
+	clock := newIdleClock(time.Now())
+	stdoutW := newWatchdogWriter(sink, clock)
 
 	cmd := exec.Command(spec.Command[0], spec.Command[1:]...)
 	cmd.Dir = spec.Cwd
@@ -55,8 +70,12 @@ func Run(ctx context.Context, spec JobSpec, sink io.Writer) Result {
 	for k, v := range spec.Env {
 		cmd.Env = append(cmd.Env, k+"="+v)
 	}
-	cmd.Stdout = wd
-	cmd.Stderr = wd
+	cmd.Stdout = stdoutW
+	if spec.Stderr != nil {
+		cmd.Stderr = newWatchdogWriter(spec.Stderr, clock)
+	} else {
+		cmd.Stderr = stdoutW
+	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	if err := cmd.Start(); err != nil {
@@ -90,7 +109,7 @@ func Run(ctx context.Context, spec JobSpec, sink io.Writer) Result {
 					switch {
 					case spec.MaxRuntime > 0 && time.Now().After(deadline):
 						reason = "max_runtime exceeded (" + spec.MaxRuntime.String() + ")"
-					case spec.IdleTimeout > 0 && wd.idleFor() > spec.IdleTimeout:
+					case spec.IdleTimeout > 0 && clock.idleFor() > spec.IdleTimeout:
 						reason = "idle: no output for " + spec.IdleTimeout.String()
 					default:
 						continue

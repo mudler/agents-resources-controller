@@ -211,11 +211,11 @@ func (s *Store) Job(id string) (*model.Job, error) {
 	err := s.db.QueryRow(
 		`SELECT id, selector, command, cwd, env, submitter, idempotency_key, state,
 		        device_id, worker_id, exit_code, kill_reason, submitted_at, started_at, finished_at,
-		        priority, max_runtime, idle_timeout, queued_at
+		        priority, max_runtime, idle_timeout, queued_at, kind, reason
 		 FROM jobs WHERE id = ?`, id,
 	).Scan(&j.ID, &j.Selector, &cmdJSON, &j.Cwd, &envJSON, &j.Submitter, &idem, &j.State,
 		&j.DeviceID, &j.WorkerID, &exitCode, &j.KillReason, &submitted, &started, &finished,
-		&priority, &maxRuntime, &idleTimeout, &queuedAt)
+		&priority, &maxRuntime, &idleTimeout, &queuedAt, &j.Kind, &j.Reason)
 	if err != nil {
 		return nil, err
 	}
@@ -265,9 +265,10 @@ func (s *Store) assignQueued(jobID, deviceID string) (*model.Job, error) {
 	defer tx.Rollback()
 
 	var workerID string
+	var deviceCeiling int64
 	err = tx.QueryRow(
-		`SELECT worker_id FROM devices WHERE id = ? AND state = ?`,
-		deviceID, string(model.DeviceReady)).Scan(&workerID)
+		`SELECT worker_id, max_runtime FROM devices WHERE id = ? AND state = ?`,
+		deviceID, string(model.DeviceReady)).Scan(&workerID, &deviceCeiling)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNoDevice
 	}
@@ -275,15 +276,23 @@ func (s *Store) assignQueued(jobID, deviceID string) (*model.Job, error) {
 		return nil, fmt.Errorf("select device: %w", err)
 	}
 
-	var submitter string
+	var submitter, kind, reason string
 	var ttl int64
 	if err := tx.QueryRow(
-		`SELECT submitter, max_runtime FROM jobs WHERE id = ? AND state = ?`,
-		jobID, string(model.JobQueued)).Scan(&submitter, &ttl); err != nil {
+		`SELECT submitter, max_runtime, kind, reason FROM jobs WHERE id = ? AND state = ?`,
+		jobID, string(model.JobQueued)).Scan(&submitter, &ttl, &kind, &reason); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, errJobNoLongerQueued
 		}
 		return nil, err
+	}
+
+	// A pinned job already had the device's ceiling applied at submit time
+	// in Enqueue. A selector job could not know which device it would land
+	// on, so it inherits the landing device's ceiling only now, and only if
+	// it asked for none of its own.
+	if ttl == 0 && deviceCeiling > 0 {
+		ttl = deviceCeiling
 	}
 
 	if _, err := tx.Exec(
@@ -291,9 +300,11 @@ func (s *Store) assignQueued(jobID, deviceID string) (*model.Job, error) {
 		string(model.DeviceBusy), deviceID, string(model.DeviceReady)); err != nil {
 		return nil, fmt.Errorf("mark device busy: %w", err)
 	}
+	// device_id is set here (not only at Enqueue) because a selector job's
+	// row carries no device_id until it lands on one.
 	if _, err := tx.Exec(
-		`UPDATE jobs SET state = ?, worker_id = ? WHERE id = ?`,
-		string(model.JobAssigned), workerID, jobID); err != nil {
+		`UPDATE jobs SET state = ?, device_id = ?, worker_id = ?, max_runtime = ? WHERE id = ?`,
+		string(model.JobAssigned), deviceID, workerID, ttl, jobID); err != nil {
 		return nil, fmt.Errorf("assign job: %w", err)
 	}
 
@@ -303,10 +314,14 @@ func (s *Store) assignQueued(jobID, deviceID string) (*model.Job, error) {
 	if ttl > 0 {
 		expiry = now.Add(time.Duration(ttl)*time.Second + leaseGraceOverRuntime)
 	}
+	// kind and reason are copied straight from the job row onto the lease
+	// it is granted: for a hold this is what lets rc devices and the
+	// dashboard label the holder as a hold with its reason, rather than a
+	// mysterious sleep, without a join back to jobs.
 	if _, err := tx.Exec(
-		`INSERT INTO leases (id, device_id, holder, job_id, acquired_at, expires_at)
-		 VALUES (?, ?, ?, ?, ?, ?)`,
-		uuid.NewString(), deviceID, submitter, jobID, now.Unix(), expiry.Unix()); err != nil {
+		`INSERT INTO leases (id, device_id, holder, job_id, acquired_at, expires_at, kind, reason)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		uuid.NewString(), deviceID, submitter, jobID, now.Unix(), expiry.Unix(), kind, reason); err != nil {
 		return nil, fmt.Errorf("insert lease: %w", err)
 	}
 	if _, err := tx.Exec(`DELETE FROM reservations WHERE device_id = ?`, deviceID); err != nil {

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -25,6 +26,14 @@ const maxLogChunk = 1 << 20
 // either a bug or an attempt to make the controller allocate on demand.
 const maxHeartbeatBody = 64 << 10
 
+// maxSheetBytes mirrors the worker's own truncation cap (see
+// worker.maxSheetBytes) as a second line of defence: the worker already
+// truncates before sending, but this rejects outright anything that still
+// arrives oversized — a hand-edited file that bypassed truncation, a future
+// caller of this API that doesn't — rather than silently accepting it into
+// the database.
+const maxSheetBytes = 64 * 1024
+
 // DeviceSpec is one device a worker declares at registration: its name and,
 // if the operator configured one, the runtime ceiling the controller should
 // enforce against any job scheduled onto it.
@@ -37,6 +46,65 @@ type RegisterRequest struct {
 	Host    string       `json:"host"`
 	BootID  string       `json:"boot_id,omitempty"`
 	Devices []DeviceSpec `json:"devices"`
+
+	// Labels is this registration's freshly detected device facts: the
+	// empty key "" holds host-wide facts merged into every device (a
+	// device-scoped value wins any key collision), any other key names one
+	// device by its bare name.
+	//
+	// The field is deliberately NOT json:",omitempty": a nil map (absent
+	// from the wire entirely) and a non-nil, empty map (present as {})
+	// decode to different Go values, and that difference is the only signal
+	// this handler has for telling "the probe pass found nothing at all, so
+	// say nothing and leave what's stored alone" apart from "the pass ran
+	// and legitimately detected zero labels, so clear what's stored" — see
+	// ReplaceLabels's own doc comment for why the latter must replace.
+	// worker.labelsPayload is the caller-side half of this contract: it
+	// returns nil, not an empty map, when a whole probe pass produced not a
+	// single fact, so a fleet-wide probe outage can never wipe every
+	// device's detected labels and, with them, every selector that depends
+	// on them.
+	Labels map[string]map[string]string `json:"labels"`
+	// DeclaredLabels is the operator-asserted counterpart to Labels (from
+	// worker.yaml's DeviceConfig.Labels), same shape and the same
+	// nil-vs-empty contract — though for this source there is no probe to
+	// fail: the worker always sends its current config verbatim, so an
+	// operator who removes a declared label and restarts actually sees it
+	// cleared, the same way an unset max_runtime clears a ceiling.
+	DeclaredLabels map[string]map[string]string `json:"declared_labels"`
+	// Sheet is this host's usage-sheet documentation (host.md), and
+	// DeviceSheets is each device's own (host.d/<device>.md), keyed by bare
+	// device name.
+	//
+	// Sheet is a *string, not a plain string, for the same nil-vs-empty
+	// reason Labels is a nil-checked map — a fix-round-1 finding: the
+	// worker's readSheets can fail to read host.md for a reason OTHER than
+	// it simply not existing (permission denied, ...), and a plain string
+	// could not tell that apart from "the host genuinely has no sheet".
+	// nil means "leave whatever is already stored for this host's sheet
+	// alone"; a non-nil pointer, even to "", is an explicit, trustworthy
+	// report and is applied via UpsertHostDoc. DeviceSheets needs no such
+	// pointer: a device whose sheet could not be read is simply omitted
+	// from the map (its key is absent), which applyDeviceFacts already
+	// treats as "leave it alone" via its `if body, ok := ...` check.
+	Sheet        *string           `json:"sheet,omitempty"`
+	DeviceSheets map[string]string `json:"device_sheets,omitempty"`
+}
+
+// LabelsPushRequest is what a worker posts on every probe-interval pass
+// AFTER its initial registration: the same detected/declared facts and
+// usage sheets RegisterRequest carries, scoped to ONLY that. It deliberately
+// has no boot_id or device-upsert path, and handlePushLabels never calls
+// UpsertWorker — see that handler's doc comment for why reusing
+// registration itself for this would be actively dangerous. Sheet has the
+// same nil-vs-empty contract as RegisterRequest.Sheet.
+type LabelsPushRequest struct {
+	Host           string                       `json:"host"`
+	Devices        []string                     `json:"devices"`
+	Labels         map[string]map[string]string `json:"labels"`
+	DeclaredLabels map[string]map[string]string `json:"declared_labels"`
+	Sheet          *string                      `json:"sheet,omitempty"`
+	DeviceSheets   map[string]string            `json:"device_sheets,omitempty"`
 }
 
 type RegisterResponse struct {
@@ -54,6 +122,11 @@ type Assignment struct {
 	// Submitter carries the job's submitter so a lease lifecycle hook's
 	// RC_SUBMITTER can name them.
 	Submitter string `json:"submitter,omitempty"`
+	// Kind is model.LeaseKindJob or model.LeaseKindHold. A worker that
+	// sees "hold" substitutes its own sleeper for Command — see
+	// internal/worker's execute — rather than trusting what is stored
+	// here, which for a hold is a fixed, meaningless placeholder.
+	Kind string `json:"kind,omitempty"`
 }
 
 // PollResponse is the envelope handleAssignments answers a long-poll with: it
@@ -102,6 +175,11 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "bad_request", "host required")
 		return
 	}
+	if name := oversizedSheet(req.Sheet, req.DeviceSheets); name != "" {
+		writeErr(w, http.StatusRequestEntityTooLarge, "sheet_too_large",
+			fmt.Sprintf("usage sheet %q exceeds 64KB", name))
+		return
+	}
 
 	now := s.cfg.Clock.Now()
 	// The worker ID is derived from the host so a restarted worker resumes its
@@ -143,8 +221,189 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	deviceNames := make([]string, 0, len(req.Devices))
+	for _, dev := range req.Devices {
+		deviceNames = append(deviceNames, dev.Name)
+	}
+	if err := s.applyDeviceFacts(req.Host, deviceNames, req.Labels, req.DeclaredLabels, req.Sheet, req.DeviceSheets, now); err != nil {
+		writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
+		return
+	}
+
 	s.publishDevices()
 	writeJSON(w, http.StatusOK, RegisterResponse{WorkerID: workerID})
+}
+
+// handlePushLabels stores a worker's freshly probed device facts and usage
+// sheets on the same interval its probes re-run, after the initial
+// registration.
+//
+// This is deliberately a SEPARATE route from handleRegister, not a repeated
+// call to it: UpsertWorker treats every registration as a fresh process
+// announcing it has no running jobs (see its own doc comment), and reaps
+// anything still "assigned" or "running" under that worker ID on the theory
+// that nothing a brand-new process could be supervising survives a restart.
+// That theory is exactly backwards for a live worker's own periodic push —
+// calling register() again from the same still-running process would mark
+// every job it is actually supervising right now as lost and quarantine the
+// device out from under it, purely because a probe pass happened to finish.
+// This route never touches UpsertWorker, or any worker/device/job state at
+// all: only device_labels and host_docs.
+func (s *Server) handlePushLabels(w http.ResponseWriter, r *http.Request) {
+	var req LabelsPushRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	if req.Host == "" {
+		writeErr(w, http.StatusBadRequest, "bad_request", "host required")
+		return
+	}
+
+	// The {id} in the path must name a worker this controller actually
+	// knows about, AND that worker's recorded host must match req.Host — a
+	// fix-round-1 finding: without this, POSTing to an arbitrary or
+	// typo'd worker ID silently wrote device_labels/host_docs rows for
+	// whatever host the body claimed, with no verification the two agree.
+	// A worker with a typo'd `host:` in worker.yaml would then push into
+	// rows nothing ever reads (its real device IDs are "correct-host:name",
+	// not "typo-host:name") while this route kept answering 200 forever —
+	// a misconfigured node that looks perfectly healthy for months. Worse,
+	// a typo that happened to COLLIDE with a different real host's name
+	// would silently overwrite that host's labels instead.
+	knownHost, err := s.cfg.Store.WorkerHost(r.PathValue("id"))
+	if err != nil {
+		if errors.Is(err, store.ErrWorkerNotFound) {
+			writeErr(w, http.StatusNotFound, "not_found", "worker not found")
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
+		return
+	}
+	if req.Host != knownHost {
+		writeErr(w, http.StatusBadRequest, "bad_request", "host does not match the registered worker")
+		return
+	}
+
+	if name := oversizedSheet(req.Sheet, req.DeviceSheets); name != "" {
+		writeErr(w, http.StatusRequestEntityTooLarge, "sheet_too_large",
+			fmt.Sprintf("usage sheet %q exceeds 64KB", name))
+		return
+	}
+
+	now := s.cfg.Clock.Now()
+	if err := s.applyDeviceFacts(req.Host, req.Devices, req.Labels, req.DeclaredLabels, req.Sheet, req.DeviceSheets, now); err != nil {
+		writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
+		return
+	}
+	s.publishDevices()
+	w.WriteHeader(http.StatusOK)
+}
+
+// oversizedSheet reports the name of the first sheet ("host", or a device's
+// bare name) that exceeds maxSheetBytes, or "" if none do. A nil sheet (the
+// worker has nothing trustworthy to say about the host sheet this round) is
+// never oversized — there is nothing to check.
+func oversizedSheet(sheet *string, deviceSheets map[string]string) string {
+	if sheet != nil && len(*sheet) > maxSheetBytes {
+		return "host"
+	}
+	for name, body := range deviceSheets {
+		if len(body) > maxSheetBytes {
+			return name
+		}
+	}
+	return ""
+}
+
+// applyDeviceFacts stores what a worker reports about its devices — probed
+// and declared labels, plus any host and per-device usage sheets — for
+// every device named in deviceNames. It is shared, unchanged, by
+// handleRegister and handlePushLabels: both must apply the exact same
+// nil-vs-empty label contract and the exact same host-then-device merge, and
+// a caller-specific duplicate of this logic would be exactly the kind of
+// place the two could quietly drift.
+//
+// The nil-vs-empty contract is applied per DEVICE, not just once for the
+// whole map: a nil labels (or declaredLabels) map skips that source for
+// every device, but even a non-nil map only touches a device whose bare
+// name is actually a KEY in it — see RegisterRequest.Labels and
+// worker.labelsPayload for why a device can be legitimately absent from an
+// otherwise non-nil map (its own probes failed this pass, so nothing about
+// it is trustworthy) while a sibling device that DID report cleanly is
+// still updated. A fix-round-1 review finding caught the earlier, coarser
+// version of this: gatherLabels' built-ins (at minimum "cpus") make the
+// TOP-LEVEL map non-nil on virtually every real pass, so a nil-check alone
+// never actually protected a device whose OWN facts (e.g. nvidia-smi's
+// GPU/VRAM keys) disappeared for one pass while the host-wide facts kept
+// flowing.
+//
+// A present device key, even mapping to an empty submap, DOES replace via
+// ReplaceLabels — that is the legitimate "this device's probes ran and
+// found nothing" case Task 3's ReplaceLabels exists to support — merging
+// that device's own host-wide value (the "" key) in first so a
+// device-scoped value wins any key collision.
+func (s *Server) applyDeviceFacts(host string, deviceNames []string,
+	labels, declaredLabels map[string]map[string]string,
+	sheet *string, deviceSheets map[string]string, now time.Time) error {
+
+	if sheet != nil {
+		if err := s.cfg.Store.UpsertHostDoc(host, "", *sheet, now); err != nil {
+			return fmt.Errorf("store host sheet: %w", err)
+		}
+	}
+	// else: the worker could not read host.md this round (see
+	// RegisterRequest.Sheet) — leave whatever is already stored for this
+	// host's sheet exactly as it was.
+
+	hostLabels := labels[""]
+	hostDeclared := declaredLabels[""]
+
+	for _, name := range deviceNames {
+		deviceID := host + ":" + name
+
+		if labels != nil {
+			if deviceLabels, ok := labels[name]; ok {
+				if err := s.cfg.Store.ReplaceLabels(deviceID, model.SourceDetected,
+					mergeLabelMaps(hostLabels, deviceLabels), now); err != nil {
+					return fmt.Errorf("replace detected labels for %s: %w", deviceID, err)
+				}
+			}
+			// else: this device has no key in labels at all — the worker
+			// has nothing trustworthy to say about it this round, so its
+			// previously stored detected labels are left exactly as they
+			// were.
+		}
+		if declaredLabels != nil {
+			if deviceDeclared, ok := declaredLabels[name]; ok {
+				if err := s.cfg.Store.ReplaceLabels(deviceID, model.SourceDeclared,
+					mergeLabelMaps(hostDeclared, deviceDeclared), now); err != nil {
+					return fmt.Errorf("replace declared labels for %s: %w", deviceID, err)
+				}
+			}
+		}
+		if body, ok := deviceSheets[name]; ok {
+			if err := s.cfg.Store.UpsertHostDoc(host, deviceID, body, now); err != nil {
+				return fmt.Errorf("store sheet for %s: %w", deviceID, err)
+			}
+		}
+	}
+	return nil
+}
+
+// mergeLabelMaps combines host-wide facts with one device's own, letting the
+// device-scoped value win any key collision — a device fact is more
+// specific than a host-wide one, so it must never be shadowed by it. It
+// always returns a fresh, non-nil map, even when both inputs are empty, so
+// a caller can pass it straight to ReplaceLabels without a nil check.
+func mergeLabelMaps(host, device map[string]string) map[string]string {
+	out := make(map[string]string, len(host)+len(device))
+	for k, v := range host {
+		out[k] = v
+	}
+	for k, v := range device {
+		out[k] = v
+	}
+	return out
 }
 
 // handleHeartbeat renews the leases of the jobs the worker names, and only
@@ -250,7 +509,7 @@ func (s *Server) handleAssignments(w http.ResponseWriter, r *http.Request) {
 				out = append(out, Assignment{
 					JobID: j.ID, DeviceID: j.DeviceID, Command: j.Command, Cwd: j.Cwd, Env: j.Env,
 					MaxRuntimeSeconds: j.MaxRuntimeSeconds, IdleTimeoutSeconds: j.IdleTimeoutSeconds,
-					Submitter: j.Submitter,
+					Submitter: j.Submitter, Kind: j.Kind,
 				})
 			}
 			writeJSON(w, http.StatusOK, PollResponse{Assignments: out, Kills: kills})

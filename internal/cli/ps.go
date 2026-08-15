@@ -38,6 +38,13 @@ func RenderDevices(w io.Writer, views []server.DeviceView) error {
 		holder, elapsed, command := "-", "-", "-"
 		if v.Holder != "" {
 			holder = v.Holder
+			// A hold's reason rides the lease row precisely so it can be
+			// shown here instead of a bare holder name next to a
+			// meaningless "hold" command — see assignQueued's doc comment
+			// in internal/store/allocate.go.
+			if v.Reason != "" {
+				holder = fmt.Sprintf("%s (%s)", holder, v.Reason)
+			}
 			elapsed = (time.Duration(v.ElapsedSeconds) * time.Second).String()
 		}
 		if len(v.Command) > 0 {
@@ -50,6 +57,7 @@ func RenderDevices(w io.Writer, views []server.DeviceView) error {
 
 func NewDevicesCmd() *cobra.Command {
 	var asJSON bool
+	var selector string
 
 	cmd := &cobra.Command{
 		Use:   "devices",
@@ -60,15 +68,41 @@ func NewDevicesCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+
+			devices := state.Devices
+			if selector != "" {
+				// Filtering happens here, client-side, but the matching
+				// itself is not reimplemented: it comes straight from
+				// /v1/explain, the exact same store.MatchingDevices the
+				// scheduler uses, so this table can never disagree with what
+				// a real --select submit would actually match.
+				explain, err := c.Explain(cmd.Context(), selector)
+				if err != nil {
+					return err
+				}
+				matching := make(map[string]bool, len(explain.Matching))
+				for _, id := range explain.Matching {
+					matching[id] = true
+				}
+				filtered := make([]server.DeviceView, 0, len(devices))
+				for _, v := range devices {
+					if matching[v.Device.ID] {
+						filtered = append(filtered, v)
+					}
+				}
+				devices = filtered
+			}
+
 			if asJSON {
 				enc := json.NewEncoder(cmd.OutOrStdout())
 				enc.SetIndent("", "  ")
-				return enc.Encode(state.Devices)
+				return enc.Encode(devices)
 			}
-			return RenderDevices(cmd.OutOrStdout(), state.Devices)
+			return RenderDevices(cmd.OutOrStdout(), devices)
 		},
 	}
 	cmd.Flags().BoolVarP(&asJSON, "json", "o", false, "output JSON")
+	cmd.Flags().StringVar(&selector, "select", "", "filter to devices matching this selector, e.g. vram>=40G")
 	return cmd
 }
 

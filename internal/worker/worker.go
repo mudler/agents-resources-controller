@@ -16,6 +16,18 @@ import (
 	"github.com/mudler/agents-resources-controller/internal/model"
 )
 
+// holdSleeper is the command execute runs for a hold (kind == "hold"),
+// standing in for whatever the job row's Command actually says: a hold's
+// command is this worker's choice, never the client's — see execute's own
+// comment for why. "2147483647" (2^31-1 seconds, ~68 years) rather than GNU
+// coreutils' `sleep infinity`: POSIX sleep(1) only guarantees an integer
+// argument, and this worker runs on whatever the operator's box happens to
+// be — busybox (a realistic device-host userland) has no "infinity" — so
+// the portable spelling of "longer than this will ever need to run" is used
+// instead. The wall-clock watchdog (JobSpec.MaxRuntime), not this command,
+// is what actually bounds how long it runs.
+var holdSleeper = []string{"sleep", "2147483647"}
+
 type assignment struct {
 	JobID              string            `json:"job_id"`
 	DeviceID           string            `json:"device_id"`
@@ -27,6 +39,11 @@ type assignment struct {
 	// Submitter identifies who submitted this job, so a lifecycle hook's
 	// RC_SUBMITTER can name them.
 	Submitter string `json:"submitter,omitempty"`
+	// Kind is model.LeaseKindJob or model.LeaseKindHold. When it is
+	// "hold", execute runs its own sleeper instead of Command — see
+	// execute — because the sleeper a hold runs is this worker's choice,
+	// never the submitter's.
+	Kind string `json:"kind,omitempty"`
 }
 
 // deviceSpec is what this worker declares about one of its devices at
@@ -35,6 +52,42 @@ type assignment struct {
 type deviceSpec struct {
 	Name              string `json:"name"`
 	MaxRuntimeSeconds int    `json:"max_runtime_seconds,omitempty"`
+}
+
+// registerRequest mirrors server.RegisterRequest: what this worker posts
+// once at startup. Labels and DeclaredLabels are deliberately NOT
+// `omitempty` — see labelsPayload for why a nil map (omitted from the wire
+// entirely) must mean something different from a non-nil, empty one. Sheet
+// is a pointer for the identical reason, fixed in fix round 1: readSheets
+// can fail to read host.md for a reason other than "it doesn't exist"
+// (permission denied, ...), and a plain string could not tell that case
+// apart from "the host genuinely has no sheet" — which would let a
+// transient chmod erase a previously good, stored sheet the next time this
+// worker registers or pushes. nil means "leave the stored host sheet
+// alone"; a non-nil pointer, even to "", is an explicit, trustworthy report.
+type registerRequest struct {
+	Host           string                       `json:"host"`
+	BootID         string                       `json:"boot_id,omitempty"`
+	Devices        []deviceSpec                 `json:"devices"`
+	Labels         map[string]map[string]string `json:"labels"`
+	DeclaredLabels map[string]map[string]string `json:"declared_labels"`
+	Sheet          *string                      `json:"sheet,omitempty"`
+	DeviceSheets   map[string]string            `json:"device_sheets,omitempty"`
+}
+
+// labelsPushRequest mirrors server.LabelsPushRequest: what this worker posts
+// on every probe-interval pass AFTER its initial registration. It carries no
+// boot_id and no ceiling — see pushLabels and handlePushLabels's own doc
+// comment for why this is a route separate from register() entirely, not a
+// repeated call to it. Sheet has the same nil-vs-empty contract as
+// registerRequest.Sheet.
+type labelsPushRequest struct {
+	Host           string                       `json:"host"`
+	Devices        []string                     `json:"devices"`
+	Labels         map[string]map[string]string `json:"labels"`
+	DeclaredLabels map[string]map[string]string `json:"declared_labels"`
+	Sheet          *string                      `json:"sheet,omitempty"`
+	DeviceSheets   map[string]string            `json:"device_sheets,omitempty"`
 }
 
 // pollResponse mirrors server.PollResponse: an envelope carrying both new
@@ -72,6 +125,28 @@ type Worker struct {
 	// state, so devices never contend with each other.
 	hooksMu     sync.Mutex
 	deviceHooks map[string]*deviceHookState
+
+	// nvidiaSmiStartupChecked and nvidiaSmiSeenAtStartup are gatherLabels'
+	// fix-round-3 state: whether nvidia-smi's presence has been recorded
+	// yet, and what that one-time recording found. Written exactly once,
+	// on this worker's first probe pass (inside register(), which always
+	// completes before Start ever spawns probeLoop's goroutine — no mutex
+	// needed for the same reason w.workerID needs none: the `go` statement
+	// that starts probeLoop happens-after every write register() made).
+	// See gatherLabels for the full reasoning.
+	nvidiaSmiStartupChecked bool
+	nvidiaSmiSeenAtStartup  bool
+
+	// labelOmitWarned tracks, per device, whether labelsPayload has
+	// already logged a warning for the CURRENT episode of that device
+	// being omitted from a push (its probe source failed or was
+	// unavailable). See labelsPayload for why this exists: without it, an
+	// ongoing failure re-logs the same warning on every single pass for
+	// as long as it lasts, which trains an operator to ignore the log
+	// stream exactly the way a permanent one would. Like the two fields
+	// above, only ever touched from the sequential register()/pushLabels()
+	// call chain, never concurrently.
+	labelOmitWarned map[string]bool
 }
 
 func New(cfg Config) *Worker {
@@ -92,12 +167,13 @@ func New(cfg Config) *Worker {
 		}
 	}
 	return &Worker{
-		cfg:         cfg,
-		http:        &http.Client{Timeout: 2 * time.Minute},
-		running:     map[string]context.CancelFunc{},
-		started:     map[string]struct{}{},
-		hooks:       hooks,
-		deviceHooks: map[string]*deviceHookState{},
+		cfg:             cfg,
+		http:            &http.Client{Timeout: 2 * time.Minute},
+		running:         map[string]context.CancelFunc{},
+		started:         map[string]struct{}{},
+		hooks:           hooks,
+		deviceHooks:     map[string]*deviceHookState{},
+		labelOmitWarned: map[string]bool{},
 	}
 }
 
@@ -146,6 +222,15 @@ func (w *Worker) Start(ctx context.Context) error {
 	// names the jobs this worker is supervising, and during the pass that
 	// list is correctly empty, so no lease is renewed by starting it early.
 	go w.heartbeatLoop(ctx)
+
+	// The probe loop, like the heartbeat, runs on its own goroutine from
+	// here on: a probe pass can take up to probePassBudget (30s, and a
+	// single wedged nvidia-smi or drop-in probe could in principle push
+	// close to it), and it must never delay a heartbeat tick on the other
+	// goroutine — a worker late to its own heartbeat has its devices marked
+	// unknown. The first pass already ran synchronously inside register()
+	// above; this only fires again once ProbeInterval has actually elapsed.
+	go w.probeLoop(ctx)
 
 	// Before this worker ever polls for work, run the release hook of every
 	// device it declares one for. A worker that crashed (kill -9, an OOM,
@@ -235,10 +320,32 @@ func (w *Worker) register(ctx context.Context) error {
 			MaxRuntimeSeconds: int(d.MaxRuntime.Seconds()),
 		})
 	}
-	payload, err := json.Marshal(map[string]any{
-		"host":    w.cfg.Host,
-		"boot_id": BootID(),
-		"devices": devices,
+
+	// The very first probe pass and sheet read run synchronously, right
+	// here, so registration carries real data on the worker's first
+	// contact with the controller rather than an empty set that only fills
+	// in once the probe loop's first tick fires (up to ProbeInterval — 5
+	// minutes by default — later). This can add up to probePassBudget
+	// (30s) to Start before the first heartbeat, which is acceptable for
+	// the same reason runStartupReleaseHooks already can: it happens once,
+	// before this worker's devices are relied on for anything.
+	res := w.gatherLabels(ctx)
+	labels := labelsPayload(res, w.labelOmitWarned)
+	if labels == nil {
+		slog.Error("initial probe pass produced no facts at all; registering without detected labels",
+			"host", w.cfg.Host)
+	}
+	declared := declaredLabelsPayload(w.cfg.Devices)
+	sheet, deviceSheets := sheetPayload(w.cfg.SheetDir, w.cfg.Devices)
+
+	payload, err := json.Marshal(registerRequest{
+		Host:           w.cfg.Host,
+		BootID:         BootID(),
+		Devices:        devices,
+		Labels:         labels,
+		DeclaredLabels: declared,
+		Sheet:          sheet,
+		DeviceSheets:   deviceSheets,
 	})
 	if err != nil {
 		return err
@@ -405,6 +512,219 @@ func (w *Worker) heartbeatLoop(ctx context.Context) {
 			resp.Body.Close()
 		}
 	}
+}
+
+// probeLoop re-runs a full probe pass every ProbeInterval and pushes
+// whatever it found to the controller. It runs on its own goroutine (see
+// Start), so a slow pass here never delays a heartbeat tick on the other
+// one: pushLabels runs synchronously within THIS loop, not spawned
+// per-tick, so two probe passes are never running concurrently against the
+// same host (wasteful — nvidia-smi and any drop-in probes would be invoked
+// twice at once for no benefit) — the cost of that choice is simply that a
+// pass overrunning ProbeInterval delays the next tick's pass, which is
+// exactly as acceptable as gatherLabels' own probePassBudget comment
+// already argues: whatever one pass misses, the next one picks up.
+func (w *Worker) probeLoop(ctx context.Context) {
+	t := time.NewTicker(w.cfg.ProbeInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			w.pushLabels(ctx)
+		}
+	}
+}
+
+// pushLabels runs one probe pass and pushes its result, plus this host's
+// current usage sheets, to the controller via the dedicated labels route —
+// NOT by calling register() again. See handlePushLabels's doc comment
+// (internal/server/worker_api.go) for why: re-registering a worker that is
+// still alive is indistinguishable, server-side, from a fresh process that
+// cannot possibly be running anything, and would reap every job this worker
+// is actually supervising right now.
+func (w *Worker) pushLabels(ctx context.Context) {
+	res := w.gatherLabels(ctx)
+	labels := labelsPayload(res, w.labelOmitWarned)
+	if labels == nil {
+		slog.Error("probe pass produced no facts at all; pushing without a labels field so previously detected labels are not wiped",
+			"host", w.cfg.Host)
+	}
+	declared := declaredLabelsPayload(w.cfg.Devices)
+	sheet, deviceSheets := sheetPayload(w.cfg.SheetDir, w.cfg.Devices)
+
+	names := make([]string, 0, len(w.cfg.Devices))
+	for _, d := range w.cfg.Devices {
+		names = append(names, d.Name)
+	}
+
+	payload, err := json.Marshal(labelsPushRequest{
+		Host:           w.cfg.Host,
+		Devices:        names,
+		Labels:         labels,
+		DeclaredLabels: declared,
+		Sheet:          sheet,
+		DeviceSheets:   deviceSheets,
+	})
+	if err != nil {
+		slog.Error("marshal labels push", "err", err)
+		return
+	}
+	resp, err := w.do(ctx, http.MethodPost, "/v1/workers/"+w.workerID+"/labels", bytes.NewReader(payload))
+	if err != nil {
+		slog.Warn("push labels failed", "err", err)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		slog.Warn("push labels rejected", "status", resp.Status)
+	}
+}
+
+// labelsPayload turns one gatherLabels pass into the wire shape a register
+// or labels-push request carries: "" for host-wide facts, a device's bare
+// name for everything scoped to it.
+//
+// This is the guard standing between a probe outage and a device's detected
+// labels being silently wiped, and it is applied PER DEVICE, not once for
+// the whole pass — a fix-round-1 review finding caught the original,
+// pass-wide version of this guard being inert in production:
+// builtinLabels() always yields at least "cpus" from runtime.NumCPU(), so
+// res.Host is non-empty on virtually every real host, which made the
+// pass-wide "everything is empty" check unreachable outside a contrived
+// unit test. The actual danger it needs to prevent is narrower and more
+// common: nvidia-smi (present on PATH but broken — the realistic shape of
+// "a driver upgrade broke it", see nvidiaLabels) or a drop-in probe failing
+// while the rest of the pass — built-ins included — keeps succeeding. That
+// must not turn a device's LAST KNOWN GPU/VRAM facts into nothing just
+// because host-wide facts happened to still come through.
+//
+// The controller's ReplaceLabels makes the stored set for one device and one
+// source exactly what it is given, so an empty submap means "clear" —
+// correct for a device whose probes ran and legitimately found nothing (a
+// card removed), wrong for a device whose probes simply failed to run this
+// pass. Those two cases produce an identical empty per-device map, so the
+// only place left to distinguish them is res.Failed: when nothing capable of
+// producing device-scoped facts failed anywhere this pass, an empty device
+// is trustworthy and is sent as an explicit clear; when something did fail,
+// every device that came back empty is OMITTED from the returned map
+// entirely (its key is simply absent, not present as {}) rather than sent
+// as a clear — see applyDeviceFacts (server-side) for why omission, not an
+// empty map, is what actually protects it: only a present key gets
+// ReplaceLabels called on it at all.
+//
+// A nil return — meaning "say nothing about detected labels at all" — is
+// reserved for the one case where there is nothing to say about anything:
+// no host facts and no device facts whatsoever.
+// labelsPayload's warned parameter is the caller's (a *Worker's)
+// labelOmitWarned map, mutated in place: fix round 3 changed the omission
+// warning below from "log every pass this device stays omitted" to
+// "log once when it FIRST becomes omitted, stay quiet while the same
+// episode continues, log again only if a NEW episode starts after a
+// recovery". An ongoing failure (nvidia-smi still gone, a drop-in still
+// broken) would otherwise re-log the identical line on every single pass
+// for as long as it lasts — indistinguishable, to an operator watching the
+// log stream, from the permanent-forever case fix round 3's primary change
+// already eliminates, and just as good at training them to stop reading it.
+// warned is plain map[string]bool, not synchronized: see its field comment
+// on Worker for why that's safe (only ever touched from the sequential
+// register()/pushLabels() call chain).
+func labelsPayload(res ProbeResult, warned map[string]bool) map[string]map[string]string {
+	allEmpty := len(res.Host) == 0
+	if allEmpty {
+		for _, m := range res.Device {
+			if len(m) > 0 {
+				allEmpty = false
+				break
+			}
+		}
+	}
+	if allEmpty {
+		return nil
+	}
+
+	out := make(map[string]map[string]string, len(res.Device)+1)
+	if len(res.Host) > 0 {
+		out[""] = res.Host
+	}
+	for name, m := range res.Device {
+		if len(m) > 0 {
+			out[name] = m
+			delete(warned, name) // recovered with real facts: a future failure logs again
+			continue
+		}
+		if !res.Failed {
+			// Confirmed clean: this device's probes ran (or there simply
+			// were none configured) and nothing failed anywhere this
+			// pass, so an empty result here is trustworthy.
+			out[name] = m
+			delete(warned, name) // confirmed empty and cleared normally: same reset
+			continue
+		}
+		// Something that can produce device-scoped facts failed this
+		// pass — nvidia-smi found but broken, or found-then-vanished
+		// after this worker had already seen it present (fix round 3:
+		// NOT "never found at all" — see gatherLabels for why that case
+		// no longer sets Failed) — so this device's empty result proves
+		// nothing about it. Omit it entirely so applyDeviceFacts
+		// (server-side) leaves whatever is already stored for it
+		// untouched.
+		//
+		// Two limitations accepted alongside this ruling, not overlooked:
+		//   - A preserved label never expires on its own. A device that
+		//     genuinely lost its GPU (decommissioned, card pulled) keeps
+		//     advertising it indefinitely until either its probe starts
+		//     reporting again (clearing the stale keys the normal way) or
+		//     an operator intervenes by hand. No staleness/TTL mechanism
+		//     is built here — that belongs with the verify-probe work
+		//     planned for the next stage, not invented ad hoc in this fix.
+		//   - Failed is a single pass-wide bool (see ProbeResult.Failed),
+		//     not attributed to any one probe or device, so ONE flaky
+		//     drop-in anywhere on the host freezes every OTHER empty
+		//     device's labels too, not just the one the flaky probe was
+		//     ever meant to cover. Accepted for now.
+		if !warned[name] {
+			slog.Warn("device's probe source failed or was unavailable this pass; preserving its previously detected labels instead of clearing them",
+				"device", name)
+			warned[name] = true
+		}
+	}
+	return out
+}
+
+// declaredLabelsPayload turns this worker's configured, operator-asserted
+// device labels into the same wire shape labelsPayload produces. Unlike
+// detected labels there is no probe to fail here: worker.yaml IS the
+// declaration of intent, so this always sends the config verbatim,
+// including devices that declare none — an operator who removes a declared
+// label and restarts must see it actually cleared, the same way an unset
+// max_runtime clears a previously-declared ceiling (see register's own
+// ceiling-clearing behaviour, server-side).
+func declaredLabelsPayload(devices []DeviceConfig) map[string]map[string]string {
+	out := make(map[string]map[string]string, len(devices))
+	for _, d := range devices {
+		out[d.Name] = d.Labels
+	}
+	return out
+}
+
+// sheetPayload wraps readSheets into the wire shape a register or
+// labels-push request carries. A nil sheet return means "host.md could not
+// be read this round (for a reason other than it simply not existing);
+// leave whatever the controller already has for this host's sheet alone" —
+// see registerRequest.Sheet's own doc comment for why a plain string cannot
+// carry that distinction. deviceSheets already carries the equivalent
+// per-device signal on its own: readSheets omits a device's key entirely
+// when ITS sheet could not be read, which is exactly the shape
+// applyDeviceFacts (server-side) already expects.
+func sheetPayload(dir string, devices []DeviceConfig) (sheet *string, deviceSheets map[string]string) {
+	host, perDevice, err := readSheets(dir, devices)
+	if err != nil {
+		slog.Warn("read host usage sheet; leaving the previously stored copy alone", "err", err)
+		return nil, perDevice
+	}
+	return &host, perDevice
 }
 
 // minPollInterval floors the gap between successive polls when the previous
@@ -670,9 +990,24 @@ func (w *Worker) execute(ctx context.Context, a assignment) {
 		}
 	}
 
+	// A hold's command is this worker's own choice, never the submitter's:
+	// the controller stores a fixed, meaningless placeholder for a hold's
+	// job row (see server.holdCommand) and rejects a hold submission that
+	// carries a command of its own, but the guarantee that nothing a
+	// client sent ever runs is enforced here too, not only there — a.Command
+	// is simply never looked at for a hold. holdSleeper, not a duration
+	// derived from a.MaxRuntimeSeconds: the wall-clock watchdog already
+	// enforces the TTL (see JobSpec.MaxRuntime below), so the sleeper only
+	// needs to outlast it, and letting the watchdog be the one clock avoids
+	// two independent timers ever disagreeing about when a hold ends.
+	command := a.Command
+	if a.Kind == model.LeaseKindHold {
+		command = holdSleeper
+	}
+
 	sink := &logSink{w: w, jobID: a.JobID, ctx: reportCtx}
 	res := Run(jobCtx, JobSpec{
-		Command:     a.Command,
+		Command:     command,
 		Cwd:         a.Cwd,
 		Env:         env,
 		MaxRuntime:  time.Duration(a.MaxRuntimeSeconds) * time.Second,

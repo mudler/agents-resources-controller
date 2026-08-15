@@ -2,7 +2,10 @@ package cli_test
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -137,6 +140,50 @@ func TestRenderJobsListsQueuedJobsWithPositions(t *testing.T) {
 	require.Contains(t, lineFor(t, got, "queued-2"), "queued (#2)")
 	require.Contains(t, lineFor(t, got, "queued-3"), "queued (#1)",
 		"position is per device: another device's queue starts at 1 again")
+}
+
+// TestDevicesSelectFiltersToMatchingDevices pins `rc devices --select`: it
+// must filter the table down to exactly the devices the SAME matching the
+// scheduler uses (via /v1/explain) reports, not a client-side reimplementation
+// of selector matching.
+func TestDevicesSelectFiltersToMatchingDevices(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/v1/state":
+			_ = json.NewEncoder(w).Encode(server.StateResponse{Devices: []server.DeviceView{
+				{Device: model.Device{ID: "gpubox:gpu0", State: model.DeviceReady}},
+				{Device: model.Device{ID: "gpubox:gpu1", State: model.DeviceReady}},
+				{Device: model.Device{ID: "gpubox:gpu2", State: model.DeviceReady}},
+			}})
+		case r.URL.Path == "/v1/explain":
+			require.Equal(t, "vram>=40G", r.URL.Query().Get("selector"))
+			_ = json.NewEncoder(w).Encode(server.ExplainResponse{
+				Selector: "vram>=40G",
+				Matching: []string{"gpubox:gpu0", "gpubox:gpu2"},
+				Free:     []string{"gpubox:gpu0", "gpubox:gpu2"},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	t.Setenv("RC_CONTROLLER", ts.URL)
+	t.Setenv("RC_TOKEN", "tok")
+
+	cmd := cli.NewDevicesCmd()
+	cmd.SilenceUsage = true
+	cmd.SilenceErrors = true
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"--select", "vram>=40G"})
+
+	require.NoError(t, cmd.Execute())
+
+	got := out.String()
+	require.Contains(t, got, "gpubox:gpu0")
+	require.Contains(t, got, "gpubox:gpu2")
+	require.NotContains(t, got, "gpubox:gpu1", "a device the selector does not match must not appear in the filtered table")
 }
 
 // The table is buffered until Flush, so a dropped Flush error would let
