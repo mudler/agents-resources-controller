@@ -38,6 +38,13 @@ func RenderDevices(w io.Writer, views []server.DeviceView) error {
 		holder, elapsed, command := "-", "-", "-"
 		if v.Holder != "" {
 			holder = v.Holder
+			// A hold's reason rides the lease row precisely so it can be
+			// shown here instead of a bare holder name next to a
+			// meaningless "hold" command — see assignQueued's doc comment
+			// in internal/store/allocate.go.
+			if v.Reason != "" {
+				holder = fmt.Sprintf("%s (%s)", holder, v.Reason)
+			}
 			elapsed = (time.Duration(v.ElapsedSeconds) * time.Second).String()
 		}
 		if len(v.Command) > 0 {

@@ -22,7 +22,6 @@ service like LocalAI or ollama around a job's hold on a device).
 | Capability probes (`/etc/rc/probe.d/*.sh`) and device labels | List device names in `worker.yaml` |
 | Per-host usage sheet (`/etc/rc/host.md`) and `rc describe` | Keep host notes wherever you keep them now |
 | Device selectors (`--select 'vram>=40G'`) | Address a device by exact ID: `-d gpubox:gpu0` |
-| `rc hold` | Submit a placeholder job that just sleeps, then `rc kill` it |
 | Verify probes between jobs | Nothing checks VRAM was released after a job |
 | Webhook notifications | Poll `rc ps` / `rc devices`, or watch `/v1/events` |
 | Dashboard actions (kill/hold from the browser) | `rc kill` from a terminal; the dashboard is read-only |
@@ -492,6 +491,37 @@ JOB                                   DEVICE       STATE        SUBMITTER       
 25147ef7-7bf4-40b9-9034-31e294e5be1a  gpubox:gpu0  running      mudler@mudler-ubuntu-box  sh -c sleep 30
 9d1c8a44-0f7a-4a1e-9e2e-2b4f2c0a1a77  gpubox:gpu0  queued (#1)  agent-b@builder           ./train
 ```
+
+`rc hold` claims a device for a human, not a job — "I need a shell on this
+box", not "run this command":
+
+```
+$ rc hold gpubox:gpu0 --ttl 30m --reason "manual profiling"
+rc: hold e6b8b6b0-8b7f-4e2a-9b8b-9b1c2b3a4d5e granted on gpubox:gpu0, expires around 2026-08-13T13:00:00Z
+rc: end it early with `rc release e6b8b6b0-8b7f-4e2a-9b8b-9b1c2b3a4d5e`, or Ctrl-C here
+```
+
+**Under the hood a hold is a job with `kind: hold`**, whose command a
+worker — never the client — chooses for itself (a sleeper, for its TTL).
+That is a deliberate simplification rather than a second lease mechanism:
+it reuses the exact same allocation transaction, queue, wall-clock
+watchdog, and acquire/release hooks a job already has, so taking a hold
+stands a node's inference server down exactly like a job would, and it
+needs no new code in `rc ps`, `rc devices`, or the dashboard to show up —
+`rc ps` lists it with command `hold`, and `rc devices` shows its holder and
+`--reason`. The cost: a hold occupies a real worker process for its
+duration and appears in job history like any other job.
+
+`--ttl` is required and is capped by the device's `max_runtime` exactly as
+a job's is — rejected, never silently shortened. `--select` works for a
+hold too, taking the first matching free device.
+
+**Ctrl-C on a granted hold releases it** — the opposite of `rc run`'s
+detach-only behaviour for a running job, because a hold's whole point is
+that a human is sitting there, and leaving means they're done with it.
+`rc release <job-id>` does the same thing from any terminal, and is a thin
+alias over `rc kill`: only the hold's own submitter, or an admin token, may
+end it early.
 
 ## Dashboard
 
