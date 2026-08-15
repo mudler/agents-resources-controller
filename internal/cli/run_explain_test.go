@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -55,8 +56,23 @@ func TestRunExplainPrintsMatchesAndNeverSubmits(t *testing.T) {
 	out := stdout.String()
 	require.Contains(t, out, "gpubox:gpu0")
 	require.Contains(t, out, "gpubox:gpu1")
-	require.Contains(t, out, "1")
-	require.Contains(t, out, "3")
+
+	// The "free" and "queue depth" lines are each asserted on their own
+	// line, not via a bare substring: "1" (the free count) is also a
+	// substring of the already-printed "gpubox:gpu1  free" row, so a
+	// substring check on the whole output would pass even if the
+	// free/queue-depth line were deleted entirely.
+	var freeLine, queueLine string
+	for _, line := range strings.Split(out, "\n") {
+		switch {
+		case strings.HasPrefix(line, "free:"):
+			freeLine = line
+		case strings.HasPrefix(line, "queue depth:"):
+			queueLine = line
+		}
+	}
+	require.Equal(t, "free: 1/2", freeLine)
+	require.Equal(t, "queue depth: 3", queueLine)
 }
 
 // TestRunExplainRequiresSelect: --explain answers "what would this selector
