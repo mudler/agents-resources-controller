@@ -1029,6 +1029,18 @@ func (w *Worker) execute(ctx context.Context, a assignment) {
 	if res.Err != nil {
 		body["reason"] = res.Err.Error()
 	}
+
+	// A device that fails verification must be quarantined BEFORE the
+	// controller learns the job is over: Release only flips busy -> ready, so
+	// a device already unhealthy stays quarantined when the report lands. The
+	// other order leaves it briefly schedulable while still dirty, which is
+	// the OOM this check exists to prevent.
+	if v := w.runVerify(reportCtx, a.DeviceID, a.JobID); !v.OK {
+		slog.Error("verify failed; quarantining device",
+			"device", a.DeviceID, "job", a.JobID, "reason", v.Reason)
+		w.reportFault(reportCtx, a.DeviceID, v.Reason)
+	}
+
 	// The terminal report is the call that frees the device's lease: unlike
 	// the "running" report above, dropping it strands the device until the
 	// reaper notices, so it gets retried.
