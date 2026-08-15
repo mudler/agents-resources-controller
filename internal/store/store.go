@@ -441,6 +441,30 @@ func (s *Store) AssignedJobsFor(workerID string) ([]model.Job, error) {
 	return out, nil
 }
 
+// ActiveJobOnDevice returns the ID of the job currently holding deviceID, or
+// "" if the device is idle. Exclusivity is the whole point of this system, so
+// at most one job should ever qualify; the newest wins if that invariant is
+// ever violated, since it is the one a caller is asking about.
+//
+// This is a single indexed read rather than a filter over ActiveJobs
+// precisely because its caller is a request handler: ActiveJobs re-reads each
+// job in full, one query apiece, which is fine for a dashboard and wasteful
+// on a path that only needs an ID.
+func (s *Store) ActiveJobOnDevice(deviceID string) (string, error) {
+	var id string
+	err := s.db.QueryRow(
+		`SELECT id FROM jobs WHERE device_id = ? AND state IN (?, ?)
+		 ORDER BY submitted_at DESC, rowid DESC LIMIT 1`,
+		deviceID, string(model.JobAssigned), string(model.JobRunning)).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return id, nil
+}
+
 // ActiveJobs returns jobs that are assigned or running, newest first.
 func (s *Store) ActiveJobs() ([]model.Job, error) {
 	rows, err := s.db.Query(

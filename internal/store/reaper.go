@@ -240,6 +240,52 @@ func (s *Store) Sweep(grace, unhealthyAfter time.Duration) (SweepResult, error) 
 	return res, nil
 }
 
+// QuarantineReasons returns the recorded quarantine reason of each device in
+// ids, keyed by device ID. A device with no row, or with no reason recorded
+// (the column defaults to ""), is simply absent from the map — a caller must
+// treat "no reason" and "unknown reason" the same way, since a row written
+// before the column existed carries the same empty string as one written
+// today with nothing to say.
+//
+// This exists as a separate, post-commit read rather than as extra fields on
+// SweepResult because Sweep is not to be restructured for it, and because
+// the read genuinely must happen outside Sweep's transaction: the pool is
+// capped at one connection (see store.Open), so a query issued while Sweep's
+// own cursors are open would deadlock. The consequence is that the reason
+// returned here is the CURRENT one, which is a moment later than the one the
+// sweep wrote — another path (a worker self-reporting a fault, a
+// re-registration) may have overwritten it in between. That is the honest
+// answer for a notification anyway: it describes why the device is out of
+// the pool now, not why it was a few milliseconds ago.
+func (s *Store) QuarantineReasons(ids []string) (map[string]string, error) {
+	out := make(map[string]string, len(ids))
+	if len(ids) == 0 {
+		return out, nil
+	}
+	placeholders := make([]string, len(ids))
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	rows, err := s.db.Query(fmt.Sprintf(
+		`SELECT id, quarantine_reason FROM devices WHERE id IN (%s)`,
+		strings.Join(placeholders, ", ")), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var id, reason string
+		if err := rows.Scan(&id, &reason); err != nil {
+			return nil, err
+		}
+		out[id] = reason
+	}
+	return out, rows.Err()
+}
+
 // leaseRenewWindow is how far past each heartbeat a live job's lease is
 // pushed forward. It must comfortably outlast both the heartbeat interval
 // and the sweep interval (10s each, see internal/cli/serve.go) — expiry

@@ -13,6 +13,7 @@ import (
 
 	"github.com/mudler/agents-resources-controller/internal/clock"
 	"github.com/mudler/agents-resources-controller/internal/logstore"
+	"github.com/mudler/agents-resources-controller/internal/notify"
 	"github.com/mudler/agents-resources-controller/internal/server"
 	"github.com/mudler/agents-resources-controller/internal/store"
 	"github.com/spf13/cobra"
@@ -24,10 +25,47 @@ import (
 // so the two thresholds cannot silently drift apart.
 const HeartbeatGrace = 30 * time.Second
 
+// notifierOptions bounds what a webhook outage can cost. The queue is deep
+// enough to hold a bad minute's worth of events (a fleet-wide sweep that
+// loses every device at once is tens of events, not hundreds) and shallow
+// enough that a wedged endpoint sheds load instead of growing without limit.
+//
+// Attempts and Backoff are deliberately small. Delivery is serialised
+// through one goroutine, so every retry of one event delays every event
+// behind it; three attempts against an endpoint that accepts connections and
+// never answers already costs ~30s of that goroutine's time (the webhook
+// sink's own per-request timeout), which is the most a queued notification
+// should ever be worth.
+var notifierOptions = notify.Options{QueueSize: 256, Attempts: 3, Backoff: time.Second}
+
+// notifierCloseTimeout bounds shutdown. Close drains and delivers what is
+// still queued, which against a dead endpoint would otherwise cost
+// Attempts × the per-request timeout, plus backoff, for EVERY queued event
+// in turn — many minutes of an operator waiting for a controller to stop.
+// Past this deadline Close cancels the in-flight delivery and gives up on
+// the rest: a notification is never worth holding a shutdown open for.
+const notifierCloseTimeout = 5 * time.Second
+
+// sweepInterval is how often the reaper runs, and sweepUnhealthyAfter how
+// long a worker may be silent before its devices are written off entirely
+// (as opposed to merely demoted to unknown after HeartbeatGrace).
+//
+// They are vars rather than consts only so a test can drive the reaper's own
+// goroutine without waiting out ten seconds of real time or five minutes of
+// silence — the loop reads them once per iteration, and nothing but a test
+// ever assigns to them. That seam is worth having: it is the only way to
+// prove from outside that the sweep's events actually reach a configured
+// webhook, rather than that a function which would have emitted them exists.
+var (
+	sweepInterval       = 10 * time.Second
+	sweepUnhealthyAfter = 5 * time.Minute
+)
+
 func NewServeCmd() *cobra.Command {
 	var (
-		addr    string
-		dataDir string
+		addr       string
+		dataDir    string
+		webhookURL string
 	)
 
 	cmd := &cobra.Command{
@@ -54,7 +92,32 @@ func NewServeCmd() *cobra.Command {
 				return err
 			}
 
-			srv := server.New(server.Config{Store: st, Logs: logs, Clock: c, Tokens: tokens})
+			// Built unconditionally: with no webhook configured webhookSink
+			// returns a nil Sink, notify.New answers with a nil *Notifier,
+			// and every method on that is a safe no-op. So no call site
+			// downstream — handler, sweep or shutdown — needs to know
+			// whether an operator configured a webhook at all.
+			hook := resolveWebhookURL(webhookURL)
+			notifier := notify.New(webhookSink(hook), notifierOptions)
+			if hook != "" {
+				slog.Info("event webhook configured", "url", hook)
+			}
+			// Registered before the reaper and scheduler joins below so
+			// LIFO unwinding runs it AFTER both loops have stopped: nothing
+			// may still be emitting when the queue is drained, or those
+			// events are dropped on the floor at the one moment an operator
+			// most wants to know what happened.
+			defer func() {
+				ctx, cancel := context.WithTimeout(context.Background(), notifierCloseTimeout)
+				defer cancel()
+				if err := notifier.Close(ctx); err != nil {
+					slog.Warn("gave up delivering queued notifications", "err", err)
+				}
+			}()
+
+			srv := server.New(server.Config{
+				Store: st, Logs: logs, Clock: c, Tokens: tokens, Notifier: notifier,
+			})
 
 			// The reaper: silent workers lose their devices to unknown, then
 			// unhealthy. Nothing here ever promotes a device to ready.
@@ -74,14 +137,14 @@ func NewServeCmd() *cobra.Command {
 			reaperWG.Add(1)
 			go func() {
 				defer reaperWG.Done()
-				t := time.NewTicker(10 * time.Second)
+				t := time.NewTicker(sweepInterval)
 				defer t.Stop()
 				for {
 					select {
 					case <-reaperCtx.Done():
 						return
 					case <-t.C:
-						res, err := st.Sweep(HeartbeatGrace, 5*time.Minute)
+						res, err := sweepAndNotify(st, notifier, HeartbeatGrace, sweepUnhealthyAfter)
 						if err != nil {
 							slog.Error("sweep", "err", err)
 							continue
@@ -157,7 +220,114 @@ func NewServeCmd() *cobra.Command {
 
 	cmd.Flags().StringVar(&addr, "addr", ":8080", "listen address")
 	cmd.Flags().StringVar(&dataDir, "data", "/var/lib/rc", "state directory")
+	cmd.Flags().StringVar(&webhookURL, "webhook-url", "",
+		"POST operational events (watchdog trips, unhealthy devices, lost workers and jobs) "+
+			"to this URL as JSON; defaults to $RC_WEBHOOK_URL")
 	return cmd
+}
+
+// resolveWebhookURL picks the webhook endpoint: the flag if it was given,
+// otherwise RC_WEBHOOK_URL, otherwise none. The flag wins so an operator can
+// override an environment set by a unit file without editing the unit.
+func resolveWebhookURL(flagValue string) string {
+	if flagValue != "" {
+		return flagValue
+	}
+	return os.Getenv("RC_WEBHOOK_URL")
+}
+
+// webhookSink returns the Sink for url, or a nil Sink when no webhook is
+// configured. Returning nil rather than a Sink pointed at "" is what makes
+// notify.New hand back a nil *Notifier, which is the documented "no webhook"
+// state — see the call site in RunE.
+func webhookSink(url string) notify.Sink {
+	if url == "" {
+		return nil
+	}
+	return notify.NewWebhook(url, nil)
+}
+
+// sweepEvents maps one sweep's outcome to the events it should announce.
+//
+// It is deliberately given only what the sweep actually reports —
+// store.SweepResult carries device and job IDs, nothing else — plus the
+// quarantine reasons read back afterwards. The events are correspondingly
+// modest: job_lost carries the exact kill_reason the reaper wrote ("worker
+// lost") and no device, because the sweep never told us which device the job
+// was on.
+//
+// The worker_lost / device_unhealthy split is decided by the stored
+// quarantine reason rather than by anything in SweepResult, which cannot
+// tell the two apart. In practice a device that newly turns unhealthy in a
+// sweep was quarantined by this very sweep for worker loss; the general
+// branch covers a reason written by another path in between, and a reason
+// nobody recorded, neither of which should be reported as a lost worker on
+// no evidence.
+func sweepEvents(res store.SweepResult, reasons map[string]string) []notify.Event {
+	// Devices demoted to unknown are absent on purpose: unknown is not a
+	// quarantine, and the next heartbeat routinely undoes it.
+	out := make([]notify.Event, 0, len(res.DevicesUnhealthy)+len(res.JobsLost)+len(res.LeasesExpired))
+	for _, id := range res.DevicesUnhealthy {
+		reason := reasons[id]
+		kind := notify.KindDeviceUnhealthy
+		if reason == quarantineWorkerLost {
+			kind = notify.KindWorkerLost
+		}
+		out = append(out, notify.Event{Kind: kind, Device: id, Reason: reason})
+	}
+	for _, id := range res.JobsLost {
+		out = append(out, notify.Event{Kind: notify.KindJobLost, Job: id, Reason: sweepJobLostReason})
+	}
+	for _, id := range res.LeasesExpired {
+		out = append(out, notify.Event{Kind: notify.KindLeaseExpired, Job: id, Reason: sweepLeaseExpiredReason})
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+const (
+	// quarantineWorkerLost mirrors the constant internal/store/reaper.go
+	// stores in devices.quarantine_reason when a sweep writes a worker off.
+	// It is unexported there, and it is a stored value in a live database,
+	// so it is matched by value here rather than re-exported.
+	quarantineWorkerLost = "worker_lost"
+	// sweepJobLostReason and sweepLeaseExpiredReason are the exact
+	// kill_reason strings the reaper records on the jobs it ends, so an
+	// operator reading `rc ps` sees the same words the webhook told them.
+	sweepJobLostReason      = "worker lost"
+	sweepLeaseExpiredReason = "lease expired"
+)
+
+// sweepAndNotify runs one sweep and announces what it changed.
+//
+// The quarantine reasons are read AFTER Sweep returns, never during it: the
+// store runs at one connection, so a second query issued while Sweep's own
+// cursors are open would deadlock. Failing to read them is not allowed to
+// fail the sweep — the reaper's job is to reclaim hardware, and a
+// notification it could not fully label is still worth sending — so the
+// events degrade to device_unhealthy instead.
+func sweepAndNotify(st *store.Store, n *notify.Notifier, grace, unhealthyAfter time.Duration) (store.SweepResult, error) {
+	res, err := st.Sweep(grace, unhealthyAfter)
+	if err != nil {
+		return res, err
+	}
+
+	var reasons map[string]string
+	if len(res.DevicesUnhealthy) > 0 {
+		reasons, err = st.QuarantineReasons(res.DevicesUnhealthy)
+		if err != nil {
+			slog.Error("read quarantine reasons for event notifications", "err", err)
+			reasons = nil
+		}
+	}
+	for _, e := range sweepEvents(res, reasons) {
+		// Never blocks: a wedged webhook drops events, it does not hold up
+		// the reaper.
+		n.Notify(e)
+	}
+	return res, nil
 }
 
 // loadTokens reads RC_TOKENS as "token:role,token:role". It rejects anything

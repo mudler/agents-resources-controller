@@ -9,10 +9,12 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/mudler/agents-resources-controller/internal/model"
+	"github.com/mudler/agents-resources-controller/internal/notify"
 	"github.com/mudler/agents-resources-controller/internal/store"
 )
 
@@ -561,7 +563,61 @@ func (s *Server) handleDeviceFault(w http.ResponseWriter, r *http.Request) {
 	}
 	slog.Warn("device quarantined: fault", "device", id, "reason", req.Reason)
 	s.publishDevices()
+
+	// A verify failure IS a device going unhealthy, so emitting both kinds
+	// would make any consumer counting device_unhealthy double count. The
+	// specific kind wins; the general one is for every other source.
+	kind := notify.KindDeviceUnhealthy
+	if strings.HasPrefix(req.Reason, verifyReasonPrefix) {
+		kind = notify.KindVerifyFailed
+	}
+	s.emit(notify.Event{Kind: kind, Device: id, Job: s.activeJobOn(id), Reason: req.Reason})
 	w.WriteHeader(http.StatusOK)
+}
+
+// verifyReasonPrefix is the literal prefix internal/worker/verify.go stamps
+// on the reason of every verify-sourced fault. The fault endpoint takes free
+// text — a failed lifecycle hook posts its own tail output through the same
+// route — so this prefix is the only thing distinguishing the two sources.
+// internal/worker pins the exact string in a test of its own, so it cannot
+// drift silently; changing it there without changing it here would demote
+// every verify failure to a plain device_unhealthy.
+const verifyReasonPrefix = "verify failed: "
+
+// watchdogReasons are the reasons internal/worker/exec.go writes when one of
+// its two watchdogs trips, matched as prefixes because each is completed
+// with the configured limit ("max_runtime exceeded (4h0m0s)").
+//
+// Matching the reason rather than the `killed` state is the whole point: a
+// job killed by `rc kill`, or by a worker shutting down, is reported killed
+// too and is nobody's incident. exec.go labels those "cancelled".
+var watchdogReasons = []string{"max_runtime exceeded", "idle: no output for"}
+
+func isWatchdogReason(reason string) bool {
+	for _, prefix := range watchdogReasons {
+		if strings.HasPrefix(reason, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// activeJobOn names the job currently holding deviceID, or "" if none is —
+// what a verify failure needs to say WHICH run left the device dirty. The
+// worker verifies before it reports the job terminal (see internal/worker),
+// so at fault time that job is still assigned or running and this finds it.
+//
+// It never fails the request it serves: a fault must be recorded and
+// announced whether or not the job behind it can be named, so a store error
+// here degrades the event to one without a job rather than rejecting a
+// quarantine the store already applied.
+func (s *Server) activeJobOn(deviceID string) string {
+	id, err := s.cfg.Store.ActiveJobOnDevice(deviceID)
+	if err != nil {
+		slog.Warn("could not resolve the job on a faulted device", "device", deviceID, "err", err)
+		return ""
+	}
+	return id
 }
 
 func (s *Server) handleAppendLogs(w http.ResponseWriter, r *http.Request) {
@@ -624,5 +680,13 @@ func (s *Server) handleJobStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.publishJob(jobID, req.State)
+	// Only a terminal report can be a watchdog trip, and only one whose
+	// reason names a watchdog — see isWatchdogReason for why the `killed`
+	// state is not the signal.
+	if isWatchdogReason(req.Reason) {
+		s.emit(notify.Event{
+			Kind: notify.KindWatchdogTrip, Job: jobID, Device: job.DeviceID, Reason: req.Reason,
+		})
+	}
 	w.WriteHeader(http.StatusOK)
 }
