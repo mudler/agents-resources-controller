@@ -47,8 +47,14 @@ type Event struct {
 }
 
 // Sink delivers a single Event, returning an error if delivery failed.
-// Deliver must respect ctx: when ctx is done, Deliver should stop trying
-// and return promptly.
+//
+// Deliver MUST respect ctx: it must stop trying and return once ctx is
+// done. This is not a nicety — Close cancels the shared delivery context
+// and then unconditionally waits for the background goroutine to exit, so
+// a Sink that ignores ctx turns a bounded Close into one that hangs until
+// the Sink itself returns, regardless of the caller's own deadline. The
+// webhook Sink in this package honours ctx via http.NewRequestWithContext;
+// any other Sink implementation must do the same.
 type Sink interface {
 	Deliver(ctx context.Context, e Event) error
 }
@@ -101,7 +107,18 @@ type Notifier struct {
 // New creates a Notifier delivering events to sink, and starts the single
 // background goroutine that serves its queue. Callers must eventually call
 // Close to release that goroutine.
+//
+// If sink is nil, New returns nil instead of a Notifier that would crash
+// its background goroutine on the first delivery attempt. This matters
+// because a later task constructs the notifier conditionally on whether a
+// webhook is configured — exactly the shape that would otherwise hand New
+// a nil Sink. A nil *Notifier is already the documented "no webhook
+// configured" state that every method here handles safely, so the caller
+// gets correct behaviour for free instead of a crash.
 func New(sink Sink, opts Options) *Notifier {
+	if sink == nil {
+		return nil
+	}
 	if opts.Attempts < 1 {
 		opts.Attempts = 1
 	}
@@ -127,6 +144,23 @@ func New(sink Sink, opts Options) *Notifier {
 // event is dropped and the drop is counted — Notify must never block its
 // caller and must never panic, since it is called from the scheduler's hot
 // path, the reaper's sweep, and HTTP handlers.
+//
+// If e.At is the zero time, Notify stamps it with time.Now().UTC() before
+// enqueueing. At is part of the documented wire format an operator's
+// consumer may sort or dedupe on, so it must never ship as the Go zero
+// value just because a caller forgot to set it.
+//
+// Note on shutdown: the check for "has Close been called" and the send to
+// the queue are two separate steps, not one atomic operation. An event
+// whose Notify call is in flight at the exact moment Close runs can lose
+// the race after passing the closed check but before its send is received
+// by drainRemaining — that event is silently lost and NOT counted in
+// Dropped, unlike every other drop path. This is a deliberate accepted gap,
+// not a bug: it is bounded by QueueSize, only possible in the brief shutdown
+// window, and closing it would mean either blocking Notify (which this
+// package exists to avoid) or closing a channel with concurrent senders
+// (a panic risk we specifically designed around, see the queue field
+// comment above).
 func (n *Notifier) Notify(e Event) {
 	if n == nil {
 		return
@@ -136,6 +170,9 @@ func (n *Notifier) Notify(e Event) {
 		n.dropped.Add(1)
 		return
 	default:
+	}
+	if e.At.IsZero() {
+		e.At = time.Now().UTC()
 	}
 	select {
 	case n.queue <- e:
@@ -147,7 +184,15 @@ func (n *Notifier) Notify(e Event) {
 }
 
 // Dropped reports how many events have been dropped so far because the
-// queue was full. Safe on a nil receiver, returning 0.
+// queue was full or because Notify was called after Close. Safe on a nil
+// receiver, returning 0.
+//
+// Only the full-queue case is logged (in Notify, at the point of the drop);
+// a post-Close drop is counted here but not logged, since by then the
+// Notifier is shutting down and there is no delivery goroutine left to
+// usefully report through. Also see Notify's doc comment for the one drop
+// path this counter cannot see at all: an event that loses its race against
+// a concurrent Close.
 func (n *Notifier) Dropped() int64 {
 	if n == nil {
 		return 0
@@ -155,14 +200,21 @@ func (n *Notifier) Dropped() int64 {
 	return n.dropped.Load()
 }
 
-// Close stops accepting new events, drains and attempts to deliver whatever
-// is already queued (bounded by ctx), and waits for the background
-// goroutine to finish. It is safe to call on a nil receiver, safe to call
-// more than once, and returns promptly even when ctx is already cancelled:
-// in that case it cancels delivery immediately so the background goroutine
-// unwinds without waiting out any pending backoff or a wedged sink, and
-// still waits for that goroutine to actually finish before returning, so
-// the goroutine is never leaked.
+// Close stops accepting new events and drains and attempts to deliver
+// whatever is already queued. It is safe to call on a nil receiver and safe
+// to call more than once.
+//
+// When ctx is done (including already-cancelled), Close cancels the shared
+// delivery context, which unsticks any pending backoff sleep and any
+// in-flight or subsequent Sink.Deliver call that itself honours ctx
+// cancellation as required by the Sink contract. Close then unconditionally
+// waits for the background goroutine to exit before returning, so the
+// goroutine is never leaked — but this means ctx only bounds how long Close
+// waits when the Sink cooperates. A Sink that ignores its context can still
+// make Close block past ctx's deadline, because Close will not return while
+// the goroutine is still running a Deliver call. "Bounded by ctx" is
+// therefore a best-effort promise contingent on the Sink, not a hard
+// guarantee independent of it.
 func (n *Notifier) Close(ctx context.Context) error {
 	if n == nil {
 		return nil
@@ -219,11 +271,13 @@ func (n *Notifier) drainRemaining() {
 func (n *Notifier) deliver(e Event) {
 	backoff := n.opts.Backoff
 	var lastErr error
+	made := 0 // number of Sink.Deliver calls actually made, for the give-up log below
 	for attempt := 1; attempt <= n.opts.Attempts; attempt++ {
 		if err := n.deliveryCtx.Err(); err != nil {
 			lastErr = err
 			break
 		}
+		made++
 		err := n.sink.Deliver(n.deliveryCtx, e)
 		if err == nil {
 			return
@@ -242,5 +296,5 @@ func (n *Notifier) deliver(e Event) {
 		}
 	}
 	slog.Warn("notify: gave up delivering event",
-		"event", e.Kind, "device", e.Device, "attempts", n.opts.Attempts, "error", lastErr)
+		"event", e.Kind, "device", e.Device, "job", e.Job, "attempts", made, "error", lastErr)
 }
