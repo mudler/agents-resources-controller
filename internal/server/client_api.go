@@ -47,7 +47,25 @@ type SubmitRequest struct {
 	MaxRuntimeSeconds  int               `json:"max_runtime_seconds,omitempty"`
 	IdleTimeoutSeconds int               `json:"idle_timeout_seconds,omitempty"`
 	NoWait             bool              `json:"no_wait,omitempty"`
+	// Kind is model.LeaseKindJob or model.LeaseKindHold; empty means job.
+	// A hold ("rc hold") is a job whose command the worker chooses for
+	// itself, never the submitter — see handleSubmit, which rejects a hold
+	// submission that carries one.
+	Kind string `json:"kind,omitempty"`
+	// Reason is why a hold was taken (e.g. "manual profiling"), surfaced by
+	// rc devices and the dashboard via the lease it is copied onto. Only
+	// meaningful for a hold.
+	Reason string `json:"reason,omitempty"`
 }
+
+// holdCommand is the fixed, meaningless-by-design command recorded on a
+// hold's job row. It is display-only — what a real worker actually runs
+// for a hold is chosen by the worker itself (internal/worker's execute),
+// never by what is stored here — so even if this value ever reached a
+// process, nothing a submitter supplied could run through it: a hold
+// submission that carries its own command is rejected outright below,
+// before this is ever used.
+var holdCommand = []string{"hold"}
 
 // JobView is a job plus the queue position a client needs to show progress.
 type JobView struct {
@@ -56,12 +74,18 @@ type JobView struct {
 }
 
 type DeviceView struct {
-	Device              model.Device `json:"device"`
-	Holder              string       `json:"holder,omitempty"`
-	JobID               string       `json:"job_id,omitempty"`
-	Command             []string     `json:"command,omitempty"`
-	ElapsedSeconds      int          `json:"elapsed_seconds"`
-	HeartbeatAgeSeconds int          `json:"heartbeat_age_seconds"`
+	Device model.Device `json:"device"`
+	Holder string       `json:"holder,omitempty"`
+	JobID  string       `json:"job_id,omitempty"`
+	// Kind is the holding lease's kind (model.LeaseKindJob or
+	// model.LeaseKindHold), empty when nothing holds the device. Read
+	// straight off the lease row, which is where task 8 labels a hold —
+	// see the design note in internal/store/allocate.go's assignQueued.
+	Kind                string   `json:"kind,omitempty"`
+	Reason              string   `json:"reason,omitempty"`
+	Command             []string `json:"command,omitempty"`
+	ElapsedSeconds      int      `json:"elapsed_seconds"`
+	HeartbeatAgeSeconds int      `json:"heartbeat_age_seconds"`
 }
 
 type StateResponse struct {
@@ -276,8 +300,41 @@ func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
-	if len(req.Command) == 0 {
-		writeErr(w, http.StatusBadRequest, "bad_request", "command required")
+
+	kind := req.Kind
+	if kind == "" {
+		kind = model.LeaseKindJob
+	}
+	switch kind {
+	case model.LeaseKindJob:
+		if len(req.Command) == 0 {
+			writeErr(w, http.StatusBadRequest, "bad_request", "command required")
+			return
+		}
+	case model.LeaseKindHold:
+		// The sleeper a hold runs is the worker's choice, never the
+		// submitter's (see internal/worker's execute) — this is the one
+		// place that guarantee is actually enforced: a hold submission
+		// carrying a command is refused outright rather than silently
+		// discarded, so "--kind hold" can never become a way to run
+		// arbitrary code labelled as something else.
+		if len(req.Command) != 0 {
+			writeErr(w, http.StatusBadRequest, "bad_request",
+				"a hold may not specify a command: the worker supplies its own")
+			return
+		}
+		// --ttl is required for a hold, capped by the device's max_runtime
+		// exactly as a job's is (checked below via the ordinary ceiling
+		// path once MaxRuntimeSeconds is known to be positive) — rejected,
+		// never clamped, never silently defaulted to "no expiry".
+		if req.MaxRuntimeSeconds <= 0 {
+			writeErr(w, http.StatusBadRequest, "bad_request", "a hold requires --ttl")
+			return
+		}
+		req.Command = holdCommand
+	default:
+		writeErr(w, http.StatusBadRequest, "bad_request",
+			fmt.Sprintf("unknown kind %q: must be %q or %q", req.Kind, model.LeaseKindJob, model.LeaseKindHold))
 		return
 	}
 	switch {
@@ -322,6 +379,8 @@ func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 		Priority:    req.Priority,
 		MaxRuntime:  time.Duration(req.MaxRuntimeSeconds) * time.Second,
 		IdleTimeout: time.Duration(req.IdleTimeoutSeconds) * time.Second,
+		Kind:        kind,
+		Reason:      req.Reason,
 	})
 	if errors.Is(err, store.ErrRuntimeAboveCeiling) {
 		writeErr(w, http.StatusBadRequest, "runtime_above_ceiling", err.Error())
@@ -551,14 +610,18 @@ func (s *Server) deviceViews() ([]DeviceView, error) {
 	byDevice := map[string]struct {
 		holder string
 		jobID  string
+		kind   string
+		reason string
 		since  time.Time
 	}{}
 	for _, l := range leases {
 		byDevice[l.DeviceID] = struct {
 			holder string
 			jobID  string
+			kind   string
+			reason string
 			since  time.Time
-		}{l.Holder, l.JobID, l.AcquiredAt}
+		}{l.Holder, l.JobID, l.Kind, l.Reason, l.AcquiredAt}
 	}
 
 	now := s.cfg.Clock.Now()
@@ -571,6 +634,8 @@ func (s *Server) deviceViews() ([]DeviceView, error) {
 		if l, ok := byDevice[d.ID]; ok {
 			v.Holder = l.holder
 			v.JobID = l.jobID
+			v.Kind = l.kind
+			v.Reason = l.reason
 			v.ElapsedSeconds = int(now.Sub(l.since).Seconds())
 			if job, err := s.cfg.Store.Job(l.jobID); err == nil {
 				v.Command = job.Command

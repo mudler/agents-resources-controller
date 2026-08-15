@@ -122,6 +122,11 @@ type Assignment struct {
 	// Submitter carries the job's submitter so a lease lifecycle hook's
 	// RC_SUBMITTER can name them.
 	Submitter string `json:"submitter,omitempty"`
+	// Kind is model.LeaseKindJob or model.LeaseKindHold. A worker that
+	// sees "hold" substitutes its own sleeper for Command — see
+	// internal/worker's execute — rather than trusting what is stored
+	// here, which for a hold is a fixed, meaningless placeholder.
+	Kind string `json:"kind,omitempty"`
 }
 
 // PollResponse is the envelope handleAssignments answers a long-poll with: it
@@ -504,7 +509,7 @@ func (s *Server) handleAssignments(w http.ResponseWriter, r *http.Request) {
 				out = append(out, Assignment{
 					JobID: j.ID, DeviceID: j.DeviceID, Command: j.Command, Cwd: j.Cwd, Env: j.Env,
 					MaxRuntimeSeconds: j.MaxRuntimeSeconds, IdleTimeoutSeconds: j.IdleTimeoutSeconds,
-					Submitter: j.Submitter,
+					Submitter: j.Submitter, Kind: j.Kind,
 				})
 			}
 			writeJSON(w, http.StatusOK, PollResponse{Assignments: out, Kills: kills})
