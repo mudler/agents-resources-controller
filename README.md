@@ -12,7 +12,8 @@ Exclusive device leases, supervised job execution, live log streaming, fleet
 visibility, a queue with priorities, per-device runtime watchdogs, lease
 expiry, boot-identity recovery, server-side cancellation (`rc kill`),
 re-attaching to a running job's output (`rc attach`), a live SSE event
-stream, a read-only web dashboard, lease lifecycle hooks (stop/start a
+stream, a web dashboard that can kill a job and clear an unhealthy device,
+lease lifecycle hooks (stop/start a
 service like LocalAI or ollama around a job's hold on a device), capability
 probes and labels with provenance, selectors (`--select`), per-host usage
 sheets and `rc describe`, and `rc hold`/`rc release` for claiming a device
@@ -24,7 +25,7 @@ for a human rather than a job.
 |---|---|
 | Verify probes between jobs | Nothing checks VRAM was released after a job |
 | Webhook notifications | Poll `rc ps` / `rc devices`, or watch `/v1/events` |
-| Dashboard actions (kill/hold from the browser) | `rc kill` from a terminal; the dashboard is read-only |
+| Submitting or holding a device from the browser | `rc run` / `rc hold` from a terminal; the dashboard kills a job and clears an unhealthy device, and does nothing else that changes state |
 | A `cuda` label from the built-in GPU probe | `nvidia-smi --query-gpu` has no `cuda_version` field (see "Capability probes and labels" below); write a drop-in probe if you need it |
 | A controller-side operator annotation layered over a usage sheet | The spec allows one ("the host file wins on conflict"), but it was never built — a usage sheet is exactly what the host's `host.md`/`host.d/*.md` say, full stop; `host_docs` is keyed `(host, device_id)` with no annotation layer on top |
 
@@ -685,7 +686,7 @@ end it early.
 
 ## Dashboard
 
-The controller serves a read-only web dashboard at `/` — the same address
+The controller serves a web dashboard at `/` — the same address
 `rc serve --addr` binds, no separate process or port. It shows the same
 picture as `rc devices` / `rc ps` in a browser: a card per device (state,
 current holder, elapsed time, and a `stale`/`alert` tint once a worker's
@@ -694,14 +695,46 @@ queue in priority order, and the currently running jobs. It refreshes on a
 poll plus a live SSE nudge, and shows how long ago its own snapshot was
 last refreshed so a disconnected browser tab does not quietly look current.
 
-**It is read-only.** There is no kill/hold/submit button anywhere on the
-page — the actions that touch a lease or a process still go through `rc
-kill` / `rc run` from a terminal. The page asks for a client token before
-showing anything, and that token is kept in the tab's `sessionStorage`
-only: it is never written to disk, never sent to any other tab or a new
-browser session, and is gone the moment the tab is closed. Reloading the
-page (in the same tab) keeps it; opening the dashboard in a second tab asks
-for the token again.
+The page asks for a client token before showing anything, and that token is
+kept in the tab's `sessionStorage` only: it is never written to disk, never
+sent to any other tab or a new browser session, and is gone the moment the
+tab is closed. Reloading the page (in the same tab) keeps it; opening the
+dashboard in a second tab asks for the token again.
+
+Two things on the page change state, and nothing else does. There is no
+submit button and no hold button — starting work still goes through `rc
+run` / `rc hold` from a terminal.
+
+**Kill a running job.** Fill in the identity box ("you are …") with the
+submitter name your jobs run under — the same string `rc run --as` sends and
+the `submitter` column shows — and a `kill` control appears on each running
+job. It sends that identity, and the controller checks it against the job's
+submitter exactly as `rc kill` is checked, so killing someone else's job is
+refused with `not_job_owner` and the page shows that refusal in the
+controller's own words. The control is still offered on a job you did not
+submit (drawn as an outline rather than a filled button, since the
+controller will refuse it) because "someone else's job is stuck on the GPU I
+need" is precisely when an operator goes looking for it, and a refusal
+naming the submitter is more useful than a missing button. The identity is
+not a credential and is not stored: a reload keeps the connection and
+forgets who you are, and the kill controls stay hidden until you say so
+again.
+
+**Clear an unhealthy device.** An `unhealthy` card carries a `clear` control,
+which is the browser equivalent of `POST /v1/devices/{id}/clear` and needs an
+**admin** token. The page does not have one and never keeps one: it asks for
+it in a prompt at the moment you click, uses it for that single request, and
+drops it before the response comes back — never in `sessionStorage`, never in
+`localStorage`, never on a variable that outlives the call. Clearing a second
+device asks again. So the strongest credential ever resident in the browser
+is the client token, which reaches only your own jobs. A device that is
+unhealthy but still holds a live lease is refused with `device_not_cleared`,
+shown verbatim: deal with the lease first.
+
+Both actions confirm before firing, refresh the page's state on success, and
+report the controller's own error text on failure rather than a generic
+"failed" — `not_job_owner` and `device_not_cleared` each tell you what to do
+next.
 
 The one exception to "tokens go in the `Authorization` header, never the
 URL" is `GET /v1/events`, the SSE stream the dashboard uses to know when to
