@@ -10,6 +10,8 @@ import (
 	"github.com/mudler/agents-resources-controller/internal/client"
 	"github.com/mudler/agents-resources-controller/internal/clock"
 	"github.com/mudler/agents-resources-controller/internal/logstore"
+	"github.com/mudler/agents-resources-controller/internal/model"
+	"github.com/mudler/agents-resources-controller/internal/notify"
 	"github.com/mudler/agents-resources-controller/internal/server"
 	"github.com/mudler/agents-resources-controller/internal/store"
 	"github.com/mudler/agents-resources-controller/internal/worker"
@@ -49,10 +51,11 @@ const (
 // for its one device at registration (worker.DeviceConfig.MaxRuntime),
 // exercised by TestWatchdogKillsAnOverrunningJob.
 //
-// opts customizes the one device newFleet's worker registers beyond what
-// deviceMaxRuntime already covers — see fleetOption and withHooks, used by
-// hold_test.go to exercise the acquire/release lifecycle hooks against a
-// real worker rather than reimplementing this whole setup a second time.
+// opts customize the fleet beyond what deviceMaxRuntime already covers — see
+// fleetOption and its withX constructors, used by hold_test.go (lifecycle
+// hooks), verify_test.go (a verify directory) and notify_test.go (a
+// controller notifier) to exercise those features against a real worker
+// rather than reimplementing this whole setup a second time.
 //
 // It returns a client authenticated as a client-role token, the store (for
 // tests that want to assert against it directly), and the device's ID
@@ -74,12 +77,40 @@ func newFleet(t *testing.T, deviceMaxRuntime time.Duration, opts ...fleetOption)
 	logs, err := logstore.New(filepath.Join(dir, "logs"))
 	require.NoError(t, err)
 
-	srv := server.New(server.Config{
-		Store: st, Logs: logs, Clock: c,
-		Tokens: map[string]string{"wtok": "worker", "ctok": "client"},
-	})
+	fc := fleetConfig{
+		server: server.Config{
+			Store: st, Logs: logs, Clock: c,
+			Tokens: map[string]string{"wtok": "worker", "ctok": "client", "atok": "admin"},
+		},
+		worker: worker.Config{
+			Token: "wtok", Host: fleetHost,
+			Devices:           []worker.DeviceConfig{{Name: fleetDevice, MaxRuntime: deviceMaxRuntime}},
+			HeartbeatInterval: time.Second, PollWait: time.Second,
+		},
+	}
+	for _, opt := range opts {
+		opt(&fc)
+	}
+
+	srv := server.New(fc.server)
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
+	if fc.urlOut != nil {
+		*fc.urlOut = ts.URL
+	}
+	// Registered before the worker and the scheduler loop, so LIFO teardown
+	// stops both of those BEFORE this runs: nothing is still producing
+	// events by the time the notifier drains, which is the same ordering
+	// cli.NewServeCmd's own shutdown defers are careful to get right. (An
+	// event emitted after this point is dropped, not a panic — every
+	// notify.Notifier method is safe post-Close.)
+	if fc.server.Notifier != nil {
+		t.Cleanup(func() {
+			closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = fc.server.Notifier.Close(closeCtx)
+		})
+	}
 
 	// The scheduler loop, mirroring cli.NewServeCmd: notices a device
 	// freeing up (a job finishing, a worker re-registering) and hands the
@@ -112,17 +143,9 @@ func newFleet(t *testing.T, deviceMaxRuntime time.Duration, opts ...fleetOption)
 		<-schedDone
 	})
 
-	dev := worker.DeviceConfig{Name: fleetDevice, MaxRuntime: deviceMaxRuntime}
-	for _, opt := range opts {
-		opt(&dev)
-	}
-
 	wkCtx, cancelWk := context.WithCancel(context.Background())
-	wk := worker.New(worker.Config{
-		ControllerURL: ts.URL, Token: "wtok", Host: fleetHost,
-		Devices:           []worker.DeviceConfig{dev},
-		HeartbeatInterval: time.Second, PollWait: time.Second,
-	})
+	fc.worker.ControllerURL = ts.URL // known only now, so it is not an option's to set
+	wk := worker.New(fc.worker)
 	workerDone := make(chan error, 1)
 	go func() { workerDone <- wk.Start(wkCtx) }()
 	// Clean shutdown: with no in-flight job left by the time a test ends
@@ -147,18 +170,114 @@ func newFleet(t *testing.T, deviceMaxRuntime time.Duration, opts ...fleetOption)
 
 	registerCtx, cancelRegister := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancelRegister()
+	declared := fc.worker.Devices[0].Labels
 	require.Eventually(t, func() bool {
 		state, err := cl.State(registerCtx)
-		return err == nil && len(state.Devices) == 1
-	}, 15*time.Second, 100*time.Millisecond, "worker never registered its device")
+		return err == nil && len(state.Devices) == 1 &&
+			registrationLanded(state.Devices[0].Device, declared)
+	}, 15*time.Second, 100*time.Millisecond,
+		"worker never finished registering its device (detected cpus and every declared label must land)")
 
 	return cl, st, fleetHost + ":" + fleetDevice
 }
 
-// fleetOption customizes the one device newFleet's worker declares, for a
-// test that needs more than the bare name-and-ceiling every other test here
-// is content with.
-type fleetOption func(*worker.DeviceConfig)
+// registrationLanded reports whether every store write a registration makes
+// that a client can actually SEE has landed for this device: the detected
+// "cpus" label, plus each of the declared labels this fleet was configured
+// with (withLabels). It is what newFleet — and
+// TestWorkerRestartQuarantinesDeviceInsteadOfFalselyReady, which gates itself
+// the same way — waits for instead of the mere existence of a device row.
+//
+// Why not "one device exists": handleRegister
+// (internal/server/worker_api.go) does four things in order inside ONE
+// handler — UpsertWorker creates the device rows, SetDeviceMaxRuntime writes
+// each device's runtime ceiling, applyDeviceFacts writes labels and sheets,
+// publishDevices announces the lot. A gate that only waits for the device row
+// is satisfied by the FIRST of those, so newFleet could return with the test
+// body racing the remaining three: a test that writes labels of its own (the
+// selector tests) could have them overwritten a moment later by
+// applyDeviceFacts, and a test that depends on the device's runtime ceiling
+// (TestWatchdogKillsAnOverrunningJob, whose worker takes its limit from the
+// assignment, which comes from the device row SetDeviceMaxRuntime writes)
+// could submit before that ceiling existed and watch its job run unbounded.
+// Roughly 100ms of accidental slack normally hid this; a deliberate 105ms
+// sleep inserted after UpsertWorker returns and before the two writes that
+// follow it turned the two into 5/10 and 7/10 failures respectively.
+//
+// Waiting for the detected "cpus" label alone was NOT enough, and the first
+// version of this helper said otherwise. applyDeviceFacts is itself three
+// writes per device, in this order: detected labels, THEN declared labels,
+// THEN that device's usage sheet. So "cpus" goes true after the first of the
+// three, and withLabels — which sets DECLARED labels — lands after it. Proven
+// with the same stall technique, 300ms between the detected and the declared
+// write: TestSelectorMatchingNoDeviceIsRejectedAtSubmit failed 3/3 with "the
+// device's declared vendor label never reached the controller".
+//
+// "cpus" is still the right detected fact to wait on: builtinLabels
+// (internal/worker/probe.go) emits it unconditionally from runtime.NumCPU, so
+// it is never absent for environmental reasons the way mem_total_bytes or a
+// GPU fact can be, and it is HOST-scoped, so applyDeviceFacts' host-then-device
+// merge puts it on every device. Observing it also proves SetDeviceMaxRuntime
+// landed, which is what closes the watchdog exposure with the same wait.
+//
+// The one write this cannot observe is the LAST one: the per-device usage
+// sheet. A worker sends an explicit, empty sheet for a device with no
+// host.d/<name>.md (see readSheets), and an empty sheet is invisible through
+// the API — handleDescribe falls back to the host-wide note on an empty body
+// and reports no age at all. So the residual is exactly one store call,
+// writing an empty host_docs row that nothing in this package reads. A test
+// that starts asserting on usage sheets must extend this gate rather than
+// assume it already covers them.
+//
+// All of this proves only that the FIRST registration completed.
+// ProbeInterval defaults to 5 minutes (internal/worker/config.go), so a
+// worker's periodic label push cannot collide with anything inside a test
+// today — but a test that shortened that interval would make direct label
+// injection racy again, and this wait would not save it.
+func registrationLanded(d model.Device, declared map[string]string) bool {
+	if !hasLabel(d, "cpus", model.SourceDetected, "") {
+		return false
+	}
+	for k, v := range declared {
+		if !hasLabel(d, k, model.SourceDeclared, v) {
+			return false
+		}
+	}
+	return true
+}
+
+// hasLabel reports whether d carries key from source. An empty want matches
+// any value; a non-empty one must match exactly, so a declared label is only
+// counted once the value the fleet configured is the value stored.
+func hasLabel(d model.Device, key, source, want string) bool {
+	for _, l := range d.Labels {
+		if l.Key == key && l.Source == source && (want == "" || l.Value == want) {
+			return true
+		}
+	}
+	return false
+}
+
+// fleetConfig is everything about newFleet's fleet a test is allowed to
+// change: the controller's own configuration (today, whether it has a
+// notifier), the worker's (its one device, its verify directory), and an
+// optional out-parameter for the controller URL.
+//
+// The two configs are collected BEFORE anything is constructed because they
+// are consumed at different moments — server.Config at server.New, before the
+// httptest listener exists, and worker.Config after it, since the worker
+// needs that listener's URL. Options therefore describe the fleet rather than
+// mutate a live one.
+type fleetConfig struct {
+	server server.Config
+	worker worker.Config
+	urlOut *string
+}
+
+// fleetOption customizes the fleet newFleet stands up, for a test that needs
+// more than the bare one-device-with-a-ceiling every other test here is
+// content with.
+type fleetOption func(*fleetConfig)
 
 // withHooks arms the device's acquire/release lifecycle hooks and shortens
 // its release_linger to lingerSeconds — long enough to keep the hold_test.go
@@ -168,9 +287,57 @@ type fleetOption func(*worker.DeviceConfig)
 // generous, require.Eventually bound instead of waiting out the 30s
 // production default.
 func withHooks(onAcquire, onRelease string, linger time.Duration) fleetOption {
-	return func(d *worker.DeviceConfig) {
+	return func(fc *fleetConfig) {
+		d := &fc.worker.Devices[0]
 		d.OnAcquire = onAcquire
 		d.OnRelease = onRelease
 		d.ReleaseLinger = linger
+	}
+}
+
+// withLabels gives newFleet's device declared labels (worker.yaml's
+// devices[].labels), so a test that needs facts distinguishing this device
+// from another can get them through registration — the way an operator would
+// — instead of writing them into the store behind the controller's back.
+//
+// This is an ADDITION, not a replacement for the store-side injection the
+// selector tests do: those deliberately exercise the DETECTED source, which
+// no configuration can assert, and the registration wait above is what makes
+// writing that source directly sound. Use this when the source does not
+// matter and you just want the fact to be there before the test body starts.
+func withLabels(labels map[string]string) fleetOption {
+	return func(fc *fleetConfig) {
+		fc.worker.Devices[0].Labels = labels
+	}
+}
+
+// withVerifyDir points the worker's post-job verify pass at dir. A worker
+// whose VerifyDir does not exist runs no verify pass at all (the feature is
+// off unless scripts exist), which is what every other test here gets: the
+// default is /etc/rc/verify.d, which is absent on a test machine.
+func withVerifyDir(dir string) fleetOption {
+	return func(fc *fleetConfig) {
+		fc.worker.VerifyDir = dir
+	}
+}
+
+// withNotifier gives the controller a notifier, so a test can watch the
+// events an operator's webhook would receive. newFleet closes it during
+// teardown, after the worker and scheduler have stopped.
+func withNotifier(n *notify.Notifier) fleetOption {
+	return func(fc *fleetConfig) {
+		fc.server.Notifier = n
+	}
+}
+
+// withControllerURL captures the URL of the httptest controller newFleet
+// stands up. It exists for the one route the client package does not wrap:
+// the admin-only POST /v1/devices/{id}/clear, which verify_test.go calls
+// over the wire (with the harness's "atok" admin token) rather than reaching
+// into the store, so what it proves is the operator-facing recovery path and
+// not a store method no operator can call.
+func withControllerURL(dst *string) fleetOption {
+	return func(fc *fleetConfig) {
+		fc.urlOut = dst
 	}
 }

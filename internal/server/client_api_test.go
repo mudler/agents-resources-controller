@@ -99,6 +99,96 @@ func TestDevicesViewShowsHolderAndHeartbeatAge(t *testing.T) {
 	require.Equal(t, 90, state.Devices[0].HeartbeatAgeSeconds)
 }
 
+// TestDevicesViewComputesOldestLabelAgeFromControllerClock is the
+// dashboard's half of the clock-skew fix: DeviceView.OldestLabelAgeSeconds
+// must be computed by the controller against ITS OWN clock, the same way
+// HeartbeatAgeSeconds already is — internal/server/dashboard/index.html
+// used to compute this one age itself, in the browser, via
+// Date.parse(label.updated_at) against Date.now(), and its own comment
+// documented the resulting exposure to a skewed operator's-machine clock.
+// This advances the fake clock a known amount past a detected label, then
+// pushes a fresh declared one, and asserts the OLDER label's age wins —
+// not the newer one just pushed, and not an average of the two.
+func TestDevicesViewComputesOldestLabelAgeFromControllerClock(t *testing.T) {
+	ts, _, _, c := newServer(t)
+
+	reg := post(t, ts, "wtok", "/v1/workers/register", server.RegisterRequest{
+		Host: "gpubox", Devices: []server.DeviceSpec{{Name: "gpu0"}},
+		Labels: map[string]map[string]string{"gpu0": {"vram": "80G"}},
+	})
+	var regResp server.RegisterResponse
+	require.NoError(t, json.NewDecoder(reg.Body).Decode(&regResp))
+	reg.Body.Close()
+
+	c.Advance(2 * time.Hour) // vram/detected is now 2h old
+
+	post(t, ts, "wtok", "/v1/workers/"+regResp.WorkerID+"/labels", server.LabelsPushRequest{
+		Host: "gpubox", Devices: []string{"gpu0"},
+		DeclaredLabels: map[string]map[string]string{"gpu0": {"owner": "team-a"}},
+	}).Body.Close() // owner/declared is fresh: 0s old
+
+	req, err := http.NewRequest(http.MethodGet, ts.URL+"/v1/state", nil)
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer ctok")
+	got, err := ts.Client().Do(req)
+	require.NoError(t, err)
+	defer got.Body.Close()
+
+	var state server.StateResponse
+	require.NoError(t, json.NewDecoder(got.Body).Decode(&state))
+	require.Len(t, state.Devices, 1)
+	require.NotNil(t, state.Devices[0].OldestLabelAgeSeconds)
+	require.Equal(t, int(2*time.Hour/time.Second), *state.Devices[0].OldestLabelAgeSeconds,
+		"the OLDEST label's age must win, not the freshest one just pushed")
+}
+
+// TestDevicesViewOldestLabelAgeIsNilWithNoLabels: a device with no labels
+// at all has nothing to date, so OldestLabelAgeSeconds must be nil, not a
+// meaningless 0 that would read as "confirmed just now".
+func TestDevicesViewOldestLabelAgeIsNilWithNoLabels(t *testing.T) {
+	ts, _, _, _ := newServer(t)
+	registerWorker(t, ts) // no labels
+
+	req, err := http.NewRequest(http.MethodGet, ts.URL+"/v1/state", nil)
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer ctok")
+	got, err := ts.Client().Do(req)
+	require.NoError(t, err)
+	defer got.Body.Close()
+
+	var state server.StateResponse
+	require.NoError(t, json.NewDecoder(got.Body).Decode(&state))
+	require.Len(t, state.Devices, 1)
+	require.Nil(t, state.Devices[0].OldestLabelAgeSeconds, "a device with no labels has nothing to date")
+}
+
+// TestDevicesViewOldestLabelAgeIsNotClampedForFutureStampedLabel matches
+// this task's "never clamp a future timestamp to 0" rule (see formatAge,
+// internal/cli/describe.go) for the dashboard's own age field: a label
+// stamped ahead of the controller's clock must report a NEGATIVE age, not
+// be floored to 0 and read as perfectly fresh.
+func TestDevicesViewOldestLabelAgeIsNotClampedForFutureStampedLabel(t *testing.T) {
+	ts, st, _, c := newServer(t)
+	registerWorker(t, ts)
+
+	future := c.Now().Add(10 * time.Minute)
+	require.NoError(t, st.ReplaceLabels("gpubox:gpu0", model.SourceDetected,
+		map[string]string{"vram": "80G"}, future))
+
+	req, err := http.NewRequest(http.MethodGet, ts.URL+"/v1/state", nil)
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer ctok")
+	got, err := ts.Client().Do(req)
+	require.NoError(t, err)
+	defer got.Body.Close()
+
+	var state server.StateResponse
+	require.NoError(t, json.NewDecoder(got.Body).Decode(&state))
+	require.Len(t, state.Devices, 1)
+	require.NotNil(t, state.Devices[0].OldestLabelAgeSeconds)
+	require.Equal(t, -10*60, *state.Devices[0].OldestLabelAgeSeconds)
+}
+
 func TestLogStreamDeliversWorkerChunks(t *testing.T) {
 	ts, _, _, _ := newServer(t)
 	registerWorker(t, ts)

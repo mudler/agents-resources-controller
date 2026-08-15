@@ -11,6 +11,7 @@ import (
 
 	"github.com/mudler/agents-resources-controller/internal/clock"
 	"github.com/mudler/agents-resources-controller/internal/logstore"
+	"github.com/mudler/agents-resources-controller/internal/notify"
 	"github.com/mudler/agents-resources-controller/internal/store"
 )
 
@@ -25,6 +26,12 @@ type Config struct {
 	Logs   *logstore.Store
 	Clock  clock.Clock
 	Tokens map[string]string // token -> role: worker | client | admin
+	// Notifier delivers operational events (a tripped watchdog, a failed
+	// verify probe) to whatever sink the operator configured. A nil
+	// Notifier is the supported and default state — no webhook configured —
+	// and needs no special handling anywhere: every notify.Notifier method
+	// is safe on a nil receiver, so emit below simply does nothing.
+	Notifier *notify.Notifier
 }
 
 type Server struct {
@@ -114,6 +121,24 @@ func isAdmin(r *http.Request) bool {
 	role, _ := r.Context().Value(roleContextKey).(string)
 	return role == "admin"
 }
+
+// emit is the single point at which this package announces an operational
+// event, so the "who emits what" mapping can be read off the handlers rather
+// than reconstructed from scattered notifier calls. It never blocks and
+// never fails: notify.Notify drops rather than waits, which is what lets it
+// be called from a request handler without a webhook outage ever becoming a
+// scheduling outage.
+//
+// It is called emit, not notify, because this Server already has a field of
+// that name — the long-poll waker in notify.go, an unrelated mechanism — and
+// a struct cannot carry a field and a method with the same name. Renaming
+// the older one was the alternative; leaving it alone keeps this task's diff
+// to the wiring it is actually about.
+//
+// Event.At is deliberately not stamped here: notify.Notify fills it in when
+// it is zero, and doing it twice would mean two sources of truth for the one
+// field a consumer may sort or dedupe on.
+func (s *Server) emit(e notify.Event) { s.cfg.Notifier.Notify(e) }
 
 // Poke wakes a worker's assignment long-poll immediately. Exported so callers
 // outside this package (the scheduler loop in `rc serve`) can nudge a worker

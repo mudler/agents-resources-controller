@@ -63,6 +63,180 @@ func TestDescribeReturnsLabelsWithBothSourcesAndTimestamps(t *testing.T) {
 	require.WithinDuration(t, stamped, declared.UpdatedAt, time.Second)
 }
 
+// TestDescribeComputesLabelAgeFromControllerClock is the server-side half
+// of the clock-skew fix: it advances the FAKE clock (never sleeps) a known
+// amount past a label's timestamp and asserts LabelAgeSeconds carries
+// exactly that value, keyed by key+"/"+source, for both a detected and a
+// declared label recorded at different moments. Getting this from
+// UpdatedAt/time.Now() on the reader's side is exactly the bug this field
+// exists to remove — this test pins the number the CONTROLLER computes,
+// independent of whatever clock a CLI happened to read it with.
+func TestDescribeComputesLabelAgeFromControllerClock(t *testing.T) {
+	ts, _, _, c := newServer(t)
+
+	reg := post(t, ts, "wtok", "/v1/workers/register", server.RegisterRequest{
+		Host: "gpubox", Devices: []server.DeviceSpec{{Name: "gpu0"}},
+		Labels: map[string]map[string]string{"gpu0": {"vram": "80G"}},
+	})
+	var regResp server.RegisterResponse
+	require.NoError(t, json.NewDecoder(reg.Body).Decode(&regResp))
+	reg.Body.Close()
+
+	c.Advance(10 * time.Minute)
+
+	post(t, ts, "wtok", "/v1/workers/"+regResp.WorkerID+"/labels", server.LabelsPushRequest{
+		Host: "gpubox", Devices: []string{"gpu0"},
+		DeclaredLabels: map[string]map[string]string{"gpu0": {"vram": "40G"}},
+	}).Body.Close()
+
+	// detected/vram is now 25 minutes old, declared/vram is 15 minutes old:
+	// two different, known ages recorded at two different moments.
+	c.Advance(15 * time.Minute)
+
+	resp := get(t, ts, "ctok", "/v1/devices/gpubox:gpu0/describe")
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	var out server.DescribeResponse
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&out))
+
+	require.Equal(t, 25*60, out.LabelAgeSeconds["vram/"+model.SourceDetected],
+		"the detected label's age must be the controller clock's own elapsed time since it was recorded")
+	require.Equal(t, 15*60, out.LabelAgeSeconds["vram/"+model.SourceDeclared],
+		"the declared label's age must reflect its own, later, recording time - not be conflated with the detected one")
+}
+
+// TestDescribeFutureStampedLabelReportsNegativeAge pins the controller-side
+// half of the future-stamped case: a label timestamped ahead of the
+// controller's own clock (a worker with a fast clock) must not be silently
+// floored to zero here. Flooring at the server would already have thrown
+// away the anomaly before the CLI's rendering ever saw it, defeating
+// formatAge's "in the future" warning regardless of how well the CLI
+// renders it.
+func TestDescribeFutureStampedLabelReportsNegativeAge(t *testing.T) {
+	ts, st, _, c := newServer(t)
+
+	post(t, ts, "wtok", "/v1/workers/register", server.RegisterRequest{
+		Host: "gpubox", Devices: []server.DeviceSpec{{Name: "gpu0"}},
+	}).Body.Close()
+
+	// Stamp the label 5 minutes AHEAD of the controller's current clock -
+	// the shape a worker with a fast clock produces.
+	future := c.Now().Add(5 * time.Minute)
+	require.NoError(t, st.ReplaceLabels("gpubox:gpu0", model.SourceDetected,
+		map[string]string{"vram": "80G"}, future))
+
+	resp := get(t, ts, "ctok", "/v1/devices/gpubox:gpu0/describe")
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	var out server.DescribeResponse
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&out))
+
+	require.Equal(t, -5*60, out.LabelAgeSeconds["vram/"+model.SourceDetected],
+		"a label stamped ahead of the controller's clock must report a negative age, not be floored to 0")
+}
+
+// TestDescribeFutureStampedSheetReportsNegativeAge is the sheet-side twin
+// of TestDescribeFutureStampedLabelReportsNegativeAge: FIX 4 closed a real
+// gap where clamping sheetAge at zero on the server survived the full test
+// suite because nothing exercised a future-stamped SHEET at all, only a
+// future-stamped label.
+func TestDescribeFutureStampedSheetReportsNegativeAge(t *testing.T) {
+	ts, st, _, c := newServer(t)
+
+	post(t, ts, "wtok", "/v1/workers/register", server.RegisterRequest{
+		Host: "gpubox", Devices: []server.DeviceSpec{{Name: "gpu0"}},
+	}).Body.Close()
+
+	future := c.Now().Add(10 * time.Minute)
+	require.NoError(t, st.UpsertHostDoc("gpubox", "gpubox:gpu0", "shared rack A1", future))
+
+	resp := get(t, ts, "ctok", "/v1/devices/gpubox:gpu0/describe")
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	var out server.DescribeResponse
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&out))
+
+	require.NotNil(t, out.SheetAgeSeconds)
+	require.Equal(t, -10*60, *out.SheetAgeSeconds,
+		"a sheet stamped ahead of the controller's clock must report a negative age, not be floored to 0")
+}
+
+// TestDescribeLabelAgeKeyDoesNotCollideOnSlashInLabelKey guards the
+// key+"/"+source join DescribeResponse.LabelAgeSeconds uses: a label key
+// comes from a worker's YAML config or a probe script, neither of which
+// constrains its charset, so a key can itself contain "/". This registers
+// one such key ("gpu/pci-slot") alongside a plain one ("vram"), each with
+// both sources and a DIFFERENT, known age, and asserts all four ages land
+// under their own distinct key rather than two of them overwriting each
+// other. store.ReplaceLabels restricts source to exactly "detected" and
+// "declared", NEITHER OF WHICH CONTAINS "/" — which is the necessary and
+// sufficient condition that makes this join collision-free regardless of
+// what the key contains (brute-forced over 599,186 pairs; see
+// DescribeResponse.LabelAgeSeconds's doc comment for the full argument, and
+// TestLabelSourcesNeverContainASlash below for the trip-wire that keeps a
+// future source honoring it).
+func TestDescribeLabelAgeKeyDoesNotCollideOnSlashInLabelKey(t *testing.T) {
+	ts, _, _, c := newServer(t)
+
+	reg := post(t, ts, "wtok", "/v1/workers/register", server.RegisterRequest{
+		Host: "gpubox", Devices: []server.DeviceSpec{{Name: "gpu0"}},
+		Labels:         map[string]map[string]string{"gpu0": {"vram": "80G", "gpu/pci-slot": "0000:01:00.0"}},
+		DeclaredLabels: map[string]map[string]string{"gpu0": {"vram": "40G", "gpu/pci-slot": "slot-1"}},
+	})
+	var regResp server.RegisterResponse
+	require.NoError(t, json.NewDecoder(reg.Body).Decode(&regResp))
+	reg.Body.Close()
+
+	c.Advance(20 * time.Minute)
+
+	// Re-push only the DETECTED labels (DeclaredLabels omitted/nil, which
+	// applyDeviceFacts treats as "no news about that source" and leaves
+	// untouched — see its own doc comment) so detected gets a fresh,
+	// later timestamp while declared keeps its original, older one.
+	post(t, ts, "wtok", "/v1/workers/"+regResp.WorkerID+"/labels", server.LabelsPushRequest{
+		Host: "gpubox", Devices: []string{"gpu0"},
+		Labels: map[string]map[string]string{"gpu0": {"vram": "80G", "gpu/pci-slot": "0000:01:00.0"}},
+	}).Body.Close()
+
+	c.Advance(5 * time.Minute)
+
+	resp := get(t, ts, "ctok", "/v1/devices/gpubox:gpu0/describe")
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	var out server.DescribeResponse
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&out))
+
+	require.Len(t, out.LabelAgeSeconds, 4,
+		"four distinct (key,source) pairs must produce four distinct map entries, none overwritten by another")
+	require.Equal(t, 5*60, out.LabelAgeSeconds["vram/"+model.SourceDetected])
+	require.Equal(t, 25*60, out.LabelAgeSeconds["vram/"+model.SourceDeclared])
+	require.Equal(t, 5*60, out.LabelAgeSeconds["gpu/pci-slot/"+model.SourceDetected])
+	require.Equal(t, 25*60, out.LabelAgeSeconds["gpu/pci-slot/"+model.SourceDeclared])
+}
+
+// TestLabelSourcesNeverContainASlash is the trip-wire for the
+// key+"/"+source join's real invariant: NO label source literal may ever
+// contain "/", regardless of length (equal length, which an earlier
+// version of DescribeResponse.LabelAgeSeconds's own doc comment claimed
+// was what mattered, is irrelevant to collision-safety — see that comment
+// for the corrected argument). This test cannot see a THIRD source added
+// in the future — there is nothing to assert against yet — so it exists
+// purely as a trip-wire on TODAY's two: if either model.SourceDetected or
+// model.SourceDeclared is ever changed to include a "/", this fails
+// immediately, before anyone has to rediscover the collision by hand the
+// way this task's review round did (brute force: a source shaped like
+// "a/declared" produces 585 collisions against realistic keys).
+func TestLabelSourcesNeverContainASlash(t *testing.T) {
+	for _, src := range []string{model.SourceDetected, model.SourceDeclared} {
+		require.NotContains(t, src, "/",
+			"a label source containing '/' can make DescribeResponse.LabelAgeSeconds's key+\"/\"+source join collide, misattributing one label's age to another's key")
+	}
+}
+
 // TestDescribeReturnsSheetAndAge pins the other half of "age is not
 // decoration": a usage sheet last edited long ago must report that real
 // timestamp so a stale sheet is visibly stale, not silently treated as
@@ -90,7 +264,110 @@ func TestDescribeReturnsSheetAndAge(t *testing.T) {
 	require.Equal(t, "gpu0 runs the nightly eval suite", out.Sheet)
 	require.WithinDuration(t, stamped, out.SheetUpdatedAt, time.Second,
 		"the sheet's age must reflect when it was actually written, however long ago")
+	require.NotNil(t, out.SheetAgeSeconds, "a real, non-empty sheet must always carry a computed age")
+	require.Equal(t, int(90*24*time.Hour/time.Second), *out.SheetAgeSeconds,
+		"SheetAgeSeconds must be the controller clock's own elapsed time since the sheet was recorded")
 	require.False(t, out.SheetIsHostWide, "a device's own sheet must not be reported as the host-wide fallback")
+}
+
+// TestDescribeSheetAgeSurvivesRequestTimeNotAffectingIt guards against the
+// server computing SheetAgeSeconds from the HTTP request's own arrival time
+// (e.g. an accidental time.Now() slipped back in): two describe requests
+// issued back to back against the same fake-clock instant must report the
+// identical age, not one that silently ticks with wall-clock time spent
+// between them.
+func TestDescribeSheetAgeSurvivesRequestTimeNotAffectingIt(t *testing.T) {
+	ts, _, _, c := newServer(t)
+
+	post(t, ts, "wtok", "/v1/workers/register", server.RegisterRequest{
+		Host: "gpubox", Devices: []server.DeviceSpec{{Name: "gpu0"}},
+		DeviceSheets: map[string]string{"gpu0": "note"},
+	}).Body.Close()
+	c.Advance(time.Hour)
+
+	first := get(t, ts, "ctok", "/v1/devices/gpubox:gpu0/describe")
+	var out1 server.DescribeResponse
+	require.NoError(t, json.NewDecoder(first.Body).Decode(&out1))
+	first.Body.Close()
+
+	second := get(t, ts, "ctok", "/v1/devices/gpubox:gpu0/describe")
+	var out2 server.DescribeResponse
+	require.NoError(t, json.NewDecoder(second.Body).Decode(&out2))
+	second.Body.Close()
+
+	require.NotNil(t, out1.SheetAgeSeconds)
+	require.NotNil(t, out2.SheetAgeSeconds)
+	require.Equal(t, *out1.SheetAgeSeconds, *out2.SheetAgeSeconds,
+		"the fake clock did not advance between requests, so the reported age must not have changed either")
+	require.Equal(t, int(time.Hour/time.Second), *out1.SheetAgeSeconds)
+}
+
+// TestDescribeSheetAgeIsNilWhenNoSheetExists guards the one case
+// SheetAgeSeconds cannot just be now.Sub(SheetUpdatedAt): when there is no
+// sheet at all, SheetUpdatedAt is the zero time, and a naive subtraction
+// against it would report several decades of "age" rather than the honest
+// "nothing to report an age for" a caller with no sheet to distrust should
+// see. This is the synthetic "nothing was EVER registered, not even an
+// empty sheet" shape (a bare RegisterRequest with no Sheet field at all);
+// see TestDescribeSheetAgeIsNilForRealisticEmptySheet below for the shape a
+// real worker actually produces when it has no host.md.
+func TestDescribeSheetAgeIsNilWhenNoSheetExists(t *testing.T) {
+	ts, _, _, _ := newServer(t)
+	registerWorker(t, ts) // no Sheet, no DeviceSheets
+
+	resp := get(t, ts, "ctok", "/v1/devices/gpubox:gpu0/describe")
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	var out server.DescribeResponse
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&out))
+
+	require.Equal(t, "", out.Sheet)
+	require.True(t, out.SheetUpdatedAt.IsZero())
+	require.Nil(t, out.SheetAgeSeconds,
+		"no sheet means nothing to report an age for, not decades of now.Sub(zero time)")
+}
+
+// TestDescribeSheetAgeIsNilForRealisticEmptySheet is FIX 6's server-side
+// pin: the REALISTIC shape a worker with no host.md produces is NOT "empty
+// body, zero timestamp" — internal/worker/worker.go's sheetPayload sends a
+// non-nil pointer to "" in that case (readSheetFile treats a genuinely
+// missing file as a successful empty read, not an error), so
+// applyDeviceFacts stores a REAL row with a real, non-zero timestamp for
+// the empty host-wide sheet. Gating SheetAgeSeconds on sheetAt.IsZero(), as
+// an earlier version of handleDescribe did, would never protect against
+// this — the single most common real-world "no sheet" shape — because that
+// timestamp is never actually zero here. The gate must be on the body
+// being empty, which it is regardless of the (very real) timestamp
+// attached to recording that emptiness.
+func TestDescribeSheetAgeIsNilForRealisticEmptySheet(t *testing.T) {
+	ts, _, _, c := newServer(t)
+
+	reg := post(t, ts, "wtok", "/v1/workers/register", server.RegisterRequest{
+		Host: "gpubox", Devices: []server.DeviceSpec{{Name: "gpu0"}},
+		// A real worker with no host.md sends a non-nil pointer to "", not
+		// an absent Sheet field. See sheetPayload's own doc comment.
+		Sheet: ptr(""),
+		// Likewise for a device with no host.d/gpu0.md of its own.
+		DeviceSheets: map[string]string{"gpu0": ""},
+	})
+	reg.Body.Close()
+	require.Equal(t, http.StatusOK, reg.StatusCode)
+
+	c.Advance(time.Hour)
+
+	resp := get(t, ts, "ctok", "/v1/devices/gpubox:gpu0/describe")
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	var out server.DescribeResponse
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&out))
+
+	require.Equal(t, "", out.Sheet)
+	require.False(t, out.SheetUpdatedAt.IsZero(),
+		"a real worker's empty-sheet registration leaves a real, non-zero timestamp - this is what makes the naive zero-timestamp gate wrong")
+	require.Nil(t, out.SheetAgeSeconds,
+		"an empty sheet has nothing to report an age for, regardless of the real timestamp attached to it")
 }
 
 // TestDescribeSheetFallsBackToHostWideWhenNoDeviceSheet: a device with no

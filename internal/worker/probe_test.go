@@ -2,8 +2,10 @@ package worker_test
 
 import (
 	"context"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -203,6 +205,469 @@ func TestMalformedDottedKeysAreDropped(t *testing.T) {
 	require.NotContains(t, res.Host, "")
 	require.NotContains(t, res.Host, ".lead")
 	require.NotContains(t, res.Host, "trail.")
+}
+
+// TestBrokenProbeMarksOnlyTheDevicesItSpeaksFor pins the per-source
+// attribution that replaced the pass-wide Failed flag: a drop-in that
+// reported gpu0's facts and then broke leaves gpu0 unconfirmed — preserve,
+// do not clear, unchanged — while gpu1, which that probe never said a word
+// about, stays confirmed and keeps refreshing.
+func TestBrokenProbeMarksOnlyTheDevicesItSpeaksFor(t *testing.T) {
+	dir := t.TempDir()
+	state := t.TempDir()
+	marker := filepath.Join(state, "ran")
+	writeProbe(t, dir, "10-gpu.sh",
+		"if [ -f "+marker+" ]; then echo broken >&2; exit 1; fi\n"+
+			"touch "+marker+"\n"+
+			`echo '{"gpu0.vram":"80G"}'`)
+
+	w := worker.New(worker.Config{
+		ControllerURL: "http://example.invalid", Token: "t", Host: "box",
+		Devices:  []worker.DeviceConfig{{Name: "gpu0"}, {Name: "gpu1"}},
+		ProbeDir: dir,
+	})
+
+	first := w.GatherLabelsForTest(context.Background())
+	require.Equal(t, "80G", first.Device["gpu0"]["vram"], "sanity: the first pass must capture gpu0's fact")
+	require.Empty(t, first.Unconfirmed, "nothing failed on the first pass")
+
+	second := w.GatherLabelsForTest(context.Background())
+	require.True(t, second.Unconfirmed["gpu0"], "the device the broken probe reported last time is unconfirmed")
+	require.False(t, second.Unconfirmed["gpu1"],
+		"gpu1 was never named by the broken probe: freezing it too is the pass-wide behaviour this replaced")
+}
+
+// TestProbeThatNeverSucceededSpeaksForNoDevice is the measured defect at the
+// gatherLabels layer: a drop-in that has never once worked in this process
+// has told this worker nothing about any device, so its failure must not
+// make any device's facts unconfirmed — otherwise a single permanently
+// broken script freezes every host fact on every device of the box forever,
+// which is exactly how disk_free_bytes=72G stayed advertised on a full one.
+func TestProbeThatNeverSucceededSpeaksForNoDevice(t *testing.T) {
+	dir := t.TempDir()
+	writeProbe(t, dir, "50-custom.sh", `echo 'jq: command not found' >&2; exit 127`)
+
+	w := worker.New(worker.Config{
+		ControllerURL: "http://example.invalid", Token: "t", Host: "box",
+		Devices:  []worker.DeviceConfig{{Name: "gpu0"}, {Name: "gpu1"}},
+		ProbeDir: dir,
+	})
+
+	res := w.GatherLabelsForTest(context.Background())
+	require.NotEmpty(t, res.Host, "the built-ins ran and their host facts must be reported")
+	require.Empty(t, res.Unconfirmed,
+		"a probe that has never reported a device fact speaks for no device; its failure must freeze nothing")
+}
+
+// TestPreservationLastsAsLongAsTheOutage is the review-round-1 finding:
+// every other test here stops at the FIRST failing pass, so a scope memory
+// that is consulted but never carried forward would preserve gpu0 once and
+// then, having forgotten what the broken script covers, send gpu0 as a
+// present empty map on the very next pass — ReplaceLabels wipes it, one
+// probe interval late, with the whole suite green. Real outages last many
+// intervals (a driver upgrade, a script broken until someone notices), so
+// preservation is only worth anything if it holds pass after pass.
+func TestPreservationLastsAsLongAsTheOutage(t *testing.T) {
+	dir := t.TempDir()
+	state := t.TempDir()
+	marker := filepath.Join(state, "ran")
+	writeProbe(t, dir, "10-gpu.sh",
+		"if [ -f "+marker+" ]; then echo broken >&2; exit 1; fi\n"+
+			"touch "+marker+"\n"+
+			`echo '{"gpu0.vram":"80G"}'`)
+
+	w := worker.New(worker.Config{
+		ControllerURL: "http://example.invalid", Token: "t", Host: "box",
+		Devices:  []worker.DeviceConfig{{Name: "gpu0"}, {Name: "gpu1"}},
+		ProbeDir: dir,
+	})
+
+	require.Equal(t, "80G", w.GatherLabelsForTest(context.Background()).Device["gpu0"]["vram"],
+		"sanity: the first pass must capture gpu0's fact")
+
+	for pass := 2; pass <= 5; pass++ {
+		res := w.GatherLabelsForTest(context.Background())
+		require.True(t, res.Unconfirmed["gpu0"],
+			"pass %d: gpu0 must still be preserved — the probe that covers it has been failing since pass 2, "+
+				"and an outage lasting longer than one probe interval is the normal case, not the exception", pass)
+		require.False(t, res.Unconfirmed["gpu1"], "pass %d: gpu1 was never covered by that probe", pass)
+	}
+}
+
+// TestHostOnlyProbeSpeaksForNoDeviceEvenAfterSucceeding is the central claim
+// of this fix, stated as a test rather than as prose in a comment: a drop-in
+// that SUCCEEDS and reports only host-scoped keys has named no device, so
+// when it later breaks it must not freeze any. This is the exact shape of
+// the script in the measured defect — disk_free_bytes is a host key — and
+// the case no other test covers: the never-succeeded test has no success
+// history at all, and the end-to-end test's broken script emits a device
+// key.
+func TestHostOnlyProbeSpeaksForNoDeviceEvenAfterSucceeding(t *testing.T) {
+	dir := t.TempDir()
+	state := t.TempDir()
+	marker := filepath.Join(state, "ran")
+	writeProbe(t, dir, "50-custom.sh",
+		"if [ -f "+marker+" ]; then echo broken >&2; exit 1; fi\n"+
+			"touch "+marker+"\n"+
+			`echo '{"rack":"b12","disk_free_bytes":"72000000000"}'`)
+
+	w := worker.New(worker.Config{
+		ControllerURL: "http://example.invalid", Token: "t", Host: "box",
+		Devices:  []worker.DeviceConfig{{Name: "gpu0"}, {Name: "gpu1"}},
+		ProbeDir: dir,
+	})
+
+	first := w.GatherLabelsForTest(context.Background())
+	require.Equal(t, "b12", first.Host["rack"], "sanity: the first pass must capture the host-scoped facts")
+	require.Empty(t, first.Unconfirmed)
+
+	second := w.GatherLabelsForTest(context.Background())
+	require.Empty(t, second.Unconfirmed,
+		"a probe whose successful run named no device speaks for none of them: its failure must freeze nothing, "+
+			"or one broken host-fact script freezes the whole box again")
+	require.NotContains(t, second.Host, "rack",
+		"and its own host facts are gone, not preserved — a label that vanishes fails a selector loudly, "+
+			"a stale one routes a job onto the wrong box")
+}
+
+// TestClearingProbeWarnsOncePerEpisode: when a failing drop-in has no
+// remembered scope, this worker preserves nothing for it and whatever it
+// used to report is cleared. That is the ruling, but it must not happen
+// silently — an operator otherwise sees "probe failed; skipped" on the
+// worker and, quite separately, labels disappearing and submits being
+// rejected, with nothing tying the two together and no notify event for
+// labels. Once per episode, not once per pass: an outage lasts many
+// intervals, and a line per pass is how a log stream stops being read.
+func TestClearingProbeWarnsOncePerEpisode(t *testing.T) {
+	dir := t.TempDir()
+	state := t.TempDir()
+	ok := filepath.Join(state, "ok")
+	writeProbe(t, dir, "50-custom.sh",
+		"if [ -f "+ok+" ]; then echo '{\"rack\":\"b12\"}'; exit 0; fi\n"+
+			"echo broken >&2; exit 1")
+
+	var logs logCapture
+	orig := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(orig) })
+
+	w := worker.New(worker.Config{
+		ControllerURL: "http://example.invalid", Token: "t", Host: "box",
+		Devices:  []worker.DeviceConfig{{Name: "gpu0"}, {Name: "gpu1"}},
+		ProbeDir: dir,
+	})
+
+	const phrase = "cleared rather than preserved"
+	w.GatherLabelsForTest(context.Background())
+	require.Equal(t, 1, strings.Count(logs.String(), phrase),
+		"the first pass of an episode must say that this probe's facts are being cleared, not preserved")
+	require.Contains(t, logs.String(), "50-custom.sh", "the line must name the probe that failed")
+	require.Contains(t, logs.String(), "gpu0", "and the devices the decision affects")
+	require.Contains(t, logs.String(), "gpu1")
+
+	for i := 0; i < 3; i++ {
+		w.GatherLabelsForTest(context.Background())
+	}
+	require.Equal(t, 1, strings.Count(logs.String(), phrase),
+		"the same episode continuing must not re-log every pass")
+
+	// It recovers, then breaks again: a NEW episode gets its own line.
+	require.NoError(t, os.WriteFile(ok, nil, 0o644))
+	w.GatherLabelsForTest(context.Background())
+	require.Equal(t, 1, strings.Count(logs.String(), phrase), "a successful pass logs nothing of its own")
+
+	require.NoError(t, os.Remove(ok))
+	w.GatherLabelsForTest(context.Background())
+	require.Equal(t, 2, strings.Count(logs.String(), phrase),
+		"a new episode after a recovery must warn again rather than stay silent on a stale marker")
+}
+
+// TestReturningProbeWarnsAgainAfterItDisappeared pins the prune that keeps
+// the once-per-episode marker honest. A probe that failed, then vanished
+// from the directory (a package upgrade mid-write, config management
+// removing and re-adding a file), then came back still broken is a NEW
+// episode: the operator watching this stream was never told about this one.
+// Without the prune the marker outlives the script that set it and the
+// second episode passes in silence — the failure mode the marker exists to
+// avoid, inverted.
+func TestReturningProbeWarnsAgainAfterItDisappeared(t *testing.T) {
+	dir := t.TempDir()
+	probe := filepath.Join(dir, "50-custom.sh")
+	broken := []byte("#!/bin/sh\necho broken >&2\nexit 1\n")
+	require.NoError(t, os.WriteFile(probe, broken, 0o755))
+
+	var logs logCapture
+	orig := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(orig) })
+
+	w := worker.New(worker.Config{
+		ControllerURL: "http://example.invalid", Token: "t", Host: "box",
+		Devices:  []worker.DeviceConfig{{Name: "gpu0"}},
+		ProbeDir: dir,
+	})
+
+	const phrase = "cleared rather than preserved"
+	w.GatherLabelsForTest(context.Background())
+	require.Equal(t, 1, strings.Count(logs.String(), phrase), "sanity: the first episode warns once")
+
+	// The script disappears entirely: no source, nothing to warn about, and
+	// nothing left to remember about it either.
+	require.NoError(t, os.Remove(probe))
+	w.GatherLabelsForTest(context.Background())
+	require.Equal(t, 1, strings.Count(logs.String(), phrase), "a directory with no probes in it says nothing")
+
+	// It comes back, still broken. This is an episode the operator has not
+	// been told about.
+	require.NoError(t, os.WriteFile(probe, broken, 0o755))
+	w.GatherLabelsForTest(context.Background())
+	require.Equal(t, 2, strings.Count(logs.String(), phrase),
+		"a probe that disappeared and returned still broken must warn again — a marker left behind by a script "+
+			"that no longer exists silences the very next episode")
+}
+
+// TestBrokenNvidiaSmiNeverWarnsAboutClearing pins the exemption that is
+// otherwise stated only in a comment: the "nothing is preserved for this
+// source" warning belongs to drop-ins, whose scope is known only from
+// history. nvidia-smi's scope is static (nvidiaScopedDevices), so it is
+// never unknown, and routing its failure through the drop-in path would
+// announce a clear that is not happening. This host declares a100-0 and
+// nothing gpu<N>-shaped, which is the shape where such a mis-routing shows
+// up: nvidia-smi's scope here is legitimately EMPTY, and an empty scope is
+// exactly what makes the drop-in path warn.
+func TestBrokenNvidiaSmiNeverWarnsAboutClearing(t *testing.T) {
+	binDir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(binDir, "nvidia-smi"),
+		[]byte("#!/bin/sh\necho 'Failed to initialize NVML: Driver/library version mismatch' >&2\nexit 1\n"), 0o755))
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	var logs logCapture
+	orig := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(orig) })
+
+	w := worker.New(worker.Config{
+		ControllerURL: "http://example.invalid", Token: "t", Host: "box",
+		Devices: []worker.DeviceConfig{{Name: "a100-0"}},
+	})
+
+	res := w.GatherLabelsForTest(context.Background())
+	require.Contains(t, logs.String(), "nvidia-smi",
+		"sanity: this pass must actually have run the broken nvidia-smi, or the assertion below proves nothing")
+	require.Empty(t, res.Unconfirmed, "nvidia-smi could never have labelled a100-0, so it freezes nothing")
+	require.NotContains(t, logs.String(), "cleared rather than preserved",
+		"nvidia-smi's scope is static, never unknown: warning that its facts are being cleared would tell an "+
+			"operator about a clear that is not happening")
+}
+
+// TestUnstatableProbePreservesTheDevicesItSpeaksFor covers the one drop-in
+// failure site the rest of the suite never reaches: a directory entry that
+// exists (ReadDir lists it) but cannot be stat'ed — here a symlink whose
+// target has been removed, the shape a half-finished package upgrade or a
+// pruned build tree leaves behind. It never ran, so what it says about gpu0
+// is unknown, exactly as if it had run and failed.
+func TestUnstatableProbePreservesTheDevicesItSpeaksFor(t *testing.T) {
+	dir := t.TempDir()
+	state := t.TempDir()
+	target := filepath.Join(state, "real-probe.sh")
+	require.NoError(t, os.WriteFile(target, []byte("#!/bin/sh\necho '{\"gpu0.vram\":\"80G\"}'\n"), 0o755))
+	require.NoError(t, os.Symlink(target, filepath.Join(dir, "10-gpu.sh")))
+
+	w := worker.New(worker.Config{
+		ControllerURL: "http://example.invalid", Token: "t", Host: "box",
+		Devices:  []worker.DeviceConfig{{Name: "gpu0"}, {Name: "gpu1"}},
+		ProbeDir: dir,
+	})
+	require.Equal(t, "80G", w.GatherLabelsForTest(context.Background()).Device["gpu0"]["vram"],
+		"sanity: the symlinked probe runs and covers gpu0 while its target exists")
+
+	// The target goes away; the entry in the probe directory stays, now
+	// dangling, so ReadDir still lists it and os.Stat on it fails.
+	require.NoError(t, os.Remove(target))
+
+	res := w.GatherLabelsForTest(context.Background())
+	require.True(t, res.Unconfirmed["gpu0"],
+		"a probe that could not even be stat'ed never ran: the devices it covers must be preserved, not cleared")
+	require.False(t, res.Unconfirmed["gpu1"], "and only the devices it covers")
+}
+
+// TestProbeThatStopsNamingADeviceStopsSpeakingForIt: the memory of which
+// devices a source covers is REPLACED on every successful run, not
+// accumulated. A probe that reported gpu0 once, then ran cleanly and
+// reported nothing (the ordinary "that fact is gone" case, which clears
+// gpu0's labels), no longer speaks for gpu0 — so when it later breaks, gpu0
+// must not be frozen on the strength of a report two passes stale.
+func TestProbeThatStopsNamingADeviceStopsSpeakingForIt(t *testing.T) {
+	dir := t.TempDir()
+	state := t.TempDir()
+	first := filepath.Join(state, "first")
+	second := filepath.Join(state, "second")
+	writeProbe(t, dir, "10-gpu.sh",
+		"if [ -f "+second+" ]; then echo broken >&2; exit 1; fi\n"+
+			"if [ -f "+first+" ]; then touch "+second+"; echo '{}'; exit 0; fi\n"+
+			"touch "+first+"\n"+
+			`echo '{"gpu0.vram":"80G"}'`)
+
+	w := worker.New(worker.Config{
+		ControllerURL: "http://example.invalid", Token: "t", Host: "box",
+		Devices:  []worker.DeviceConfig{{Name: "gpu0"}},
+		ProbeDir: dir,
+	})
+
+	require.Equal(t, "80G", w.GatherLabelsForTest(context.Background()).Device["gpu0"]["vram"], "sanity: pass 1 names gpu0")
+	require.Empty(t, w.GatherLabelsForTest(context.Background()).Unconfirmed, "sanity: pass 2 succeeds, naming nothing")
+
+	third := w.GatherLabelsForTest(context.Background())
+	require.Empty(t, third.Unconfirmed,
+		"the probe's last successful run named no device, so its failure now speaks for none either")
+}
+
+// TestUnreadableProbeDirPreservesTheDevicesItsProbesSpeakFor: a probe
+// directory that cannot be read is every drop-in in it failing at once, not
+// a directory that ran and confirmed there is nothing to report. A `chmod
+// 000 /etc/rc/probe.d` (or a bad umask in config management) must not clear
+// every device's detected labels across the fleet.
+func TestUnreadableProbeDirPreservesTheDevicesItsProbesSpeakFor(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: directory permissions do not deny reads")
+	}
+	dir := t.TempDir()
+	writeProbe(t, dir, "10-gpu.sh", `echo '{"gpu0.vram":"80G"}'`)
+
+	w := worker.New(worker.Config{
+		ControllerURL: "http://example.invalid", Token: "t", Host: "box",
+		Devices:  []worker.DeviceConfig{{Name: "gpu0"}, {Name: "gpu1"}},
+		ProbeDir: dir,
+	})
+	require.Equal(t, "80G", w.GatherLabelsForTest(context.Background()).Device["gpu0"]["vram"], "sanity: pass 1 works")
+
+	require.NoError(t, os.Chmod(dir, 0o000))
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) }) // or TempDir's own cleanup fails
+
+	res := w.GatherLabelsForTest(context.Background())
+	require.NotEmpty(t, res.Host, "the built-ins still ran")
+	require.True(t, res.Unconfirmed["gpu0"], "the probe that speaks for gpu0 never got to run")
+	require.False(t, res.Unconfirmed["gpu1"], "no probe has ever spoken for gpu1")
+}
+
+// TestUnreadableProbeDirDoesNotRecloudASourceThatRanFine: the unreadable
+// directory belongs to the drop-ins in it and to nothing else. nvidia-smi
+// ran perfectly well on this pass, so re-clouding the devices IT covers
+// because a different source could not be reached would be this task's own
+// bug — one source's failure making another source's facts doubtful —
+// reappearing in the branch added to fix a neighbouring hole.
+func TestUnreadableProbeDirDoesNotRecloudASourceThatRanFine(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: directory permissions do not deny reads")
+	}
+	binDir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(binDir, "nvidia-smi"),
+		[]byte("#!/bin/sh\necho \"NVIDIA A100-SXM4-80GB, 81920, 80000, 550.54.15\"\n"), 0o755))
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	dir := t.TempDir()
+	writeProbe(t, dir, "10-other.sh", `echo '{"gpu1.serial":"SN123"}'`)
+
+	w := worker.New(worker.Config{
+		ControllerURL: "http://example.invalid", Token: "t", Host: "box",
+		Devices:  []worker.DeviceConfig{{Name: "gpu0"}, {Name: "gpu1"}},
+		ProbeDir: dir,
+	})
+	first := w.GatherLabelsForTest(context.Background())
+	require.Equal(t, "81920M", first.Device["gpu0"]["vram"], "sanity: nvidia-smi covers gpu0")
+	require.Equal(t, "SN123", first.Device["gpu1"]["serial"], "sanity: the drop-in covers gpu1")
+
+	require.NoError(t, os.Chmod(dir, 0o000))
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+
+	res := w.GatherLabelsForTest(context.Background())
+	require.True(t, res.Unconfirmed["gpu1"], "the drop-in that covers gpu1 never got to run")
+	require.False(t, res.Unconfirmed["gpu0"],
+		"nvidia-smi ran fine this pass and still reports gpu0: an unreadable probe directory says nothing about it")
+	require.Equal(t, "81920M", res.Device["gpu0"]["vram"], "sanity: gpu0's facts are fresh, not stale")
+}
+
+// TestAbsentProbeDirClearsNormally is the complement to the unreadable case,
+// and the reason the two branches differ: a probe directory that is not
+// there is a legitimate, confirmed configuration — this host has no drop-in
+// probes — not a source that failed. Its probes' facts clear the ordinary
+// way, exactly as a probe that stops reporting a key does.
+func TestAbsentProbeDirClearsNormally(t *testing.T) {
+	parent := t.TempDir()
+	dir := filepath.Join(parent, "probe.d")
+	require.NoError(t, os.Mkdir(dir, 0o755))
+	writeProbe(t, dir, "10-gpu.sh", `echo '{"gpu0.vram":"80G"}'`)
+
+	w := worker.New(worker.Config{
+		ControllerURL: "http://example.invalid", Token: "t", Host: "box",
+		Devices:  []worker.DeviceConfig{{Name: "gpu0"}},
+		ProbeDir: dir,
+	})
+	require.Equal(t, "80G", w.GatherLabelsForTest(context.Background()).Device["gpu0"]["vram"], "sanity: pass 1 works")
+
+	require.NoError(t, os.RemoveAll(dir))
+
+	res := w.GatherLabelsForTest(context.Background())
+	require.NotEmpty(t, res.Host, "the built-ins still ran")
+	require.Empty(t, res.Unconfirmed,
+		"a probe directory that does not exist is not a failure: gpu0's facts must clear the ordinary way, "+
+			"or removing probe_dir would freeze every device on the host forever")
+}
+
+// TestBrokenNvidiaSmiPreservesOnlyDevicesItCouldEverLabel pins
+// nvidiaScopedDevices against the naming rule it is derived from: nvidiaLabels
+// emits "gpu<N>.<label>" and classifyKey keeps such a key only for a device
+// declared under that exact name, so nvidia-smi breaking says nothing at all
+// about a device named "a100-0" — it could not have labelled it even when it
+// worked. Freezing that device (as the pass-wide flag did) costs it every
+// host fact for as long as the driver stays broken, for no gain.
+func TestBrokenNvidiaSmiPreservesOnlyDevicesItCouldEverLabel(t *testing.T) {
+	binDir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(binDir, "nvidia-smi"),
+		[]byte("#!/bin/sh\necho 'Failed to initialize NVML: Driver/library version mismatch' >&2\nexit 1\n"), 0o755))
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	w := worker.New(worker.Config{
+		ControllerURL: "http://example.invalid", Token: "t", Host: "box",
+		Devices: []worker.DeviceConfig{{Name: "gpu0"}, {Name: "a100-0"}},
+	})
+
+	res := w.GatherLabelsForTest(context.Background())
+	require.True(t, res.Unconfirmed["gpu0"],
+		"a broken nvidia-smi leaves the gpu<N>-named devices unconfirmed, exactly as before")
+	require.False(t, res.Unconfirmed["a100-0"],
+		"nvidia-smi's keys could never have landed on a device named a100-0, so its failure must not freeze it")
+}
+
+// TestBrokenNvidiaSmiPrefersTheDevicesItActuallyReported: once nvidia-smi has
+// succeeded in this process, the devices it NAMED are better evidence than
+// the devices it could theoretically name. A box declaring gpu0..gpu3 with
+// one card installed must not have gpu1's host facts frozen because
+// nvidia-smi — which has only ever reported gpu0 — broke.
+func TestBrokenNvidiaSmiPrefersTheDevicesItActuallyReported(t *testing.T) {
+	binDir := t.TempDir()
+	state := t.TempDir()
+	marker := filepath.Join(state, "ran")
+	fake := "#!/bin/sh\n" +
+		"if [ -f " + marker + " ]; then echo 'NVML mismatch' >&2; exit 1; fi\n" +
+		"touch " + marker + "\n" +
+		`echo "NVIDIA A100-SXM4-80GB, 81920, 80000, 550.54.15"` + "\n"
+	require.NoError(t, os.WriteFile(filepath.Join(binDir, "nvidia-smi"), []byte(fake), 0o755))
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	w := worker.New(worker.Config{
+		ControllerURL: "http://example.invalid", Token: "t", Host: "box",
+		Devices: []worker.DeviceConfig{{Name: "gpu0"}, {Name: "gpu1"}},
+	})
+
+	first := w.GatherLabelsForTest(context.Background())
+	require.Equal(t, "81920M", first.Device["gpu0"]["vram"], "sanity: the fake nvidia-smi reported one card, gpu0")
+	require.Empty(t, first.Device["gpu1"], "sanity: only one card was listed")
+
+	second := w.GatherLabelsForTest(context.Background())
+	require.True(t, second.Unconfirmed["gpu0"], "gpu0's GPU facts are unconfirmed while nvidia-smi is broken")
+	require.False(t, second.Unconfirmed["gpu1"],
+		"nvidia-smi has never reported a second card, so breaking says nothing about gpu1")
 }
 
 // TestStderrWarningDoesNotLoseStdoutLabels guards the fix for the review

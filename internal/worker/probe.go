@@ -19,36 +19,81 @@ import (
 )
 
 // ProbeResult is what one gatherLabels pass produced: host-wide facts that
-// apply to every device on this host, and facts scoped to one device by
-// name. Both maps are always non-nil, even when nothing was gathered, so a
-// caller never has to nil-check before ranging or indexing.
+// apply to every device on this host, facts scoped to one device by name,
+// and the devices whose own facts this pass could not confirm. All three
+// maps are always non-nil, even when nothing was gathered, so a caller never
+// has to nil-check before ranging or indexing.
 type ProbeResult struct {
 	Host   map[string]string
 	Device map[string]map[string]string
 
-	// Failed reports whether this pass could not confirm at least one
-	// source of device-scoped facts: nvidia-smi found on PATH but erroring,
-	// timing out, or emitting something that doesn't parse; nvidia-smi not
-	// found on PATH THIS pass despite having been found on a PREVIOUS pass
-	// by this same worker process (fix round 3 — see gatherLabels for the
-	// "seen at startup" rule this depends on; a host that has never once
-	// seen nvidia-smi does NOT set Failed for that reason, or a device's
-	// labels could never be cleared on a GPU-less host); or a drop-in probe
-	// erroring. It is false when every configured source genuinely ran (or,
-	// for nvidia-smi, was never present to begin with) and confirmed there
-	// was nothing to report.
+	// Unconfirmed names the devices whose OWN device-scoped facts this pass
+	// could not confirm, because a source understood to speak for that
+	// device failed: nvidia-smi found on PATH but erroring, timing out, or
+	// emitting something that doesn't parse; nvidia-smi not found on PATH
+	// THIS pass despite having been found on this worker process's FIRST
+	// pass (that one snapshot, w.nvidiaSmiSeenAtStartup, is the whole
+	// history kept — see gatherLabels for the "seen at startup" rule this
+	// depends on; a host that has never once seen nvidia-smi does NOT mark
+	// anything unconfirmed for that reason, or a device's labels could never
+	// be cleared on a GPU-less host); or a drop-in probe erroring, being
+	// skipped for budget, or failing to stat.
 	//
 	// This is what lets a caller (see labelsPayload) tell "this device's
-	// probe ran and confirmed there is nothing to report" — which
+	// probes ran and confirmed there is nothing to report" — which
 	// ReplaceLabels must be allowed to turn into a clear, per Task 3's own
-	// design — apart from "something that can produce device facts broke
-	// this pass, so an empty result here proves nothing about the device
-	// itself". A single flag, not a per-device or per-probe map: gatherLabels
-	// has no way to know in advance which device a probe would have named
-	// had it succeeded, so a failure anywhere is treated as inconclusive
-	// for every device that came back empty, not just the one nearest the
-	// failure.
-	Failed bool
+	// design — apart from "something that can produce THIS device's facts
+	// broke this pass, so an empty result here proves nothing about the
+	// device itself".
+	//
+	// It is per DEVICE, not one flag for the whole pass. The pass-wide
+	// `Failed` bool this replaces argued that a single flag was NECESSARY,
+	// because gatherLabels "has no way to know in advance which device a
+	// probe would have named had it succeeded". That premise is right, and
+	// it is still why the attribution below is deliberately conservative —
+	// but the conclusion drawn from it was wrong, and Stage 3's final
+	// review measured the damage:
+	//
+	//   - HOST-scoped facts apply to every device by construction, so one
+	//     source failing cannot make ANOTHER source's host facts doubtful.
+	//     Under the pass-wide flag it did exactly that: with one unrelated
+	//     drop-in broken, disk_free_bytes and mem_total_bytes froze at
+	//     their last good values on every device of the host — facts
+	//     builtinLabels had gathered perfectly well on that same pass —
+	//     because a device omitted from the payload never gets
+	//     ReplaceLabels called on it at all (see labelsPayload here, and
+	//     applyDeviceFacts server-side). A full box kept advertising
+	//     disk_free_bytes=72G, `--select 'disk_free_bytes>=50G'` routed a
+	//     job onto it, and the job died on write.
+	//   - Which devices a source can speak for is not, in fact, wholly
+	//     unknowable. nvidia-smi's keys are "gpu<N>.<label>" by
+	//     construction, so it can only ever name a device this host
+	//     declares under that exact form — see nvidiaScopedDevices. A
+	//     drop-in script is opaque, but its LAST SUCCESSFUL run in THIS
+	//     process is evidence about it: a script that named gpu0 the last
+	//     time it worked is understood to speak for gpu0, and for nothing
+	//     else, until it succeeds again and says otherwise — see
+	//     Worker.probeSourceDevices.
+	//
+	// What has NOT changed is what being unconfirmed then means: preserve,
+	// do not clear. A device named here is omitted from the payload
+	// entirely rather than sent as an empty map, exactly as before, because
+	// wiping a device's facts on a guess is fleet-wide while a stale label
+	// is one device.
+	//
+	// A source this worker process has never once seen succeed speaks for
+	// no device, so its failure marks nothing unconfirmed. That is the
+	// deliberate cost of the fix: a drop-in that reported gpu0's facts for
+	// a PREVIOUS process and is broken by the time this one starts will
+	// have those facts cleared on the first pass, instead of frozen
+	// forever. It is the same trade gatherLabels already makes for
+	// nvidia-smi's "seen at startup" rule (see its comment there, and the
+	// residual it accepts): a process restart is a far narrower window than
+	// every probe interval on every host for the rest of a worker's life,
+	// and registration is already the moment the controller reconciles a
+	// worker's whole world. nvidia-smi itself is exempt — its scope is
+	// static, so it needs no such history (nvidiaScopedDevices again).
+	Unconfirmed map[string]bool
 }
 
 // probePassBudget bounds the WHOLE gatherLabels pass — every built-in call
@@ -77,24 +122,105 @@ var probePassBudget = 30 * time.Second
 //
 // Later probes overwrite earlier keys for the same fact: 20-x.sh wins over
 // 10-x.sh, and drop-in probes win over the built-ins that ran before them.
+//
+// Failure is tracked PER SOURCE, and attributed to the devices that source
+// is understood to speak for — see ProbeResult.Unconfirmed for the full
+// reasoning, and probeSourceDevices for how a drop-in's scope is learned.
+// A source that failed never makes another source's facts doubtful: a host
+// fact gathered successfully this pass reaches every device even when some
+// other probe on the box is broken.
 func (w *Worker) gatherLabels(ctx context.Context) ProbeResult {
 	ctx, cancel := context.WithTimeout(ctx, probePassBudget)
 	defer cancel()
 
 	deviceNames := make(map[string]struct{}, len(w.cfg.Devices))
-	res := ProbeResult{Host: map[string]string{}, Device: map[string]map[string]string{}}
+	res := ProbeResult{
+		Host:        map[string]string{},
+		Device:      map[string]map[string]string{},
+		Unconfirmed: map[string]bool{},
+	}
 	for _, d := range w.cfg.Devices {
 		deviceNames[d.Name] = struct{}{}
 		res.Device[d.Name] = map[string]string{}
 	}
 
+	// sourceDevices is this pass's rebuild of w.probeSourceDevices, swapped
+	// in when the pass ends (including via an early return). Rebuilding
+	// rather than mutating in place is what retires the memory of a source
+	// that is simply GONE — a drop-in deleted, renamed, or chmod -x'd — so
+	// the map cannot grow without bound over a worker's lifetime, and so a
+	// removed probe's facts clear the ordinary way (it did not fail; it is
+	// not configured any more) instead of being preserved forever by a
+	// memory nothing ever cleans up. A source that ran and FAILED carries
+	// its entry forward explicitly, via unconfirm.
+	sourceDevices := make(map[string]map[string]bool, len(w.probeSourceDevices))
+	defer func() {
+		w.probeSourceDevices = sourceDevices
+		// probeSourceClearWarned is pruned against the same rebuild, so a
+		// source that is gone cannot leave a marker behind that silences the
+		// warning if a script of that name ever comes back.
+		for source := range w.probeSourceClearWarned {
+			if _, known := sourceDevices[source]; !known {
+				delete(w.probeSourceClearWarned, source)
+			}
+		}
+	}()
+
+	// merge is called only for a source that actually SUCCEEDED: it folds
+	// that source's facts in and records which devices it named, replacing
+	// whatever it named last time — a probe that stops reporting gpu0 stops
+	// speaking for gpu0.
 	merge := func(source string, facts map[string]string) {
-		mergeProbeFacts(&res, facts, deviceNames, source)
+		sourceDevices[source] = mergeProbeFacts(&res, facts, deviceNames, source)
+		delete(w.probeSourceClearWarned, source) // recovered: a later failure warns again
+	}
+
+	// unconfirm is the failure half: this source could not be confirmed
+	// this pass, so every device it is understood to speak for is
+	// unconfirmed, and its memory of them is carried forward unchanged
+	// (nothing this pass learned anything about it). Carrying it forward is
+	// what makes preservation last as long as the outage does: without it a
+	// device would be preserved on the first failing pass and then, its
+	// scope forgotten, sent as a present empty map on the second — the
+	// clear this whole mechanism exists to prevent, arriving one probe
+	// interval late.
+	unconfirm := func(source string, devices map[string]bool) {
+		sourceDevices[source] = devices
+		for name := range devices {
+			res.Unconfirmed[name] = true
+		}
+	}
+
+	// dropInFailed is unconfirm for a drop-in probe, whose scope — unlike
+	// nvidia-smi's — is known only from what it named the last time it
+	// worked. When there is no such record, this source covers no device and
+	// nothing is preserved for it: whatever it used to report is about to be
+	// cleared. That is the deliberate ruling (see ProbeResult.Unconfirmed),
+	// but it must not be SILENT. Without this line an operator sees "probe
+	// failed; skipped" on the worker and, entirely separately, labels
+	// vanishing and submits being rejected, with nothing connecting the two
+	// but a hunch — and no notify event covers labels. Warned once per
+	// episode, per source, in the same shape labelOmitWarned uses for the
+	// omission warning: an outage lasts many passes and a line per pass
+	// teaches an operator to stop reading the stream.
+	dropInFailed := func(path string) {
+		devices := w.probeSourceDevices[path]
+		unconfirm(path, devices)
+		if len(devices) > 0 || w.probeSourceClearWarned[path] {
+			return
+		}
+		slog.Warn("probe failed and has not succeeded once since this worker started; "+
+			"it is treated as covering no device, so anything it used to report is cleared rather than preserved",
+			"probe", path, "devices", declaredDeviceNames(w.cfg.Devices))
+		w.probeSourceClearWarned[path] = true
 	}
 
 	merge("builtin", builtinLabels())
+
 	nvFacts, nvFound, nvBroken := nvidiaLabels(ctx, w.cfg.ProbeTimeout)
-	merge("nvidia-smi", nvFacts)
+	if nvFound && !nvBroken {
+		merge(nvidiaSource, nvFacts)
+	}
 
 	// nvidiaSmiSeenAtStartup is recorded exactly once, on this worker's
 	// very first probe pass (always inside register(), before probeLoop's
@@ -105,8 +231,8 @@ func (w *Worker) gatherLabels(ctx context.Context) ProbeResult {
 	// round 2 made ANY absence of nvidia-smi a failure, which correctly
 	// closed the fleet-wide-wipe scenario (a driver upgrade removing the
 	// binary) but, measured on a host that has NEVER had nvidia-smi at
-	// all, meant Failed stayed true on literally every pass forever —
-	// which in turn meant a device's detected labels could never be
+	// all, meant the pass reported a failure on literally every pass
+	// forever — which in turn meant a device's detected labels could never be
 	// cleared by ANY means on such a host, not even the ordinary "a
 	// drop-in probe stopped reporting a key" case. Distinguishing "never
 	// present since this worker started" (not a failure — this host
@@ -128,20 +254,43 @@ func (w *Worker) gatherLabels(ctx context.Context) ProbeResult {
 		w.nvidiaSmiSeenAtStartup = nvFound
 	}
 
-	switch {
-	case nvBroken:
-		res.Failed = true
-	case !nvFound && w.nvidiaSmiSeenAtStartup:
-		res.Failed = true
+	// nvidia-smi's scope needs no history: its keys are "gpu<N>.<label>" by
+	// construction, so the devices it could ever speak for are exactly the
+	// ones this host declares under that form. Once it HAS succeeded here,
+	// the devices it actually named are narrower still (a box declaring
+	// gpu0..gpu7 with two cards installed), so prefer that.
+	if nvBroken || (!nvFound && w.nvidiaSmiSeenAtStartup) {
+		scope := w.probeSourceDevices[nvidiaSource]
+		if len(scope) == 0 {
+			scope = nvidiaScopedDevices(deviceNames)
+		}
+		unconfirm(nvidiaSource, scope)
 	}
 
 	entries, err := os.ReadDir(w.cfg.ProbeDir)
 	if err != nil {
-		if !os.IsNotExist(err) {
-			// Anything other than "the directory doesn't exist" (permission
-			// denied, not-a-directory, ...) is worth a line, but still not
-			// fatal: the built-ins above already ran.
-			slog.Warn("read probe dir", "dir", w.cfg.ProbeDir, "err", err)
+		if os.IsNotExist(err) {
+			// No probe directory is a legitimate, confirmed configuration —
+			// this host simply has no drop-in probes — so nothing is
+			// unconfirmed and no drop-in memory survives it.
+			return res
+		}
+		// Anything else (permission denied, not-a-directory, ...) is worth a
+		// line, but still not fatal: the built-ins above already ran. Not one
+		// drop-in got the chance to run, though, so every device any of them
+		// speaks for is unconfirmed — a `chmod 000` on probe.d must not clear
+		// the whole fleet's detected labels the way a directory that ran and
+		// legitimately reported nothing would.
+		slog.Warn("read probe dir", "dir", w.cfg.ProbeDir, "err", err)
+		for source := range w.probeSourceDevices {
+			if _, ran := sourceDevices[source]; ran {
+				// A built-in, already resolved above: nvidia-smi that ran
+				// perfectly well this pass must not be re-clouded by a
+				// failure that belongs to the drop-in directory — that is
+				// this task's own bug class, one branch over.
+				continue
+			}
+			dropInFailed(source)
 		}
 		return res
 	}
@@ -154,15 +303,18 @@ func (w *Worker) gatherLabels(ctx context.Context) ProbeResult {
 	}
 	sort.Strings(names) // execution order is name order, so "20-x" overwrites "10-x"
 
-	for _, name := range names {
+	for i, name := range names {
 		if err := ctx.Err(); err != nil {
 			slog.Warn("probe pass exceeded its budget; remaining probes skipped",
 				"dir", w.cfg.ProbeDir, "budget", probePassBudget)
 			// A probe skipped for budget reasons never ran at all, so
-			// whatever it would have said about any device is simply
-			// unknown — indistinguishable, for labelsPayload's purposes,
-			// from one that ran and failed outright.
-			res.Failed = true
+			// whatever it would have said about the devices it speaks for is
+			// simply unknown — indistinguishable, for labelsPayload's
+			// purposes, from one that ran and failed outright. That goes for
+			// every probe still ahead of this one too, not just this one.
+			for _, skipped := range names[i:] {
+				dropInFailed(filepath.Join(w.cfg.ProbeDir, skipped))
+			}
 			break
 		}
 
@@ -170,7 +322,7 @@ func (w *Worker) gatherLabels(ctx context.Context) ProbeResult {
 		info, err := os.Stat(path)
 		if err != nil {
 			slog.Warn("stat probe; skipped", "probe", path, "err", err)
-			res.Failed = true
+			dropInFailed(path)
 			continue
 		}
 		if info.Mode()&0o111 == 0 {
@@ -180,12 +332,65 @@ func (w *Worker) gatherLabels(ctx context.Context) ProbeResult {
 		facts, err := runProbe(ctx, path, w.cfg.ProbeTimeout)
 		if err != nil {
 			slog.Warn("probe failed; skipped", "probe", path, "err", err)
-			res.Failed = true
+			dropInFailed(path)
 			continue
 		}
 		merge(path, facts)
 	}
 	return res
+}
+
+// declaredDeviceNames lists this host's device names, sorted, for a log line
+// that has to say which devices a decision affects.
+func declaredDeviceNames(devices []DeviceConfig) []string {
+	names := make([]string, 0, len(devices))
+	for _, d := range devices {
+		names = append(names, d.Name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// nvidiaSource names nvidia-smi as a probe source, both in the warning
+// mergeProbeFacts logs and as the key its learned device scope is
+// remembered under.
+const nvidiaSource = "nvidia-smi"
+
+// nvidiaDeviceKeyPrefix is the fixed prefix nvidiaLabels names its
+// device-scoped keys with, followed by nvidia-smi's own device index:
+// "gpu0.vram", "gpu1.model", ... It lives here, shared with
+// nvidiaScopedDevices, so the two cannot drift: the set of devices whose
+// labels are preserved when nvidia-smi breaks is derived from the exact same
+// naming rule that decides which devices it can label in the first place.
+const nvidiaDeviceKeyPrefix = "gpu"
+
+// nvidiaScopedDevices returns every declared device nvidia-smi's facts could
+// ever land on: those named exactly nvidiaDeviceKeyPrefix followed by a
+// non-empty run of digits, since classifyKey only accepts a dotted key whose
+// prefix matches a declared device name verbatim. On a host whose devices
+// are named "a100-0"/"rtx-0", nvidia-smi breaking says nothing whatsoever
+// about them — it could not have labelled them even when it worked — so
+// they keep refreshing normally instead of freezing behind a failure that
+// was never theirs.
+func nvidiaScopedDevices(deviceNames map[string]struct{}) map[string]bool {
+	scope := map[string]bool{}
+	for name := range deviceNames {
+		digits, ok := strings.CutPrefix(name, nvidiaDeviceKeyPrefix)
+		if !ok || digits == "" {
+			continue
+		}
+		allDigits := true
+		for _, r := range digits {
+			if r < '0' || r > '9' {
+				allDigits = false
+				break
+			}
+		}
+		if allDigits {
+			scope[name] = true
+		}
+	}
+	return scope
 }
 
 // keyKind is what mergeProbeFacts decided one probe-emitted key is.
@@ -231,7 +436,14 @@ func classifyKey(key string, deviceNames map[string]struct{}) (kind keyKind, dev
 // every key via classifyKey. source names where these facts came from
 // ("builtin", "nvidia-smi", or a probe's path) purely for the warning
 // logged when a key is dropped.
-func mergeProbeFacts(res *ProbeResult, facts map[string]string, deviceNames map[string]struct{}, source string) {
+//
+// It returns the devices this source actually named — the evidence
+// gatherLabels remembers about which devices this source speaks for, so a
+// later failure of the SAME source is attributed to those devices and to no
+// others. A source that named none returns an empty (never nil) map: it
+// speaks for no device, and its failure freezes nothing.
+func mergeProbeFacts(res *ProbeResult, facts map[string]string, deviceNames map[string]struct{}, source string) map[string]bool {
+	named := map[string]bool{}
 	for k, v := range facts {
 		switch kind, dev, label := classifyKey(k, deviceNames); kind {
 		case keyHost:
@@ -241,10 +453,12 @@ func mergeProbeFacts(res *ProbeResult, facts map[string]string, deviceNames map[
 				res.Device[dev] = map[string]string{}
 			}
 			res.Device[dev][label] = v
+			named[dev] = true
 		default: // keyInvalid
 			slog.Warn("probe key names no known device or is malformed; dropped", "source", source, "key", k)
 		}
 	}
+	return named
 }
 
 // maxProbeOutputBytes bounds how much of a probe's stdout (and, separately,
@@ -475,8 +689,9 @@ func kernelRelease() (string, bool) {
 // true, so a device's stale GPU facts would survive either. Fix round 3
 // measured the fallout on a host that has NEVER had nvidia-smi at all: with
 // found permanently false, gatherLabels' caller had no way to tell that
-// apart from "nvidia-smi vanished after being seen", so ProbeResult.Failed
-// stayed true on EVERY pass forever, and a device's detected labels could
+// apart from "nvidia-smi vanished after being seen", so every pass reported
+// a failure forever (the pass-wide flag that preceded
+// ProbeResult.Unconfirmed), and a device's detected labels could
 // never be cleared by ANY means on such a host — not even the ordinary
 // "a drop-in probe stopped reporting a key" case Task 3 explicitly
 // supports. gatherLabels (its only caller) now resolves the distinction
@@ -500,8 +715,10 @@ func kernelRelease() (string, bool) {
 // closed for every drop-in probe; there is no separate, weaker mechanism
 // for this one built-in.
 //
-// Facts are named "gpu<N>.<label>" where N is nvidia-smi's own device index
-// (its listing order), NOT the configured device name — classifyKey only
+// Facts are named "gpu<N>.<label>" (nvidiaDeviceKeyPrefix + the index; see
+// nvidiaScopedDevices, which derives the devices this source speaks for from
+// that same constant) where N is nvidia-smi's own device index (its listing
+// order), NOT the configured device name — classifyKey only
 // treats a key as device-scoped when its prefix matches a name this host
 // actually declared, so on a host whose devices aren't literally named
 // "gpu0", "gpu1", ... these facts are dropped (with a warning), never
@@ -568,7 +785,7 @@ func nvidiaLabels(ctx context.Context, timeout time.Duration) (facts map[string]
 		vramFree := strings.TrimSpace(fields[2])
 		driver := strings.TrimSpace(fields[3])
 
-		prefix := fmt.Sprintf("gpu%d", i)
+		prefix := fmt.Sprintf("%s%d", nvidiaDeviceKeyPrefix, i)
 		facts[prefix+".vendor"] = "nvidia"
 		facts[prefix+".model"] = model
 		// memory.total and memory.free under --format=nounits are bare MiB

@@ -147,6 +147,30 @@ type Worker struct {
 	// above, only ever touched from the sequential register()/pushLabels()
 	// call chain, never concurrently.
 	labelOmitWarned map[string]bool
+
+	// probeSourceDevices remembers, per probe source (a drop-in's full path,
+	// or nvidiaSource), which devices its most recent SUCCESSFUL run in this
+	// process named. It is how gatherLabels attributes a source's failure to
+	// the devices that source actually speaks for, instead of freezing every
+	// device on the host behind one broken script — see
+	// ProbeResult.Unconfirmed for the ruling and the defect that forced it.
+	//
+	// gatherLabels REBUILDS this map every pass rather than mutating it, so
+	// a source deleted from the probe directory stops being remembered (and
+	// its facts clear the ordinary way), and so a probe directory whose
+	// script names churn cannot grow it without bound. Same concurrency
+	// story as the fields above: only ever touched from the sequential
+	// register()/pushLabels() call chain.
+	probeSourceDevices map[string]map[string]bool
+
+	// probeSourceClearWarned is the once-per-episode marker for the OTHER
+	// half of that ruling: a drop-in that failed while this process has no
+	// record of the devices it covers preserves nothing, so whatever it used
+	// to report is about to be cleared. gatherLabels warns about that once
+	// per source per episode (reset when the source succeeds again, pruned
+	// when it disappears), for the same alert-fatigue reason labelOmitWarned
+	// exists — an outage lasts many passes.
+	probeSourceClearWarned map[string]bool
 }
 
 func New(cfg Config) *Worker {
@@ -174,30 +198,63 @@ func New(cfg Config) *Worker {
 		hooks:           hooks,
 		deviceHooks:     map[string]*deviceHookState{},
 		labelOmitWarned: map[string]bool{},
+
+		probeSourceDevices:     map[string]map[string]bool{},
+		probeSourceClearWarned: map[string]bool{},
 	}
 }
 
 // shutdownGrace bounds how long Start waits, once ctx is cancelled, for jobs
 // already running to actually finish and report before giving up on them. It
-// must comfortably cover Run's own worst case (SIGTERM, up to GraceCeiling —
-// default 10s — then SIGKILL, then up to a couple of seconds for a stubborn
-// process-group straggler: ~12s total) plus the terminal report's retry
-// budget — bounded to ~28s worst case by terminalReportAttemptTimeout, see
-// that constant for the arithmetic — for ~40s total, or a routine shutdown
-// would itself trigger the "abandoned job" path this exists to avoid. That
-// retry budget is only a real bound because each attempt has its own
-// timeout: without terminalReportAttemptTimeout, a blackholed controller
-// (connection accepted, nothing ever comes back) could let a single attempt
-// run for w's full 2-minute http.Client timeout, and five of those blow
-// through this 45s many times over.
+// comfortably covers the ordinary case: Run's own worst case for the job
+// itself (SIGTERM, up to GraceCeiling — default 10s — then SIGKILL, then up
+// to a couple of seconds for a stubborn process-group straggler: ~12s total)
+// plus the terminal report's retry budget — bounded to ~28s worst case by
+// terminalReportAttemptTimeout, see that constant for the arithmetic — is
+// ~40s, already close to this 45s window on its own. That retry budget is
+// only a real bound because each attempt has its own timeout: without
+// terminalReportAttemptTimeout, a blackholed controller (connection
+// accepted, nothing ever comes back) could let a single attempt run for w's
+// full 2-minute http.Client timeout, and five of those blow through this 45s
+// many times over.
 //
-// One path can still exceed it: a job whose acquire hook failed makes two
-// retried calls back to back (its terminal report, then the device fault
-// report), so an unreachable controller costs up to ~56s there. That trade
-// is deliberate — a device the hook has just called unusable must not stay
-// schedulable because we were in a hurry to exit — and it costs a log line,
-// not correctness: the job in question never started, so there is no
-// process to abandon.
+// Two paths can exceed it, and both are worth stating honestly rather than
+// papering over with arithmetic that no longer holds:
+//
+//   - A job whose acquire hook failed makes two retried calls back to back
+//     (its terminal report, then the device fault report), so an
+//     unreachable controller costs up to ~56s there. This predates verify
+//     and is unchanged by it.
+//   - The verify pass (runVerify, called from execute between Run returning
+//     and the terminal report) runs on reportCtx, which is deliberately
+//     immune to shutdown cancellation — see execute's own ordering comment
+//     for why a job ending during shutdown must still be verified before
+//     its device looks free again. That means a hanging verify script is
+//     bounded only by its own VerifyTimeout (default 30s) and
+//     VerifyPassBudget (default 2m), never by shutdownGrace: one hanging
+//     script alone already costs up to VerifyTimeout + GraceCeiling +
+//     stragglerWait (~42s at defaults) before Run gives up on it, and if
+//     verify then fails, reportFault is retried on the SAME ~28s budget as
+//     the terminal report, and runs BEFORE it. Stacked worst case: ~12s
+//     (kill the job) + ~42s (one hanging verify script) + ~28s (fault
+//     report retries) + ~28s (terminal report retries) ≈ 110s — well past
+//     this 45s window.
+//
+// When shutdownGrace wins that race, Start returns anyway, mid-flight retry
+// loops and all. This is not silent data loss about the DEVICE: a device
+// this process no longer controls, verified or not, is exactly what the
+// controller's own worker_lost sweep (grace HeartbeatGrace, default 30s;
+// swept unhealthy after unhealthyAfter, default 5 minutes — see
+// internal/cli/serve.go) and the next registration's reconciliation both
+// exist to catch, so the device still ends up quarantined or reconciled
+// rather than quietly handed out dirty. What IS lost is precision about the
+// JOB: its true exit code and, if verify was mid-pass or never got to run
+// at all, any verify-sourced quarantine reason never reach the controller,
+// and the job itself is reconciled as lost by the same sweep rather than
+// reported with its honest terminal state. This trade — a bounded shutdown
+// for the ordinary case, at the cost of losing JOB-reporting precision (not
+// device safety) in an already-rare pileup of a failed hook or a hanging
+// verify script during the exact moment of shutdown — is deliberate.
 const shutdownGrace = 45 * time.Second
 
 // startupReleaseBudget bounds the whole startup reconciliation pass — every
@@ -605,14 +662,23 @@ func (w *Worker) pushLabels(ctx context.Context) {
 // correct for a device whose probes ran and legitimately found nothing (a
 // card removed), wrong for a device whose probes simply failed to run this
 // pass. Those two cases produce an identical empty per-device map, so the
-// only place left to distinguish them is res.Failed: when nothing capable of
-// producing device-scoped facts failed anywhere this pass, an empty device
-// is trustworthy and is sent as an explicit clear; when something did fail,
-// every device that came back empty is OMITTED from the returned map
-// entirely (its key is simply absent, not present as {}) rather than sent
-// as a clear — see applyDeviceFacts (server-side) for why omission, not an
-// empty map, is what actually protects it: only a present key gets
-// ReplaceLabels called on it at all.
+// only place left to distinguish them is res.Unconfirmed: a device NOT named
+// there had every source that speaks for it run to completion, so an empty
+// result for it is trustworthy and is sent as an explicit clear; a device
+// named there is OMITTED from the returned map entirely (its key is simply
+// absent, not present as {}) rather than sent as a clear — see
+// applyDeviceFacts (server-side) for why omission, not an empty map, is what
+// actually protects it: only a present key gets ReplaceLabels called on it
+// at all.
+//
+// That omission is also why res.Unconfirmed had to stop being one pass-wide
+// bool (Stage 3's ProbeResult.Failed): a device omitted here never gets
+// ReplaceLabels called on it AT ALL, so it stops receiving the host-wide
+// facts under the "" key too — and one broken drop-in anywhere on the box
+// therefore froze disk_free_bytes and mem_total_bytes on every device of
+// that host, while builtinLabels went on gathering them perfectly well every
+// pass. See ProbeResult.Unconfirmed for the whole ruling; the shape of this
+// function is unchanged, it is the attribution feeding it that got narrow.
 //
 // A nil return — meaning "say nothing about detected labels at all" — is
 // reserved for the one case where there is nothing to say about anything:
@@ -654,24 +720,24 @@ func labelsPayload(res ProbeResult, warned map[string]bool) map[string]map[strin
 			delete(warned, name) // recovered with real facts: a future failure logs again
 			continue
 		}
-		if !res.Failed {
-			// Confirmed clean: this device's probes ran (or there simply
-			// were none configured) and nothing failed anywhere this
-			// pass, so an empty result here is trustworthy.
+		if !res.Unconfirmed[name] {
+			// Confirmed clean: every source that speaks for this device
+			// ran (or there simply are none) and none of them failed, so
+			// an empty result here is trustworthy.
 			out[name] = m
 			delete(warned, name) // confirmed empty and cleared normally: same reset
 			continue
 		}
-		// Something that can produce device-scoped facts failed this
-		// pass — nvidia-smi found but broken, or found-then-vanished
-		// after this worker had already seen it present (fix round 3:
-		// NOT "never found at all" — see gatherLabels for why that case
-		// no longer sets Failed) — so this device's empty result proves
+		// A source that speaks for THIS device could not be confirmed this
+		// pass — nvidia-smi found but broken, or found-then-vanished after
+		// this worker had already seen it present (NOT "never found at
+		// all" — see gatherLabels for why that case is no failure), or a
+		// drop-in that reported this device's facts last time it worked and
+		// has now started failing — so this device's empty result proves
 		// nothing about it. Omit it entirely so applyDeviceFacts
-		// (server-side) leaves whatever is already stored for it
-		// untouched.
+		// (server-side) leaves whatever is already stored for it untouched.
 		//
-		// Two limitations accepted alongside this ruling, not overlooked:
+		// Three limitations accepted alongside this ruling, not overlooked:
 		//   - A preserved label never expires on its own. A device that
 		//     genuinely lost its GPU (decommissioned, card pulled) keeps
 		//     advertising it indefinitely until either its probe starts
@@ -679,11 +745,26 @@ func labelsPayload(res ProbeResult, warned map[string]bool) map[string]map[strin
 		//     an operator intervenes by hand. No staleness/TTL mechanism
 		//     is built here — that belongs with the verify-probe work
 		//     planned for the next stage, not invented ad hoc in this fix.
-		//   - Failed is a single pass-wide bool (see ProbeResult.Failed),
-		//     not attributed to any one probe or device, so ONE flaky
-		//     drop-in anywhere on the host freezes every OTHER empty
-		//     device's labels too, not just the one the flaky probe was
-		//     ever meant to cover. Accepted for now.
+		//   - An omitted device is frozen WHOLE: it stops receiving this
+		//     pass's host-wide facts along with the device-scoped ones it
+		//     is being preserved for, because the wire has exactly one
+		//     lever per device (present or absent) and no way to say
+		//     "refresh the host facts, keep the device facts". Narrowing
+		//     the attribution (ProbeResult.Unconfirmed) shrinks how often
+		//     that happens to the devices whose OWN source broke; it does
+		//     not remove it for those devices. Removing it entirely would
+		//     mean either a per-source store server-side or replaying
+		//     cached values as if freshly probed — the second of which
+		//     would refresh every label's updated_at and quietly retire the
+		//     staleness the dashboard shows an operator, which is worse
+		//     than the freeze.
+		//   - A device that gets SOME facts this pass (a second probe still
+		//     reporting gpu0.temp) is sent, not omitted, so the broken
+		//     source's own keys for it are cleared rather than preserved:
+		//     the payload carries one map per device, so anything absent
+		//     from it is a clear. Unchanged from Stage 3, and it is the
+		//     honest reading of a partial report — the alternative would
+		//     drop the facts that DID come back.
 		if !warned[name] {
 			slog.Warn("device's probe source failed or was unavailable this pass; preserving its previously detected labels instead of clearing them",
 				"device", name)
@@ -1029,6 +1110,18 @@ func (w *Worker) execute(ctx context.Context, a assignment) {
 	if res.Err != nil {
 		body["reason"] = res.Err.Error()
 	}
+
+	// A device that fails verification must be quarantined BEFORE the
+	// controller learns the job is over: Release only flips busy -> ready, so
+	// a device already unhealthy stays quarantined when the report lands. The
+	// other order leaves it briefly schedulable while still dirty, which is
+	// the OOM this check exists to prevent.
+	if v := w.runVerify(reportCtx, a.DeviceID, a.JobID, a.Submitter); !v.OK {
+		slog.Error("verify failed; quarantining device",
+			"device", a.DeviceID, "job", a.JobID, "reason", v.Reason)
+		w.reportFault(reportCtx, a.DeviceID, v.Reason)
+	}
+
 	// The terminal report is the call that frees the device's lease: unlike
 	// the "running" report above, dropping it strands the device until the
 	// reaper notices, so it gets retried.

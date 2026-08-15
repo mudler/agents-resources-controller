@@ -14,8 +14,50 @@ probe_dir: /etc/rc/probe.d
 # probe_interval is how often the whole probe pass (built-ins plus every
 # drop-in) re-runs and pushes fresh detected labels. Optional; defaults to
 # 5m. A probe that fails, times out, or emits anything other than that one
-# flat JSON object costs its own labels for that pass, never the worker.
+# flat JSON object costs its own labels for that pass, never the worker —
+# and a probe that FAILS (as opposed to running and reporting nothing)
+# leaves the labels of the devices IT covers preserved rather than cleared,
+# scoped to that source alone: a broken drop-in no longer freezes host-wide
+# facts on devices it has nothing to do with. See README.md.
 probe_interval: 5m
+# verify_dir is where this worker looks for drop-in VERIFY scripts: run in
+# sorted filename order after a job's process tree is gone and BEFORE the
+# terminal report that frees the device, to prove the device is actually
+# clean (VRAM released, no zombie context) before the next job lands on it.
+# Optional; defaults to /etc/rc/verify.d. The feature is off unless that
+# directory exists: no scripts, no pass, no delay.
+#
+# The contract is the opposite of a probe's: the EXIT CODE is the result
+# (zero means clean) and STDERR is the reason an operator reads; stdout is
+# ignored. Any failure quarantines the device with reason `fault` — the one
+# quarantine a proven reboot does NOT clear, so it takes an admin's explicit
+# POST /v1/devices/{id}/clear to put the device back. The job's own state and
+# exit code are untouched: a dirty device says nothing about the run.
+#
+# Each script gets RC_EVENT=verify, RC_DEVICE, RC_JOB_ID, RC_SUBMITTER and
+# CUDA_VISIBLE_DEVICES in its environment, the same way a lifecycle hook
+# does. RC_SUBMITTER is the submitter of the job that just finished — the
+# one whose run left the device in whatever state you are about to inspect —
+# so a script can name them in what it writes to stderr, or page them.
+#
+# A non-executable file (a README alongside the scripts) is skipped, and the
+# skip is logged at WARN: `chmod -x` is the normal way to disable a drop-in,
+# but a git checkout or an rsync without -p drops the exec bit by accident,
+# and a safety check that silently stops running is worse than one that was
+# never there. A file that cannot be stat'd at all — a dangling symlink —
+# FAILS the pass instead: a script that could not run has proven nothing,
+# and "proved nothing" must never be recorded as "verified clean".
+verify_dir: /etc/rc/verify.d
+# verify_timeout bounds any SINGLE verify script; it is killed as a process
+# group and its pass counted as failed if it runs over. Optional; defaults to
+# 30s. Keep it tight: this sits between a job finishing and the next job on
+# the same device starting.
+verify_timeout: 30s
+# verify_pass_budget bounds the WHOLE pass — every script together, not each
+# one's verify_timeout summed. Hitting it fails the pass (an unfinished pass
+# has proven nothing) with a reason naming the budget. Optional; defaults to
+# 2m.
+verify_pass_budget: 2m
 # sheet_dir is where this worker looks for its usage-sheet documentation:
 # <sheet_dir>/host.md (host-wide, shown for every device on this host by rc
 # describe) and, per device, <sheet_dir>/host.d/<device-name>.md. Either file

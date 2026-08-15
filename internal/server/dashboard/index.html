@@ -79,6 +79,30 @@
   #err { color:var(--unhealthy); font-size:12px; }
   #gate { padding:40px 20px; max-width:460px; margin:0 auto; }
   .hide { display:none; }
+  /* Action controls. A kill or a clear is the only thing on this page that
+     changes anything, so both are drawn small and out of the reading path —
+     an operator scanning "who has gpu0" should never hit one by accident —
+     while staying legible in either palette, since every colour here is a
+     token defined in both. */
+  button.mini { padding:4px 10px; font-size:12px; border-radius:6px; }
+  /* A kill aimed at a job this identity did not submit is drawn as an
+     outline, not a solid button: the controller will refuse it
+     (not_job_owner), and the weaker treatment says so before the click
+     rather than after it. The button still exists, because "someone else's
+     job is stuck on the GPU I need" is exactly when an operator goes
+     looking for the kill control, and a refusal that names the submitter is
+     more useful than a control that silently isn't there. */
+  button.foreign { background:transparent; color:var(--muted); border:1px solid var(--line); }
+  .acts { margin-top:10px; }
+  /* #act carries the outcome of the last kill or clear and is deliberately
+     NOT cleared by render(): a 5s poll landing right after a refusal would
+     otherwise wipe "not_job_owner: ..." off the screen before it was read.
+     #err keeps its old meaning — the live connection's own health. */
+  #act { font-size:12px; color:var(--muted); }
+  #act.bad { color:var(--unhealthy); font-weight:600; }
+  #whoBar { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:6px; }
+  #who { min-width:220px; }
+  #whoHint { color:var(--muted); font-size:12px; }
 </style>
 </head>
 <body>
@@ -86,6 +110,7 @@
   <h1>resource controller</h1>
   <div class="hstat">
     <span id="updated"></span>
+    <span id="act"></span>
     <span id="err"></span>
   </div>
 </header>
@@ -100,6 +125,12 @@
 </div>
 
 <main id="app" class="hide">
+  <form id="whoBar">
+    <input id="who" type="text" autocomplete="off" placeholder="you are, e.g. alice@gpubox">
+    <button type="submit">set identity</button>
+    <span id="whoHint"></span>
+  </form>
+
   <h2>devices</h2>
   <div class="grid" id="devices"></div>
 
@@ -112,7 +143,7 @@
 
   <h2>running</h2>
   <div class="wrap"><table id="jobs">
-    <thead><tr><th>job</th><th>device</th><th>state</th><th>submitter</th><th>command</th></tr></thead>
+    <thead><tr><th>job</th><th>device</th><th>state</th><th>submitter</th><th>command</th><th></th></tr></thead>
     <tbody></tbody>
   </table></div>
   <div class="empty hide" id="jobsEmpty">nothing running</div>
@@ -120,10 +151,35 @@
 
 <script>
 (function () {
+  // The whole credential story of this page, in one place.
+  //
+  // token is the CLIENT token: it reads state and kills the operator's own
+  // jobs, and it is the only thing that survives a reload, in sessionStorage
+  // (tab-scoped, gone when the tab closes). Nothing stronger is ever kept.
+  //
+  // The admin token — which clears a device fleet-wide — is never held here
+  // at all: clearDevice() asks for it at the moment of the click, hands it
+  // to exactly one request, and drops it before any callback could capture
+  // it. So the credential resident in this browser is always the weaker of
+  // the two.
+  //
+  // identity is not a credential at all: it is the submitter name a kill is
+  // sent as, the same string `rc kill --as` sends and the same one shown in
+  // the submitter column. It is held in memory only and deliberately NOT
+  // stored beside the token, because the one stored key on this page is the
+  // client token and nothing else (see the dashboard tests). A reload
+  // therefore keeps the connection but forgets who you are, and the kill
+  // controls stay hidden until the identity box is filled in again — a
+  // small price for a page whose storage can be read off its source in one
+  // line. Note what this does and does not buy: the controller checks the
+  // submitter the client claims, so this box is a guard against killing the
+  // wrong job by accident, not an authentication of who is asking.
   var token = sessionStorage.getItem("rc_token") || "";
+  var identity = "";
   var gate = document.getElementById("gate");
   var app = document.getElementById("app");
   var err = document.getElementById("err");
+  var act = document.getElementById("act");
   var updated = document.getElementById("updated");
 
   // pollTimer and es are the two "keep this page live" handles. Both must be
@@ -143,7 +199,105 @@
     start();
   });
 
+  document.getElementById("whoBar").addEventListener("submit", function (e) {
+    e.preventDefault();
+    identity = document.getElementById("who").value.trim();
+    renderWho();
+    refresh(); // redraw the running table so its kill controls follow the
+               // identity that was just set (or cleared)
+  });
+
+  function renderWho() {
+    document.getElementById("whoHint").textContent = identity
+      ? "kill acts as " + identity
+      : "say who you are to enable kill controls";
+  }
+
   function fail(message) { err.textContent = message; }
+
+  // actOK/actFail report the outcome of a kill or a clear. They write to
+  // their own element rather than #err so a poll landing a moment later
+  // cannot wipe the answer off the screen — see the #act CSS comment.
+  function actOK(message) { act.textContent = message; act.className = ""; }
+  function actFail(message) { act.textContent = message; act.className = "bad"; }
+
+  // serverError turns a failed API response into the controller's own
+  // words. "not_job_owner: only the submitter or an admin may kill this
+  // job" and "device_not_cleared: device has a live lease and was not
+  // cleared" each tell an operator what to do next; "kill failed" tells
+  // them nothing. Both strings are server-supplied, so they reach the page
+  // through textContent (actFail) and never as HTML.
+  function serverError(r) {
+    return r.text().then(function (body) {
+      var message = "";
+      try {
+        var parsed = JSON.parse(body);
+        if (parsed && parsed.error) {
+          message = parsed.message ? parsed.error + ": " + parsed.message : parsed.error;
+        }
+      } catch (e) { /* not JSON (a proxy's error page, say): fall through */ }
+      return message || ("HTTP " + r.status);
+    }, function () { return "HTTP " + r.status; });
+  }
+
+  function killJob(job) {
+    var short = job.id.slice(0, 8);
+    var what = "kill job " + short + " on " + job.device_id + "?";
+    if (job.submitter !== identity) {
+      what += "\n\nIt was submitted by " + job.submitter + ", not by " + identity +
+        " — the controller will refuse this unless you hold an admin token.";
+    }
+    if (!window.confirm(what)) return;
+    actOK("killing " + short + "…");
+    fetch("/v1/jobs/" + encodeURIComponent(job.id) + "/kill", {
+      method: "POST",
+      headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" },
+      body: JSON.stringify({ submitter: identity })
+    }).then(function (r) {
+      if (r.ok) {
+        actOK("kill requested for " + short);
+        refresh();
+        return;
+      }
+      return serverError(r).then(actFail);
+    }).catch(function (e) { actFail(e.message); });
+  }
+
+  // clearDevice is the only admin-authenticated call this page makes, and
+  // the only place an admin token ever exists in this tab.
+  //
+  // The token is read from a prompt at the moment of the click, used for one
+  // request, and dropped on the next line — before the response arrives, so
+  // none of the callbacks below can close over a live value. It is never
+  // written to storage of any kind, never returned, and never held on a
+  // variable outside this call. Reloading, or clearing a second device,
+  // asks again; that is the intended cost.
+  function clearDevice(id) {
+    if (!window.confirm("clear " + id + "?\n\nThis returns it to the pool. " +
+        "It only works on an unhealthy device with no live lease, and it needs an admin token.")) {
+      return;
+    }
+    var admin = window.prompt("admin token to clear " + id + " (used for this one request, never stored)");
+    if (admin === null) return; // cancelled at the prompt: nothing sent
+    admin = admin.trim();
+    if (!admin) { actFail("no admin token given; nothing was sent"); return; }
+
+    actOK("clearing " + id + "…");
+    var pending = fetch("/v1/devices/" + encodeURIComponent(id) + "/clear", {
+      method: "POST",
+      headers: { Authorization: "Bearer " + admin }
+    });
+    admin = null; // dropped here, synchronously, while the request is still
+                  // in flight: the callbacks below see null, not a token
+    pending.then(function (r) {
+      if (r.ok) {
+        actOK("cleared " + id);
+        refresh();
+        return;
+      }
+      return serverError(r).then(actFail);
+    }).catch(function (e) { actFail(e.message); });
+  }
 
   // stopLive tears down every timer and connection that keeps the page
   // updating on its own. Called before (re)starting and whenever the token
@@ -157,6 +311,12 @@
   function returnToGate() {
     stopLive();
     sessionStorage.removeItem("rc_token");
+    // The last action's outcome belongs to the session that caused it: a
+    // "cleared gpubox:gpu0" left in the header above a token prompt reads
+    // as the state of a page the operator is no longer connected to. This
+    // is the ONLY place #act is cleared — deliberately not on every poll,
+    // for the reason its CSS comment gives.
+    actOK("");
     gate.classList.remove("hide");
     app.classList.add("hide");
   }
@@ -194,27 +354,23 @@
   // detected label while rendering with the declared chip's outline).
   function isDetectedSource(source) { return source === "detected"; }
 
-  // oldestLabelAgeSeconds finds how long ago the least-recently-confirmed
-  // label on a device was last seen, in seconds, or null if the device has
-  // no labels at all.
+  // oldestLabelAgeSeconds used to find how long ago the least-recently-
+  // confirmed label on a device was last seen by parsing every label's
+  // updated_at with Date.parse and measuring against Date.now() — the ONE
+  // age on this whole page that was not immune to this browser's own
+  // clock, unlike heartbeat_age_seconds and elapsed_seconds, which the
+  // server already reduces to a seconds count before either ever reaches
+  // this page. A browser clock skewed by more than an hour could show a
+  // false staleness warning here, or hide a real one.
   //
-  // Unlike heartbeat_age_seconds and elapsed_seconds — which the server
-  // already reduces to a seconds count before it ever reaches this page, so
-  // they are immune to this browser's own clock — a label only carries an
-  // absolute updated_at timestamp on the wire, so this function measures it
-  // against Date.now(), the same way updateFreshness's "updated Ns ago"
-  // does. A browser clock skewed by more than an hour can therefore show a
-  // false staleness warning here (or hide a real one) without any of the
-  // other ages on this page being affected at all.
-  function oldestLabelAgeSeconds(labels) {
-    if (!labels || !labels.length) return null;
-    var oldest = null;
-    labels.forEach(function (l) {
-      var t = Date.parse(l.updated_at);
-      if (!isNaN(t) && (oldest === null || t < oldest)) oldest = t;
-    });
-    if (oldest === null) return null;
-    return Math.max(0, Math.floor((Date.now() - oldest) / 1000));
+  // It now just reads oldest_label_age_seconds straight off the DeviceView
+  // (v) the server already computed it on — against ITS OWN clock, the
+  // same way heartbeat_age_seconds always has been — so this page carries
+  // no age of its own computation anymore. null when the device has no
+  // labels (the server's own nil for that case, via a JSON field that is
+  // simply absent).
+  function oldestLabelAgeSeconds(v) {
+    return (typeof v.oldest_label_age_seconds === "number") ? v.oldest_label_age_seconds : null;
   }
 
   // renderLabelChips shows every label as a "key=value" chip, detected and
@@ -223,8 +379,11 @@
   // detected one that actually wins rather than being overwritten away.
   // Every value comes from a probe script or an operator's worker.yaml —
   // both untrusted as far as this page is concerned — so each chip's text
-  // is set via textContent, never innerHTML.
-  function renderLabelChips(box, labels) {
+  // is set via textContent, never innerHTML. Takes the whole DeviceView (v)
+  // rather than a bare labels array so it can also read v's own
+  // oldest_label_age_seconds for the staleness warning below.
+  function renderLabelChips(box, v) {
+    var labels = v.device.labels;
     box.textContent = "";
     if (!labels || !labels.length) {
       var none = document.createElement("div");
@@ -247,7 +406,7 @@
     });
     box.appendChild(chips);
 
-    var age = oldestLabelAgeSeconds(labels);
+    var age = oldestLabelAgeSeconds(v);
     if (age !== null && age > 3600) {
       var stale = document.createElement("div");
       stale.className = "labels-stale";
@@ -320,14 +479,39 @@
       }
 
       var labelsBox = document.createElement("div");
-      renderLabelChips(labelsBox, d.labels);
+      renderLabelChips(labelsBox, v);
       card.appendChild(labelsBox);
+
+      // Only an unhealthy device can be cleared — ClearDevice refuses
+      // anything else — so the control appears on exactly those cards. It
+      // is still offered on an unhealthy device that lists a holder, which
+      // is the ghost-lease case an operator most wants to act on: the
+      // controller answers device_not_cleared there, and that refusal
+      // (surfaced verbatim) tells them the lease is the thing to deal with
+      // first.
+      if (d.state === "unhealthy") {
+        var acts = document.createElement("div");
+        acts.className = "acts";
+        var clear = document.createElement("button");
+        clear.className = "mini";
+        clear.type = "button";
+        clear.textContent = "clear";
+        clear.title = "admin only: returns " + d.id + " to the pool";
+        clear.addEventListener("click", function () { clearDevice(d.id); });
+        acts.appendChild(clear);
+        card.appendChild(acts);
+      }
 
       box.appendChild(card);
     });
   }
 
-  function fillTable(id, emptyId, rows, cells) {
+  // fillTable's optional `action` builds a trailing cell's control for a
+  // row (or returns null for none). It is a node factory rather than a
+  // string on purpose: every other cell here goes in through textContent,
+  // and an action column built from markup would be the one place on this
+  // page where a submitter name or a command could arrive as HTML.
+  function fillTable(id, emptyId, rows, cells, action) {
     var body = document.querySelector("#" + id + " tbody");
     body.textContent = "";
     (rows || []).forEach(function (row, i) {
@@ -338,6 +522,12 @@
         td.textContent = text;
         tr.appendChild(td);
       });
+      if (action) {
+        var td = document.createElement("td");
+        var control = action(row);
+        if (control) td.appendChild(control);
+        tr.appendChild(td);
+      }
       body.appendChild(tr);
     });
     var empty = document.getElementById(emptyId);
@@ -359,7 +549,25 @@
     });
     fillTable("jobs", "jobsEmpty", state.jobs, function (j) {
       return [j.id.slice(0, 8), j.device_id, j.state, j.submitter, (j.command || []).join(" ")];
-    });
+    }, killControl);
+  }
+
+  // killControl draws the kill button for one running job. Nothing is
+  // offered until an identity is set, because a kill is sent AS somebody and
+  // there is no honest value to send otherwise: the controller compares it
+  // to the job's submitter. A job this identity did not submit still gets a
+  // button, drawn as .foreign — see that rule's CSS comment.
+  function killControl(job) {
+    if (!identity) return null;
+    var b = document.createElement("button");
+    b.type = "button";
+    b.className = "mini" + (job.submitter === identity ? "" : " foreign");
+    b.textContent = "kill";
+    if (job.submitter !== identity) {
+      b.title = "submitted by " + job.submitter + ": the controller refuses a kill from anyone else";
+    }
+    b.addEventListener("click", function () { killJob(job); });
+    return b;
   }
 
   // updateFreshness renders "updated Ns ago" from the last successful
@@ -413,6 +621,8 @@
                 // not stack a second poller/stream on top of a leftover one
     gate.classList.add("hide");
     app.classList.remove("hide");
+    document.getElementById("who").value = identity;
+    renderWho();
     lastFetchAt = null;
     updateFreshness();
     refresh(); // connectEvents() runs from inside render(), i.e. only once

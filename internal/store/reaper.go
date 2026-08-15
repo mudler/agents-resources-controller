@@ -240,6 +240,104 @@ func (s *Store) Sweep(grace, unhealthyAfter time.Duration) (SweepResult, error) 
 	return res, nil
 }
 
+// QuarantineReasons returns the recorded quarantine reason of each device in
+// ids, keyed by device ID. Only an id with no device row at all is absent
+// from the map; a device that exists but has no reason recorded maps to the
+// empty string, which a caller must read as "cause unknown" — a row written
+// before the column existed carries the same empty string as one written
+// today with nothing to say, and neither is evidence of anything.
+//
+// This exists as a separate, post-commit read rather than as extra fields on
+// SweepResult because Sweep is not to be restructured for it, and because
+// the read genuinely must happen outside Sweep's transaction: the pool is
+// capped at one connection (see store.Open), so a query issued while Sweep's
+// own cursors are open would deadlock. The consequence is that the reason
+// returned here is the CURRENT one, which is a moment later than the one the
+// sweep wrote — another path (a worker self-reporting a fault, a
+// re-registration) may have overwritten it in between. That is the honest
+// answer for a notification anyway: it describes why the device is out of
+// the pool now, not why it was a few milliseconds ago.
+func (s *Store) QuarantineReasons(ids []string) (map[string]string, error) {
+	out := make(map[string]string, len(ids))
+	if len(ids) == 0 {
+		return out, nil
+	}
+	placeholders := make([]string, len(ids))
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	rows, err := s.db.Query(fmt.Sprintf(
+		`SELECT id, quarantine_reason FROM devices WHERE id IN (%s)`,
+		strings.Join(placeholders, ", ")), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var id, reason string
+		if err := rows.Scan(&id, &reason); err != nil {
+			return nil, err
+		}
+		out[id] = reason
+	}
+	return out, rows.Err()
+}
+
+// LeaseDevices maps each id in ids to the device its lease was on. The ids
+// are the ones SweepResult.LeasesExpired reports, which is a job ID when the
+// expired lease had a job and the lease's own ID when it did not (a hold
+// taken with no job behind it), so both columns are matched and both are
+// keyed in the result. An id that matches no lease is absent.
+//
+// It answers for released leases too — deliberately. By the time a sweep
+// returns, the leases it expired are already released, but the row keeps its
+// device_id, which is the only remaining link between an expired lease and
+// the hardware it just took out of the pool.
+//
+// Same discipline as QuarantineReasons: one query, drained to exhaustion,
+// run after Sweep's transaction has committed, never inside one. Ordered by
+// acquisition so that if a job somehow ever held two leases, the newest is
+// the one that wins the key.
+func (s *Store) LeaseDevices(ids []string) (map[string]string, error) {
+	out := make(map[string]string, len(ids))
+	if len(ids) == 0 {
+		return out, nil
+	}
+	placeholders := make([]string, len(ids))
+	args := make([]any, 0, len(ids)*2)
+	for i, id := range ids {
+		placeholders[i] = "?"
+		args = append(args, id)
+	}
+	for _, id := range ids {
+		args = append(args, id)
+	}
+	list := strings.Join(placeholders, ", ")
+	rows, err := s.db.Query(fmt.Sprintf(
+		`SELECT id, job_id, device_id FROM leases
+		 WHERE id IN (%s) OR job_id IN (%s)
+		 ORDER BY acquired_at`, list, list), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var leaseID, jobID, deviceID string
+		if err := rows.Scan(&leaseID, &jobID, &deviceID); err != nil {
+			return nil, err
+		}
+		out[leaseID] = deviceID
+		if jobID != "" {
+			out[jobID] = deviceID
+		}
+	}
+	return out, rows.Err()
+}
+
 // leaseRenewWindow is how far past each heartbeat a live job's lease is
 // pushed forward. It must comfortably outlast both the heartbeat interval
 // and the sweep interval (10s each, see internal/cli/serve.go) — expiry

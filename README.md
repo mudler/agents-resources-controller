@@ -12,20 +12,40 @@ Exclusive device leases, supervised job execution, live log streaming, fleet
 visibility, a queue with priorities, per-device runtime watchdogs, lease
 expiry, boot-identity recovery, server-side cancellation (`rc kill`),
 re-attaching to a running job's output (`rc attach`), a live SSE event
-stream, a read-only web dashboard, lease lifecycle hooks (stop/start a
+stream, a web dashboard that can kill a job and clear an unhealthy device,
+lease lifecycle hooks (stop/start a
 service like LocalAI or ollama around a job's hold on a device), capability
-probes and labels with provenance, selectors (`--select`), per-host usage
+probes and labels with provenance, verify probes that quarantine a device a
+job left dirty, webhook notifications for the six things worth waking up for,
+selectors (`--select`), per-host usage
 sheets and `rc describe`, and `rc hold`/`rc release` for claiming a device
 for a human rather than a job.
+
+**Deliberately out of scope.** These are not "not yet" — they are decisions,
+and nothing below assumes them:
+
+- **No multi-controller replication.** One controller owns allocation, in one
+  SQLite database. That is what makes the lease invariant a single
+  transaction; it also means the controller is a single point of failure, so
+  run it somewhere that stays up and back up `--data`.
+- **No fractional device sharing.** A lease is the whole device. There is no
+  MIG-style partition, no "half a GPU", no memory-quota scheduling.
+- **No shipping code to hosts.** The controller runs the command you give it
+  on a host that already has everything that command needs. It is not a
+  deployment tool and never copies a payload anywhere.
+- **No per-client or per-worker tokens.** `RC_TOKENS` is a small set of
+  shared secrets with three roles; identity (`--as`, the `submitter` field)
+  is a label, not a credential. Read "`rc kill` checks ownership" under
+  "Client" below before you rely on that check for anything.
+- **No TLS.** Bearer tokens cross the wire in the clear and the controller
+  terminates no TLS of its own; put it behind a tunnel, a VPN, or a private
+  network.
 
 **Not built yet**, so you will not find them documented below:
 
 | Not built yet | What you do instead today |
 |---|---|
-| Verify probes between jobs | Nothing checks VRAM was released after a job |
-| Webhook notifications | Poll `rc ps` / `rc devices`, or watch `/v1/events` |
-| Dashboard actions (kill/hold from the browser) | `rc kill` from a terminal; the dashboard is read-only |
-| A `cuda` label from the built-in GPU probe | `nvidia-smi --query-gpu` has no `cuda_version` field (see "Capability probes and labels" below); write a drop-in probe if you need it |
+| A `cuda` label from the built-in GPU probe | `nvidia-smi --query-gpu` has no `cuda_version` field (see "Labels and probes" below); write a drop-in probe if you need it |
 | A controller-side operator annotation layered over a usage sheet | The spec allows one ("the host file wins on conflict"), but it was never built — a usage sheet is exactly what the host's `host.md`/`host.d/*.md` say, full stop; `host_docs` is keyed `(host, device_id)` with no annotation layer on top |
 
 ## Controller
@@ -115,6 +135,8 @@ token: replace-with-worker-token
 # host defaults to the machine's hostname; device IDs become <host>:<name>
 probe_dir: /etc/rc/probe.d      # optional; default shown
 probe_interval: 5m               # optional; default shown
+verify_dir: /etc/rc/verify.d     # optional; default shown — see "Verify probes"
+verify_timeout: 30s              # optional; default shown — per verify script
 sheet_dir: /etc/rc               # optional; default shown — host.md lives here
 devices:
   # Object form: max_runtime is a per-device runtime ceiling the controller
@@ -175,7 +197,26 @@ die and for their terminal report — job state `killed`, reason `cancelled`
 — to reach the controller before the process exits. That ordered shutdown
 exists so the controller learns the job's real outcome and releases the
 device cleanly, not so the job survives; a `systemctl restart` (or any other
-SIGTERM) of `rc worker` during a multi-hour job kills that job. There is no
+SIGTERM) of `rc worker` during a multi-hour job kills that job.
+
+**That 45s is a grace period, not a promise the report always lands.** The
+work it covers is stacked, and each piece is bounded separately: killing the
+job (~12s), then the verify pass — which deliberately runs on a context
+immune to the shutdown, so that a job ending mid-shutdown still gets its
+device checked — costing up to ~42s for one hanging script and another ~28s
+if the resulting fault report has to retry, and only then the terminal
+report's own ~28s budget. Stacked worst case ≈ 110s, well past the 45s
+window, at which point the worker exits with the report undelivered.
+
+What that costs is precision about the JOB, not safety of the DEVICE: the
+job's true exit code (and any verify-sourced reason) never reach the
+controller, and the sweep or the next registration reconciles it as `lost`,
+quarantining its device rather than handing it out dirty. Correct, just not
+tidy — so do not read the 45s as a promise that a terminal report always
+lands. `internal/worker/worker.go`'s `shutdownGrace` comment carries the
+per-stage arithmetic.
+
+There is no
 way to detach a job from a specific worker process and hand it to a
 replacement — the worker that started a job is the one supervising it for
 its entire life.
@@ -289,18 +330,185 @@ registration, and every later probe pass proceed regardless — a wedged
 up or serving jobs.
 
 The one deliberate exception to "a probe that stops reporting a key just
-means that fact is gone": if `nvidia-smi` was present on `PATH` when this
-worker process started and later disappears (a driver upgrade mid-run is
-the canonical case), that device's previously-detected labels are
+means that fact is gone": a source that **fails** — as opposed to running
+and reporting nothing — leaves the labels of the devices it covers
 **preserved** rather than cleared, because wiping them is a fleet-wide
-guess and a stale label is scoped to one device. If `nvidia-smi` was never
-present since this worker started, its absence is not a failure and
-labels clear normally, the same as any other probe that stops reporting.
+guess and a stale label is scoped to one device. `nvidia-smi` present on
+`PATH` when this worker process started and gone now (a driver upgrade
+mid-run is the canonical case) counts as a failure; `nvidia-smi` never
+present since this worker started does not, and those labels clear
+normally, the same as any other probe that stops reporting.
 
-**Probes, like lease lifecycle hooks, run operator-supplied scripts as the
-worker user with no additional sandboxing** — the same blast radius as any
-other script the worker executes on your behalf, so trust `probe_dir`
-exactly as much as you trust `on_acquire`/`on_release`.
+Preservation is scoped to the failing source and to the devices that
+source covers: for `nvidia-smi`, the devices it has reported (or, before
+it has ever reported any, those a `gpu<N>` key could name at all); for a
+drop-in script, the devices it named the last time it ran successfully in
+this worker process. Every other device keeps refreshing, so one broken
+drop-in no longer freezes host-wide facts — `disk_free_bytes`,
+`mem_total_bytes` — on devices it has nothing to do with. A script that
+has not once succeeded since this worker started covers no device, so its
+failure preserves nothing: after a worker restart, a probe that is broken
+from the outset clears what it used to report rather than freezing it
+forever.
+
+A `probe_dir` the worker cannot read at all (a `chmod 000`, a
+not-a-directory) counts as every drop-in failing at once, so every device
+they cover is preserved — but a `probe_dir` that simply **does not exist**
+is a legitimate configuration rather than a failure, so labels there clear
+the ordinary way. Note that this is the opposite call from the one `verify_dir` makes
+for a file it cannot inspect, and deliberately so: a probe that did not run
+costs a label, while a verify script that did not run would otherwise be
+recorded as proof a device is clean.
+
+**Probes and verify scripts, like lease lifecycle hooks, run
+operator-supplied scripts as the worker user with no additional sandboxing**
+— the same blast radius as any other script the worker executes on your
+behalf, so trust `probe_dir` and `verify_dir` exactly as much as you trust
+`on_acquire`/`on_release`.
+
+### Verify probes: proving a device is clean before the next job
+
+A job exiting is not proof the device it held is usable again: a crashed
+trainer can leave VRAM pinned, a driver can wedge, a zombie can keep a
+context open. A **verify probe** is a drop-in script that checks, on the
+host, after the job's process tree is gone — and quarantines the device if
+the answer is no:
+
+```yaml
+verify_dir: /etc/rc/verify.d   # optional; default shown
+verify_timeout: 30s            # optional; default shown — per script
+verify_pass_budget: 2m         # optional; default shown — the whole pass
+```
+
+```sh
+$ cat /etc/rc/verify.d/10-vram-free.sh
+#!/bin/sh
+used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "$CUDA_VISIBLE_DEVICES")
+[ "$used" -lt 512 ] && exit 0
+echo "${used}MiB still allocated on $RC_DEVICE after job $RC_JOB_ID" >&2
+exit 1
+```
+
+**The contract is: the exit code is the result, stderr is the reason.**
+Nothing on stdout is read (unlike a capability probe, whose stdout is its
+whole point). Exit zero means the device is clean. Anything else — a
+non-zero exit, a timeout, a script that could not be run at all — fails the
+pass, and the tail of that script's stderr (200 characters, the END of it —
+shell scripts put their real complaint last) becomes the reason recorded with
+the fault. Where that reason then shows up is its own paragraph below; it is
+not on the device row.
+
+**A failure quarantines the device** via the same
+`POST /v1/devices/{id}/fault` a failed `on_acquire` uses, so it is recorded
+with quarantine reason `fault` — the one reason a proven reboot deliberately
+does **not** clear (see "Device host" above). It takes an admin's explicit
+`POST /v1/devices/{id}/clear`, or the dashboard's `clear` control, to put the
+device back in the pool.
+
+**The verify pass runs BEFORE the job's terminal report, and that ordering is
+the entire point.** The controller frees a device the instant that report
+lands, so verifying afterwards would leave a window — however short — where
+a dirty device is schedulable, which is exactly the OOM this feature exists
+to prevent. The cost of the ordering is that a slow verify pass delays the
+job's terminal report (and therefore the next job on that device) by however
+long it takes; that is what `verify_timeout` and `verify_pass_budget` bound.
+
+**The job's own outcome is untouched.** A verify failure says something about
+the device, not about the run: the job still reports its real state and its
+real exit code.
+
+```
+$ rc run -d demobox:gpu0 -- sh -c 'echo trained-a-model; exit 0'
+rc: job c1f6f2c3-d1f0-41fb-b4e2-87fc249681d9 on demobox:gpu0
+trained-a-model
+$ echo $?
+0
+$ rc devices
+DEVICE        STATE      HOLDER  ELAPSED  COMMAND
+demobox:gpu0  unhealthy  -       -        -
+$ rc run -d demobox:gpu0 --no-wait -- true
+rc: demobox:gpu0 is busy and could not be queued
+```
+
+(That last message is `rc run`'s one wording for "no device available"; the
+device is quarantined, not busy.)
+
+Getting it back is a deliberate act by an admin, after whatever the script
+complained about has actually been dealt with:
+
+```
+$ curl -sS -X POST -H "Authorization: Bearer $RC_ADMIN_TOKEN" \
+    http://rc.internal.example:8080/v1/devices/demobox:gpu0/clear
+$ rc devices
+DEVICE        STATE  HOLDER  ELAPSED  COMMAND
+demobox:gpu0  ready  -       -        -
+```
+
+**Where the reason shows up.** The device row records only the fixed reason
+`fault`, so `rc devices` shows the state and not the story. The script's own
+stderr travels in the worker's log, the controller's log, and — if you have
+one configured — the `verify_failed` webhook event:
+
+```
+worker     ERROR verify failed; quarantining device device=demobox:gpu0
+           job=c1f6f2c3-… reason="verify failed: 10-vram-free.sh: exited 1:
+           72G still allocated on demobox:gpu0 after job c1f6f2c3-…"
+controller WARN  device quarantined: fault device=demobox:gpu0 reason="verify
+           failed: 10-vram-free.sh: exited 1: 72G still allocated…"
+```
+
+The rest of the rules:
+
+- **It is off unless scripts exist.** A `verify_dir` that does not exist runs
+  nothing and costs nothing — no pass, no delay, no quarantine. That is the
+  default state of an unconfigured host.
+- **Every executable in `verify_dir` runs, in sorted filename order**, each
+  in its own process group under `verify_timeout` (killed whole if it runs
+  over), with this environment — the same one a lifecycle hook gets, on top
+  of the worker's own:
+
+  ```
+  RC_EVENT=verify
+  RC_DEVICE=demobox:gpu0
+  RC_JOB_ID=a427c77b-e788-43cb-9e4c-36354552e938
+  RC_SUBMITTER=alice@lab
+  CUDA_VISIBLE_DEVICES=0
+  ```
+
+  `RC_SUBMITTER` is the submitter of the job that just finished — whoever's
+  run left the device in the state you are about to inspect — so a script can
+  name them in the reason it writes to stderr. `CUDA_VISIBLE_DEVICES` is
+  derived from the device name's trailing integer, exactly as a job's is, and
+  is absent for a device name that has none. Treat both as untrusted input
+  for the same reason a hook must (see "Lease lifecycle hooks"): the
+  submitter is free text chosen by whoever submitted the job.
+- **Every script still runs after an earlier one fails**, but only the FIRST
+  failure's reason is kept: one is already enough to quarantine the device.
+- **A non-executable file is skipped**, so a `README` sitting alongside the
+  scripts is harmless and `chmod -x` disables a script the way it does in any
+  other drop-in directory. The skip is **logged at `WARN`** naming the file,
+  because the other way to lose the executable bit is by accident — a git
+  checkout, an `rsync` without `-p` — and a safety check that quietly stops
+  running is worse than one that was never installed:
+
+  ```
+  WARN verify script is not executable; skipped, so whatever it checks is NOT being checked
+       script=/etc/rc/verify.d/10-vram-free.sh mode=-rw-r--r--
+  ```
+
+  A file that cannot even be inspected is a different matter: a
+  dangling symlink, or anything else whose `stat` fails, **fails the pass**.
+  A verify script that could not be run has proven nothing, and "proved
+  nothing" must never be recorded as "verified clean" — the one place this
+  behaves deliberately unlike `probe_dir`, where an unreadable drop-in only
+  costs a label.
+- **`verify_pass_budget` bounds the whole pass**, not each script's own
+  timeout summed, and hitting it fails the pass for the same reason: an
+  unfinished pass proves nothing. The reason then names the budget rather
+  than any one script.
+- Verify scripts run on **every** job's exit — success, failure, watchdog
+  kill, `rc kill`, and the end of a hold alike. There is no "only on
+  failure" mode.
 
 ### Selectors
 
@@ -576,8 +784,8 @@ the one that ran `rc run`) and it actually terminates a *running* job, not
 just a queued one — the controller flags it and the worker SIGTERMs the
 process group, the same path an ordinary shutdown uses.
 
-**But `rc kill` is not a free-for-all: only the job's own submitter, or an
-admin token, may kill it.** The controller checks the `submitter` on the
+**`rc kill` checks ownership: only the job's own submitter, or an admin
+token, may kill it.** The controller checks the `submitter` on the
 kill request against the job's recorded submitter (`defaultSubmitter()`
 embeds `$USER@$HOSTNAME`, plus a session ID when run as an agent) and
 refuses everyone else with 403, even from a perfectly valid client token:
@@ -586,6 +794,16 @@ refuses everyone else with 403, even from a perfectly valid client token:
 $ rc kill 707b485b-8a91-4350-a327-d39df63250b3
 rc: not_job_owner: only the submitter or an admin may kill this job
 ```
+
+> **Submitter ownership is an accident guard, not authentication.** Read the
+> next two paragraphs together: the way past that 403 is to pass `--as` with
+> the other submitter's name, and nothing stops anyone from doing it.
+> Tokens are shared and per-client tokens are an explicit non-goal (see
+> "Deliberately out of scope"), so *anyone holding the client token can claim
+> any identity and kill any job*. What this check actually buys you is that
+> `rc kill <id>` typed against the wrong job ID fails loudly instead of
+> killing a colleague's twelve-hour training run. Treat it as a seatbelt, not
+> a lock, on the dashboard as much as on the command line.
 
 That matters because the identity that submitted a job is very often not the
 operator who later needs to kill it — an agent submitted it under its own
@@ -683,9 +901,106 @@ that a human is sitting there, and leaving means they're done with it.
 alias over `rc kill`: only the hold's own submitter, or an admin token, may
 end it early.
 
+## Event notifications
+
+The controller can POST operational events to a webhook — the things worth
+telling somebody about without them polling `rc devices` all day:
+
+```sh
+rc serve --addr :8080 --data /var/lib/rc --webhook-url https://hooks.example/rc
+# or: RC_WEBHOOK_URL=https://hooks.example/rc rc serve ...   (the flag wins)
+```
+
+With no URL configured, nothing is built and nothing is emitted; that is the
+default. On startup the controller says which endpoint it will use:
+
+```
+INFO event webhook configured url=https://hooks.example/rc
+```
+
+Each event is one `POST` with `Content-Type: application/json` and a flat
+JSON object as the body — one event per request, never a batch:
+
+```json
+{
+  "event": "watchdog_trip",
+  "device": "demobox:gpu0",
+  "job": "b07cc27e-f04c-4600-8dcc-a13f1557a4d2",
+  "reason": "max_runtime exceeded (5s)",
+  "at": "2026-08-15T18:40:34.481158937Z"
+}
+```
+
+`device`, `job` and `reason` are always present as keys and may be empty
+strings when they do not apply (a `job_lost` from a sweep knows the job but
+not the device it was on). `at` is UTC, stamped when the event was raised,
+not when it was delivered.
+
+There are six kinds, and no others:
+
+| `event` | Raised when |
+|---|---|
+| `watchdog_trip` | A job's terminal report names a watchdog: `max_runtime exceeded (…)` or `idle: no output for …`. A job killed by `rc kill` or by a worker shutting down is not one of these, and neither is a hold reaching its `--ttl` (which is the same wall-clock watchdog doing exactly what was asked, and would be the highest-volume event in the set) |
+| `verify_failed` | A verify script failed, quarantining the device. `reason` is the script's own `verify failed: …` text |
+| `device_unhealthy` | A device left the pool for any other reason: a failed `on_acquire` hook, an expired lease, a quarantine a sweep could not attribute to a lost worker. A verify failure is reported as `verify_failed` only — never as both, so a consumer counting devices lost cannot double count |
+| `worker_lost` | A sweep wrote a worker off after `5m` of silence and quarantined its devices |
+| `job_lost` | That same sweep marked the jobs that worker was supervising `lost` |
+| `lease_expired` | A lease lapsed with nobody renewing it. The job is named. Its device is quarantined too, and gets its own `device_unhealthy` — but only when that sweep has not already announced that device, and only while `lease_expired` is still the reason on it: a device already out of the pool for another cause keeps that cause and was announced when it happened |
+
+One receiver's log across an afternoon of things going wrong — a verify
+script finding a dirty GPU, a job running past its ceiling, a worker
+disappearing (which loses its device and its job in the same sweep), and a
+lease nobody renewed:
+
+```json
+{"event":"verify_failed","device":"demobox:gpu0","job":"c1f6f2c3-…","reason":"verify failed: 10-vram-free.sh: exited 1: 72G still allocated on demobox:gpu0 after job c1f6f2c3-…","at":"2026-08-15T18:39:34.099998734Z"}
+{"event":"watchdog_trip","device":"demobox:gpu0","job":"b07cc27e-…","reason":"max_runtime exceeded (5s)","at":"2026-08-15T18:40:34.481158937Z"}
+{"event":"worker_lost","device":"demobox:gpu0","job":"","reason":"worker_lost","at":"2026-08-15T18:46:45.411139980Z"}
+{"event":"job_lost","device":"","job":"ed87e831-…","reason":"worker lost","at":"2026-08-15T18:46:45.411141132Z"}
+{"event":"lease_expired","device":"fakebox:gpu0","job":"c7a211ab-…","reason":"lease expired","at":"2026-08-15T18:53:35.423880246Z"}
+{"event":"device_unhealthy","device":"fakebox:gpu0","job":"","reason":"lease_expired","at":"2026-08-15T18:53:35.423881479Z"}
+```
+
+**What does not produce an event**: a device demoted to `unknown` after 30s
+of silence (the next heartbeat routinely undoes it — this is not an
+incident); a job cancelled, killed, or refused by `--no-wait`; a queue that
+is merely long; and a worker restarting and reconciling its own stranded jobs
+(registration is the worker announcing itself, not the controller
+discovering a loss).
+
+**Delivery is best-effort, and deliberately cheap to lose.** One background
+goroutine drains a queue of 256 events; each is attempted up to 3 times, 1s
+apart and doubling, with each individual POST bounded at 10s. Any non-2xx
+response counts as a failure. Once that budget is spent the event is dropped
+with a log line and the controller moves on.
+
+**A full queue drops rather than blocks — always.** Events are raised from
+request handlers (a worker's fault report, a worker's terminal report) and
+from the reaper's sweep, and neither may ever wait on your webhook. If the queue is full when an
+event is raised, that event is discarded and counted, and the caller
+continues as if nothing happened:
+
+```
+WARN notify: dropped event, queue full event=watchdog_trip device=demobox:gpu0
+```
+
+That is the guarantee to design your receiver around: **an event that does
+not arrive is not a bug you can report**, and an unreachable endpoint costs
+you notifications and nothing else — no stalled job, no stranded device, no
+slowed sweep. Because delivery is serialised through one goroutine, a slow
+endpoint also delays every event behind it, which is why the retry budget is
+small. On shutdown the controller spends up to 5s delivering whatever is
+still queued, then gives up: a notification is never worth holding a
+shutdown open for.
+
+**The webhook carries no authentication of its own.** There is no signature,
+no shared secret, no configurable header — the controller POSTs plain JSON.
+Point it at something on a private network, or put the only secret you have
+in the URL itself, and treat anything arriving there as unauthenticated.
+
 ## Dashboard
 
-The controller serves a read-only web dashboard at `/` — the same address
+The controller serves a web dashboard at `/` — the same address
 `rc serve --addr` binds, no separate process or port. It shows the same
 picture as `rc devices` / `rc ps` in a browser: a card per device (state,
 current holder, elapsed time, and a `stale`/`alert` tint once a worker's
@@ -694,14 +1009,64 @@ queue in priority order, and the currently running jobs. It refreshes on a
 poll plus a live SSE nudge, and shows how long ago its own snapshot was
 last refreshed so a disconnected browser tab does not quietly look current.
 
-**It is read-only.** There is no kill/hold/submit button anywhere on the
-page — the actions that touch a lease or a process still go through `rc
-kill` / `rc run` from a terminal. The page asks for a client token before
-showing anything, and that token is kept in the tab's `sessionStorage`
-only: it is never written to disk, never sent to any other tab or a new
-browser session, and is gone the moment the tab is closed. Reloading the
-page (in the same tab) keeps it; opening the dashboard in a second tab asks
-for the token again.
+The page asks for a client token before showing anything, and that token is
+kept in the tab's `sessionStorage` only: it is never written to disk, never
+sent to any other tab or a new browser session, and is gone the moment the
+tab is closed. Reloading the page (in the same tab) keeps it; opening the
+dashboard in a second tab asks for the token again.
+
+Two kinds of thing on the page change state, and nothing else does. There is
+no submit button and no way to *take* a hold from the browser — starting
+work still goes through `rc run` / `rc hold` from a terminal.
+
+**Kill a running job.** Fill in the identity box ("you are …") with the
+submitter name your jobs run under — the same string `rc run --as` sends and
+the `submitter` column shows — and a `kill` control appears on each running
+job. It sends that identity, and the controller checks it against the job's
+submitter exactly as `rc kill` is checked, so killing someone else's job is
+refused with `not_job_owner` and the page shows that refusal in the
+controller's own words. The control is still offered on a job you did not
+submit (drawn as an outline rather than a filled button, since the
+controller will refuse it) because "someone else's job is stuck on the GPU I
+need" is precisely when an operator goes looking for it, and a refusal
+naming the submitter is more useful than a missing button. The identity is
+not a credential and is not stored: a reload keeps the connection and
+forgets who you are, and the kill controls stay hidden until you say so
+again.
+
+That last point deserves saying plainly rather than being inferred from "not
+a credential": **the identity box is an accident guard, not a login.** Typing
+someone else's submitter name into it is exactly what `rc kill --as` does,
+and the controller cannot tell the difference — see "`rc kill` checks
+ownership" above. Anyone who got far enough to paste a working client token
+can kill any job on the fleet by claiming its submitter's name.
+
+**And that includes ending a hold, which is where "no hold button" stops
+being the whole story.** A hold is a job (`kind: hold`), so it appears in the
+running-jobs table like any other and gets the same `kill` control — and
+killing a hold *is* `rc release`, the same call under a different name.
+You cannot take a hold from the page; you can absolutely end one, subject to
+the same submitter check (the person holding a box is usually the person
+looking at the page, so this is normally the useful direction).
+
+**Clear an unhealthy device.** An `unhealthy` card carries a `clear` control,
+which is the browser equivalent of `POST /v1/devices/{id}/clear` and needs an
+**admin** token. The page does not have one and never keeps one: it asks for
+it in a prompt at the moment you click, uses it for that single request, and
+drops it before the response comes back — never in `sessionStorage`, never in
+`localStorage`, never on a variable that outlives the call. Clearing a second
+device asks again. So the strongest credential ever resident in the browser
+is the client token — which, per the caveat above, is not a small thing to
+leave in a tab, but it cannot return a device to the pool. A clear that the
+controller refuses is refused with `device_not_cleared`, shown verbatim; the
+usual cause is a device that is unhealthy but still holds a live lease, so
+deal with the lease first. (The same message covers a device that simply is
+not `unhealthy` — the wording names the lease either way.)
+
+Both actions confirm before firing, refresh the page's state on success, and
+report the controller's own error text on failure rather than a generic
+"failed" — `not_job_owner` and `device_not_cleared` each tell you what to do
+next.
 
 The one exception to "tokens go in the `Authorization` header, never the
 URL" is `GET /v1/events`, the SSE stream the dashboard uses to know when to
@@ -783,6 +1148,20 @@ from — still requires the header and rejects a query-string token.
   from — see "Device host" above for the full three-way breakdown.
 - Jobs run in their own process group, so a kill takes the whole tree with
   it, including grandchildren that detached from the job's own stdio.
+- A device with verify scripts is proven clean before it goes back in the
+  pool, or it does not go back: the pass runs after the job's process tree is
+  gone and **before** the terminal report that frees the lease, so a failure
+  quarantines the device (`fault`, admin-clearable only) with no window in
+  which anything can be scheduled onto it. Anything that stops a script from
+  running — a timeout, an unstattable file, the pass budget — counts as a
+  failure, never as a pass. The job's own state and exit code are unaffected.
+  See "Verify probes" above.
+- An operational event (a watchdog trip, a verify failure, a device leaving
+  the pool, a lost worker or job, an expired lease) is delivered to a
+  configured webhook on a best-effort basis and never at the expense of the
+  thing that raised it: a full queue drops the event and a dead endpoint is
+  simply given up on. No handler, sweep, or scheduling pass ever waits on a
+  webhook. See "Event notifications" above.
 - A device with an `on_acquire` hook that fails is quarantined `unhealthy`
   by the worker itself, via `POST /v1/devices/{id}/fault` (worker-token
   only) — the same store path `SetDeviceState` uses, recorded with
@@ -809,11 +1188,15 @@ from — still requires the header and rejects a query-string token.
   discarded — `rc describe` shows the conflict rather than hiding it. A
   probe that fails, times out, or emits anything other than one flat JSON
   object costs that probe's labels for that pass, never the worker's
-  ability to come up or keep serving jobs — with one exception: a device
-  whose `nvidia-smi` was present at worker startup and later disappears
-  keeps its previously-detected labels instead of losing them, since
-  wiping them is a fleet-wide guess for what is really a one-device
-  problem. See "Labels and probes" above.
+  ability to come up or keep serving jobs. A probe that *fails*, as opposed
+  to one that runs and reports nothing, leaves labels **preserved** rather
+  than cleared — scoped to the failing source and to the devices that source
+  is understood to cover, not to the whole pass and not to one built-in:
+  `nvidia-smi` covers the devices it has reported (or those a `gpu<N>` key
+  could name at all), a drop-in covers the devices it named the last time it
+  succeeded in this worker process, and every other device on the host keeps
+  refreshing normally. See "Labels and probes" above for the full rule,
+  including what a source that has never once succeeded covers (nothing).
 - A hold is a job (`kind: hold`) whose command a worker chooses for
   itself, never the client — a hold submission carrying a command, `cwd`,
   or `env` is refused outright. `--ttl` is required and is capped by the

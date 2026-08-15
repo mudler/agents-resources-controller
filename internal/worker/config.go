@@ -28,6 +28,30 @@ const (
 	defaultProbeInterval = 5 * time.Minute
 	defaultProbeTimeout  = 5 * time.Second
 
+	// defaultVerifyDir and defaultVerifyTimeout are the documented fallbacks
+	// for the post-job verify pass: where drop-in verify scripts live, and
+	// how long any single script is allowed before it is killed as a
+	// process group and treated as a failure. Applied in withDefaults, same
+	// as every other timeout here, so a zero value can never be read as
+	// "unbounded" — a wedged verify script would otherwise stall the
+	// terminal report indefinitely.
+	defaultVerifyDir     = "/etc/rc/verify.d"
+	defaultVerifyTimeout = 30 * time.Second
+
+	// defaultVerifyPassBudget bounds the WHOLE verify pass — every script in
+	// VerifyDir together, not each one's own VerifyTimeout summed — for
+	// exactly the reason probePassBudget exists for gatherLabels: without
+	// it, N scripts each capped at VerifyTimeout still serialise to
+	// N*VerifyTimeout, and runVerify runs on reportCtx, which is
+	// deliberately immune to Start's own shutdown cancellation (see
+	// execute's ordering comment), so nothing else would ever bound that
+	// total. See runVerify for what happens when it trips: unlike a probe
+	// pass, which simply skips whatever it didn't get to, a verify pass
+	// hitting its budget FAILS — an unfinished verify pass has proven
+	// nothing about the device, and treating it as a pass would silently
+	// recreate the exact fail-open bug a stat error was fixed for.
+	defaultVerifyPassBudget = 2 * time.Minute
+
 	// defaultSheetDir is where readSheets looks for host.md and
 	// host.d/<device>.md when the operator does not set sheet_dir.
 	defaultSheetDir = "/etc/rc"
@@ -57,6 +81,19 @@ type Config struct {
 	// one drop-in executable — before it is killed as a process group and
 	// skipped. Optional; falls back to defaultProbeTimeout.
 	ProbeTimeout time.Duration `yaml:"probe_timeout"`
+	// VerifyDir is where this worker looks for drop-in verify script
+	// executables, run in name order once a job's process tree is
+	// confirmed gone and before the terminal report frees the device.
+	// Optional; falls back to defaultVerifyDir.
+	VerifyDir string `yaml:"verify_dir"`
+	// VerifyTimeout bounds any single verify script before it is killed as
+	// a process group and its exit is treated as a failure. Optional;
+	// falls back to defaultVerifyTimeout.
+	VerifyTimeout time.Duration `yaml:"verify_timeout"`
+	// VerifyPassBudget bounds the WHOLE verify pass — every script in
+	// VerifyDir together — not each script's own VerifyTimeout summed.
+	// Optional; falls back to defaultVerifyPassBudget.
+	VerifyPassBudget time.Duration `yaml:"verify_pass_budget"`
 	// SheetDir is where this worker looks for its usage-sheet documentation:
 	// <SheetDir>/host.md and <SheetDir>/host.d/<device>.md. Optional; falls
 	// back to defaultSheetDir.
@@ -161,6 +198,15 @@ func (c Config) withDefaults() Config {
 	}
 	if c.ProbeTimeout <= 0 {
 		c.ProbeTimeout = defaultProbeTimeout
+	}
+	if c.VerifyDir == "" {
+		c.VerifyDir = defaultVerifyDir
+	}
+	if c.VerifyTimeout <= 0 {
+		c.VerifyTimeout = defaultVerifyTimeout
+	}
+	if c.VerifyPassBudget <= 0 {
+		c.VerifyPassBudget = defaultVerifyPassBudget
 	}
 	if c.SheetDir == "" {
 		c.SheetDir = defaultSheetDir
