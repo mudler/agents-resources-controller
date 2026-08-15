@@ -170,21 +170,25 @@ func newFleet(t *testing.T, deviceMaxRuntime time.Duration, opts ...fleetOption)
 
 	registerCtx, cancelRegister := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancelRegister()
+	declared := fc.worker.Devices[0].Labels
 	require.Eventually(t, func() bool {
 		state, err := cl.State(registerCtx)
-		return err == nil && len(state.Devices) == 1 && hasDetectedCPUs(state.Devices[0].Device)
+		return err == nil && len(state.Devices) == 1 &&
+			registrationLanded(state.Devices[0].Device, declared)
 	}, 15*time.Second, 100*time.Millisecond,
-		"worker never finished registering its device (no detected cpus label ever landed)")
+		"worker never finished registering its device (detected cpus and every declared label must land)")
 
 	return cl, st, fleetHost + ":" + fleetDevice
 }
 
-// hasDetectedCPUs reports whether a device carries the detected "cpus" label,
-// which is what newFleet (and TestWorkerRestartQuarantinesDeviceInsteadOfFalselyReady,
-// which gates itself the same way) waits for instead of the mere existence of
-// a device row.
+// registrationLanded reports whether every store write a registration makes
+// that a client can actually SEE has landed for this device: the detected
+// "cpus" label, plus each of the declared labels this fleet was configured
+// with (withLabels). It is what newFleet — and
+// TestWorkerRestartQuarantinesDeviceInsteadOfFalselyReady, which gates itself
+// the same way — waits for instead of the mere existence of a device row.
 //
-// Why this and not "one device exists": handleRegister
+// Why not "one device exists": handleRegister
 // (internal/server/worker_api.go) does four things in order inside ONE
 // handler — UpsertWorker creates the device rows, SetDeviceMaxRuntime writes
 // each device's runtime ceiling, applyDeviceFacts writes labels and sheets,
@@ -200,22 +204,54 @@ func newFleet(t *testing.T, deviceMaxRuntime time.Duration, opts ...fleetOption)
 // sleep inserted after UpsertWorker returns and before the two writes that
 // follow it turned the two into 5/10 and 7/10 failures respectively.
 //
-// The "cpus" label is the right thing to wait on because it is written by the
-// LAST store call the handler makes: builtinLabels (internal/worker/probe.go)
-// emits it unconditionally from runtime.NumCPU, so it is never absent for
-// environmental reasons the way mem_total_bytes or a GPU fact can be, and it
-// is HOST-scoped, so applyDeviceFacts' host-then-device merge puts it on every
-// device. Observing it therefore proves SetDeviceMaxRuntime landed too, which
-// is what closes the watchdog exposure with the same wait.
+// Waiting for the detected "cpus" label alone was NOT enough, and the first
+// version of this helper said otherwise. applyDeviceFacts is itself three
+// writes per device, in this order: detected labels, THEN declared labels,
+// THEN that device's usage sheet. So "cpus" goes true after the first of the
+// three, and withLabels — which sets DECLARED labels — lands after it. Proven
+// with the same stall technique, 300ms between the detected and the declared
+// write: TestSelectorMatchingNoDeviceIsRejectedAtSubmit failed 3/3 with "the
+// device's declared vendor label never reached the controller".
 //
-// It proves only that the FIRST registration completed. ProbeInterval
-// defaults to 5 minutes (internal/worker/config.go), so a worker's periodic
-// label push cannot collide with anything inside a test today — but a test
-// that shortened that interval would make direct label injection racy again,
-// and this wait would not save it.
-func hasDetectedCPUs(d model.Device) bool {
+// "cpus" is still the right detected fact to wait on: builtinLabels
+// (internal/worker/probe.go) emits it unconditionally from runtime.NumCPU, so
+// it is never absent for environmental reasons the way mem_total_bytes or a
+// GPU fact can be, and it is HOST-scoped, so applyDeviceFacts' host-then-device
+// merge puts it on every device. Observing it also proves SetDeviceMaxRuntime
+// landed, which is what closes the watchdog exposure with the same wait.
+//
+// The one write this cannot observe is the LAST one: the per-device usage
+// sheet. A worker sends an explicit, empty sheet for a device with no
+// host.d/<name>.md (see readSheets), and an empty sheet is invisible through
+// the API — handleDescribe falls back to the host-wide note on an empty body
+// and reports no age at all. So the residual is exactly one store call,
+// writing an empty host_docs row that nothing in this package reads. A test
+// that starts asserting on usage sheets must extend this gate rather than
+// assume it already covers them.
+//
+// All of this proves only that the FIRST registration completed.
+// ProbeInterval defaults to 5 minutes (internal/worker/config.go), so a
+// worker's periodic label push cannot collide with anything inside a test
+// today — but a test that shortened that interval would make direct label
+// injection racy again, and this wait would not save it.
+func registrationLanded(d model.Device, declared map[string]string) bool {
+	if !hasLabel(d, "cpus", model.SourceDetected, "") {
+		return false
+	}
+	for k, v := range declared {
+		if !hasLabel(d, k, model.SourceDeclared, v) {
+			return false
+		}
+	}
+	return true
+}
+
+// hasLabel reports whether d carries key from source. An empty want matches
+// any value; a non-empty one must match exactly, so a declared label is only
+// counted once the value the fleet configured is the value stored.
+func hasLabel(d model.Device, key, source, want string) bool {
 	for _, l := range d.Labels {
-		if l.Key == "cpus" && l.Source == model.SourceDetected {
+		if l.Key == key && l.Source == source && (want == "" || l.Value == want) {
 			return true
 		}
 	}

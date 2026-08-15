@@ -163,10 +163,13 @@ func TestWorkerRestartQuarantinesDeviceInsteadOfFalselyReady(t *testing.T) {
 	// The same registration gate newFleet uses, and for the same reason: a
 	// device row exists after the FIRST of handleRegister's four store
 	// writes, so waiting on the row alone lets this test body race the rest
-	// of that handler. See hasDetectedCPUs in harness_test.go.
+	// of that handler. See registrationLanded in harness_test.go. This
+	// worker declares no labels of its own, so there is nothing to pass as
+	// the declared set.
 	require.Eventually(t, func() bool {
 		state, err := cl.State(ctx)
-		return err == nil && len(state.Devices) == 1 && hasDetectedCPUs(state.Devices[0].Device)
+		return err == nil && len(state.Devices) == 1 &&
+			registrationLanded(state.Devices[0].Device, nil)
 	}, 15*time.Second, 100*time.Millisecond,
 		"worker never finished registering its device (no detected cpus label ever landed)")
 

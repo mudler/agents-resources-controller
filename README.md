@@ -197,7 +197,26 @@ die and for their terminal report — job state `killed`, reason `cancelled`
 — to reach the controller before the process exits. That ordered shutdown
 exists so the controller learns the job's real outcome and releases the
 device cleanly, not so the job survives; a `systemctl restart` (or any other
-SIGTERM) of `rc worker` during a multi-hour job kills that job. There is no
+SIGTERM) of `rc worker` during a multi-hour job kills that job.
+
+**That 45s is a grace period, not a promise the report always lands.** The
+work it covers is stacked, and each piece is bounded separately: killing the
+job (~12s), then the verify pass — which deliberately runs on a context
+immune to the shutdown, so that a job ending mid-shutdown still gets its
+device checked — costing up to ~42s for one hanging script and another ~28s
+if the resulting fault report has to retry, and only then the terminal
+report's own ~28s budget. Stacked worst case ≈ 110s, well past the 45s
+window, at which point the worker exits with the report undelivered.
+
+What that costs is precision about the JOB, not safety of the DEVICE: the
+job's true exit code (and any verify-sourced reason) never reach the
+controller, and the sweep or the next registration reconciles it as `lost`,
+quarantining its device rather than handing it out dirty. Correct, just not
+tidy — so do not read the 45s as a promise that a terminal report always
+lands. `internal/worker/worker.go`'s `shutdownGrace` comment carries the
+per-stage arithmetic.
+
+There is no
 way to detach a job from a specific worker process and hand it to a
 replacement — the worker that started a job is the one supervising it for
 its entire life.
@@ -926,7 +945,7 @@ There are six kinds, and no others:
 | `device_unhealthy` | A device left the pool for any other reason: a failed `on_acquire` hook, an expired lease, a quarantine a sweep could not attribute to a lost worker. A verify failure is reported as `verify_failed` only — never as both, so a consumer counting devices lost cannot double count |
 | `worker_lost` | A sweep wrote a worker off after `5m` of silence and quarantined its devices |
 | `job_lost` | That same sweep marked the jobs that worker was supervising `lost` |
-| `lease_expired` | A lease lapsed with nobody renewing it. The job is named; its device is quarantined and separately announced |
+| `lease_expired` | A lease lapsed with nobody renewing it. The job is named. Its device is quarantined too, and gets its own `device_unhealthy` — but only when that sweep has not already announced that device, and only while `lease_expired` is still the reason on it: a device already out of the pool for another cause keeps that cause and was announced when it happened |
 
 One receiver's log across an afternoon of things going wrong — a verify
 script finding a dirty GPU, a job running past its ceiling, a worker
@@ -956,8 +975,8 @@ response counts as a failure. Once that budget is spent the event is dropped
 with a log line and the controller moves on.
 
 **A full queue drops rather than blocks — always.** Events are raised from
-HTTP handlers, from the reaper's sweep, and from the scheduling path, and
-none of them may ever wait on your webhook. If the queue is full when an
+request handlers (a worker's fault report, a worker's terminal report) and
+from the reaper's sweep, and neither may ever wait on your webhook. If the queue is full when an
 event is raised, that event is discarded and counted, and the caller
 continues as if nothing happened:
 
@@ -1169,11 +1188,15 @@ from — still requires the header and rejects a query-string token.
   discarded — `rc describe` shows the conflict rather than hiding it. A
   probe that fails, times out, or emits anything other than one flat JSON
   object costs that probe's labels for that pass, never the worker's
-  ability to come up or keep serving jobs — with one exception: a device
-  whose `nvidia-smi` was present at worker startup and later disappears
-  keeps its previously-detected labels instead of losing them, since
-  wiping them is a fleet-wide guess for what is really a one-device
-  problem. See "Labels and probes" above.
+  ability to come up or keep serving jobs. A probe that *fails*, as opposed
+  to one that runs and reports nothing, leaves labels **preserved** rather
+  than cleared — scoped to the failing source and to the devices that source
+  is understood to cover, not to the whole pass and not to one built-in:
+  `nvidia-smi` covers the devices it has reported (or those a `gpu<N>` key
+  could name at all), a drop-in covers the devices it named the last time it
+  succeeded in this worker process, and every other device on the host keeps
+  refreshing normally. See "Labels and probes" above for the full rule,
+  including what a source that has never once succeeded covers (nothing).
 - A hold is a job (`kind: hold`) whose command a worker chooses for
   itself, never the client — a hold submission carrying a command, `cwd`,
   or `env` is refused outright. `--ttl` is required and is capped by the

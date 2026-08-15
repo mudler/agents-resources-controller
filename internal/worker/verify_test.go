@@ -125,6 +125,37 @@ func TestVerifyPassesWhenTheDirectoryDoesNotExist(t *testing.T) {
 	require.True(t, res.OK)
 }
 
+// TestVerifyFailsWhenTheDirectoryCannotBeRead is the directory-level twin of
+// the per-file stat test below, and exists because the two were NOT treated
+// alike: an absent directory (the feature is off) and an unreadable one (the
+// feature is configured and could not run) both returned OK, so a single
+// `chmod 000` on verify.d silently disabled verification while recording
+// every device as verified clean — with no fault, and therefore no event, to
+// tell anyone.
+//
+// A device with no scripts at all is a device nobody promised anything
+// about. A device whose scripts exist and could not be listed is a device
+// somebody promised something about and nothing checked, which is the
+// failure this whole feature exists to prevent, one level up from the file.
+func TestVerifyFailsWhenTheDirectoryCannotBeRead(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions, so this case cannot be staged")
+	}
+	dir := t.TempDir()
+	writeVerify(t, dir, "10-vram.sh", `exit 0`)
+	require.NoError(t, os.Chmod(dir, 0o000))
+	// Restored so t.TempDir's own cleanup can remove it.
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+
+	res := newVerifyWorker(t, dir).RunVerifyForTest(context.Background(), "box:gpu0", "job1", "agent-a")
+	require.False(t, res.OK,
+		"an unreadable verify_dir must never be reported as a clean device: nothing ran, so nothing was proven")
+	require.True(t, strings.HasPrefix(res.Reason, "verify failed: "),
+		"the reason must carry the same prefix every other verify failure does, or the controller "+
+			"reports it as a plain device_unhealthy instead of verify_failed")
+	require.Contains(t, res.Reason, "permission denied", "the reason must say what actually went wrong")
+}
+
 func TestVerifyScriptSeesTheDeviceAndJob(t *testing.T) {
 	dir := t.TempDir()
 	writeVerify(t, dir, "10-env.sh",

@@ -28,8 +28,16 @@ type VerifyResult struct {
 	// Reason is empty when OK. Otherwise it always starts with
 	// verifyReasonPrefix, followed by the first failing script's name and
 	// the tail of its stderr — everything an operator needs to see WHY a
-	// device was quarantined from `rc ps`/`rc devices`, and everything a
-	// later task needs to recognise this fault as verify-sourced.
+	// device was quarantined, and everything the controller needs to
+	// recognise this fault as verify-sourced (it keys the verify_failed
+	// event off that prefix).
+	//
+	// Where an operator reads it: the worker's log, the controller's log,
+	// and the verify_failed webhook event. NOT `rc ps` or `rc devices` —
+	// the device row stores only the fixed quarantine reason `fault`, and a
+	// verify failure leaves the job itself succeeded, so no job failure
+	// report carries this either. Keep it short for a log line and an event
+	// payload, not for a table cell.
 	Reason string
 }
 
@@ -84,10 +92,23 @@ func (w *Worker) runVerify(ctx context.Context, deviceID, jobID, submitter strin
 
 	entries, err := os.ReadDir(w.cfg.VerifyDir)
 	if err != nil {
-		if !os.IsNotExist(err) {
-			slog.Warn("read verify dir", "dir", w.cfg.VerifyDir, "err", err)
+		if os.IsNotExist(err) {
+			// The feature is simply off on this host: no directory, no
+			// scripts, nothing claimed and nothing to prove. This is the
+			// ONLY ReadDir error that may pass.
+			return VerifyResult{OK: true}
 		}
-		return VerifyResult{OK: true}
+		// Everything else — EACCES after a permissions change, ENOTDIR
+		// because the path was replaced by a file — is the directory-level
+		// twin of the per-file stat branch below, and fails for exactly the
+		// same reason: OK=true is read as "this device is clean", and a
+		// directory that could not be listed proves nothing whatsoever about
+		// the device. Returning OK here disabled verification fleet-wide
+		// with a single `chmod 000`, silently marking every device verified
+		// while emitting no event at all — the operator's webhook, built for
+		// precisely this, would have said nothing.
+		slog.Error("read verify dir; failing the pass", "dir", w.cfg.VerifyDir, "err", err)
+		return VerifyResult{OK: false, Reason: verifyReasonPrefix + "read verify_dir: " + err.Error()}
 	}
 
 	names := make([]string, 0, len(entries))
@@ -214,10 +235,11 @@ func verifyFailureDetail(res Result) string {
 }
 
 // maxVerifyStderrTail bounds how much of a failing verify script's stderr is
-// folded into Reason. Reason is read by an operator from `rc ps`/`rc
-// devices`, not a log file, so it stays short; the script's full stderr
-// (still capped separately, at maxProbeOutputBytes, by the boundedBuffer
-// Run writes into) is not the point here.
+// folded into Reason. Reason travels as one log line and one webhook event
+// field (see VerifyResult.Reason for why it reaches neither `rc ps` nor `rc
+// devices`), so it stays short; the script's full stderr — still capped
+// separately, at maxProbeOutputBytes, by the boundedBuffer Run writes into —
+// is not the point here.
 const maxVerifyStderrTail = 200
 
 // verifyStderrTail renders the TAIL of a failing verify script's stderr —

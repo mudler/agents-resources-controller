@@ -14,7 +14,11 @@ probe_dir: /etc/rc/probe.d
 # probe_interval is how often the whole probe pass (built-ins plus every
 # drop-in) re-runs and pushes fresh detected labels. Optional; defaults to
 # 5m. A probe that fails, times out, or emits anything other than that one
-# flat JSON object costs its own labels for that pass, never the worker.
+# flat JSON object costs its own labels for that pass, never the worker —
+# and a probe that FAILS (as opposed to running and reporting nothing)
+# leaves the labels of the devices IT covers preserved rather than cleared,
+# scoped to that source alone: a broken drop-in no longer freezes host-wide
+# facts on devices it has nothing to do with. See README.md.
 probe_interval: 5m
 # verify_dir is where this worker looks for drop-in VERIFY scripts: run in
 # sorted filename order after a job's process tree is gone and BEFORE the

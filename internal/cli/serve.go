@@ -260,9 +260,15 @@ func NewServeCmd() *cobra.Command {
 
 	cmd.Flags().StringVar(&addr, "addr", ":8080", "listen address")
 	cmd.Flags().StringVar(&dataDir, "data", "/var/lib/rc", "state directory")
+	// The six kinds are listed in full, and in the same order the README's
+	// table uses: an operator deciding whether to wire this up should not
+	// have to discover from the README that the two most specific kinds —
+	// the ones a verify script and a lapsed lease produce — exist at all.
+	// notify.Kind's constants are the source of truth; if a seventh is ever
+	// added, this string and the README table are what must follow it.
 	cmd.Flags().StringVar(&webhookURL, "webhook-url", "",
-		"POST operational events (watchdog trips, unhealthy devices, lost workers and jobs) "+
-			"to this URL as JSON; defaults to $RC_WEBHOOK_URL")
+		"POST operational events to this URL as JSON: watchdog_trip, verify_failed, "+
+			"device_unhealthy, worker_lost, job_lost, lease_expired; defaults to $RC_WEBHOOK_URL")
 	return cmd
 }
 

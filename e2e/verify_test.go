@@ -16,6 +16,7 @@ import (
 
 	"github.com/mudler/agents-resources-controller/internal/client"
 	"github.com/mudler/agents-resources-controller/internal/model"
+	"github.com/mudler/agents-resources-controller/internal/notify"
 	"github.com/stretchr/testify/require"
 )
 
@@ -77,8 +78,23 @@ func TestVerifyFailureQuarantinesTheDeviceThenAPassingScriptReturnsIt(t *testing
 			"exit 0\n"), 0o700))
 	require.NoError(t, os.WriteFile(dirty, nil, 0o600))
 
+	// A real webhook on the other end, because nothing else in the suite
+	// drives verify_failed all the way out of the controller. The kind is
+	// chosen by matching the worker's "verify failed: " prefix against the
+	// controller's copy of that same literal (Ruling C) — two constants in
+	// two packages that are each unit-pinned separately, so renaming EITHER
+	// alone silently demotes every verify failure to a plain
+	// device_unhealthy and no test in ./e2e notices. This one does: it costs
+	// one httptest server and no extra jobs, since the event lands during
+	// the quarantine this test already waits for.
+	rec := newWebhookRecorder(t)
+	defer rec.Close()
+	notifier := notify.New(notify.NewWebhook(rec.URL(), nil),
+		notify.Options{QueueSize: 16, Attempts: 1})
+
 	var controllerURL string
-	cl, _, device := newFleet(t, 0, withVerifyDir(verifyDir), withControllerURL(&controllerURL))
+	cl, _, device := newFleet(t, 0,
+		withVerifyDir(verifyDir), withControllerURL(&controllerURL), withNotifier(notifier))
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
@@ -113,6 +129,28 @@ func TestVerifyFailureQuarantinesTheDeviceThenAPassingScriptReturnsIt(t *testing
 		"the device must already be quarantined when the job's terminal report lands, "+
 			"never briefly ready with a dirty GPU in the pool")
 	require.Empty(t, state.Devices[0].Holder, "the finished job must not still hold the device")
+
+	// (2b) And the operator hears about it as a VERIFY failure specifically,
+	// naming the device, the job whose run left it dirty, and the script's
+	// own words — not as a generic device_unhealthy, which is what a broken
+	// prefix on either side would produce.
+	var ev notify.Event
+	require.Eventually(t, func() bool {
+		for _, e := range rec.events() {
+			if e.Kind == notify.KindVerifyFailed {
+				ev = e
+				return true
+			}
+		}
+		return false
+	}, 30*time.Second, 100*time.Millisecond,
+		"no verify_failed event reached the webhook (received: %v)", rec.kinds())
+	require.Equal(t, device, ev.Device)
+	require.Equal(t, job.ID, ev.Job,
+		"the event must name the job whose run left the device dirty")
+	require.Contains(t, ev.Reason, "10-vram-free.sh", "the event must name the failing script")
+	require.Contains(t, ev.Reason, "72G still allocated",
+		"the event must carry the script's own stderr, which is the only place that text survives")
 
 	// (3) Nothing can claim it. NoWait, because a quarantined device is never
 	// free: even opting out of the queue must fail rather than park a job

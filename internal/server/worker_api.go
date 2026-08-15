@@ -150,13 +150,25 @@ type HeartbeatRequest struct {
 	RunningJobIDs []string `json:"running_job_ids,omitempty"`
 }
 
-// FaultRequest is what a worker sends when a lease lifecycle hook fails —
-// today, an on_acquire hook that exited non-zero or timed out. Reason is
-// free text (the hook's own tail output) kept for the controller's own
-// logs; it is not persisted on the device row, which already has a fixed
-// quarantine_reason vocabulary (see internal/store/reaper.go) — the
-// operator-facing "why" lives on the job's own failure report instead,
-// where `rc ps` already surfaces it.
+// FaultRequest is what a worker sends when it has decided a device must
+// leave the pool: an on_acquire hook that exited non-zero or timed out, or a
+// verify pass that failed after a job (see internal/worker/verify.go).
+//
+// Reason is free text — the hook's tail output, or the verify pass's
+// "verify failed: ..." — and is NOT persisted on the device row, which has a
+// fixed quarantine_reason vocabulary (see internal/store/reaper.go). Where
+// an operator can actually read it depends on which source produced it, and
+// the two differ:
+//
+//   - a failed hook fails its job too, so the text rides that job's failure
+//     report and `rc ps` surfaces it;
+//   - a failed verify pass leaves the job SUCCEEDED (the run was fine; the
+//     device is not), so there is no failure report to carry it. It reaches
+//     the worker's log, this controller's log (see handleDeviceFault), and
+//     the verify_failed webhook event — and nowhere a client API returns.
+//
+// So: do not describe the job's failure report as the operator-facing "why"
+// in general. It is only that for the hook case.
 type FaultRequest struct {
 	Reason string `json:"reason"`
 }
@@ -528,10 +540,13 @@ func (s *Server) handleAssignments(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleDeviceFault is the first (and, as of this feature, only) producer of
-// a "fault" quarantine: a worker whose on_acquire hook failed calls this
-// instead of ever starting the job, so the controller takes the device out
-// of the pool immediately rather than handing it to the next assignment.
+// handleDeviceFault is how a worker takes one of its own devices out of the
+// pool. It has two producers, not one: a worker whose on_acquire hook failed
+// calls it instead of ever starting the job, and a worker whose post-job
+// verify pass failed calls it before reporting that job terminal — so the
+// device is already quarantined when Release runs and cannot be handed to
+// the next assignment. (The prefix on Reason is what tells the two apart
+// here; see verifyReasonPrefix below.)
 // SetDeviceState already records DeviceUnhealthy set through this path with
 // quarantine reason "fault" — the one cause rebootClearableReasons
 // (internal/store/reaper.go) deliberately excludes, since a reboot proves no
