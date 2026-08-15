@@ -132,13 +132,25 @@ func TestJobsStillScheduleWhileTheWebhookHangs(t *testing.T) {
 
 	// And shutdown stays bounded: closing the notifier must not wait out a
 	// wedged endpoint's full retry budget.
+	//
+	// The bound is deliberately close to real behaviour. The honest path
+	// takes about notifierCloseTimeout (5s) — Close cancels the wedged
+	// delivery and gives up on the queue — so 10s leaves a wide margin
+	// while still catching any plausible inflation of that deadline. A
+	// bound set near the wedged retry budget itself would only fail once
+	// the timeout was raised past ~20s, which is far too late to be useful.
 	cancel()
+	shutdownStarted := time.Now()
 	select {
 	case err := <-done:
 		require.NoError(t, err)
-	case <-time.After(20 * time.Second):
+	case <-time.After(60 * time.Second):
 		t.Fatal("rc serve did not shut down while the webhook was hanging")
 	}
+	shutdownTook := time.Since(shutdownStarted)
+	t.Logf("shutdown against a hanging webhook took %s (bound %s)", shutdownTook, 10*time.Second)
+	require.Less(t, shutdownTook, 10*time.Second,
+		"shutdown waited on the wedged webhook instead of bounding the drain")
 }
 
 // postRawJSON posts body to a live controller and returns the status code.

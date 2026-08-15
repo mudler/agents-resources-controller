@@ -190,17 +190,30 @@ func NewServeCmd() *cobra.Command {
 			defer schedulerWG.Wait()
 			defer cancelReaper()
 
+			// httpWG joins the HTTP server's own shutdown, which is the
+			// third emitter and the one nothing used to wait for. The
+			// request handlers emit too (a fault, a watchdog trip), and
+			// ListenAndServe returns the moment the listener closes, NOT
+			// when handlers finish — so without this join RunE could unwind
+			// while a handler was still mid-request. A fault POST caught in
+			// that window answered 200 while its event was dropped by an
+			// already-closed notifier, and the operator was never told a
+			// device had left the pool. The same window could also hand a
+			// live handler a database st.Close had already closed.
+			var httpWG sync.WaitGroup
+
 			// Draining the notifier is the last thing that happens, and it
 			// does its own stopping and joining rather than relying on where
 			// it sits in the defer stack. Order matters here — an event
-			// emitted by a loop that is still running after the queue has
-			// been drained is dropped silently, at exactly the moment an
-			// operator most wants to know what happened — and a property
-			// this load-bearing should not rest on a reader noticing that
-			// LIFO unwinding puts this defer in the right place. Both calls
-			// below are idempotent, so the outer defers repeating them
-			// costs nothing.
+			// emitted by anything still running after the queue has been
+			// drained is dropped silently, at exactly the moment an operator
+			// most wants to know what happened — and a property this
+			// load-bearing should not rest on a reader noticing that LIFO
+			// unwinding puts this defer in the right place. Every call below
+			// is idempotent, so the outer defers repeating them costs
+			// nothing.
 			defer func() {
+				httpWG.Wait()
 				cancelReaper()
 				reaperWG.Wait()
 				schedulerWG.Wait()
@@ -213,16 +226,33 @@ func NewServeCmd() *cobra.Command {
 			}()
 
 			httpSrv := &http.Server{Addr: addr, Handler: srv.Handler()}
+			// serveOver releases the shutdown goroutine when ListenAndServe
+			// returned on its own. That is not a nicety either: RunE can
+			// return on a path that never cancels cmd.Context() — a bind
+			// failure being the one that matters — and httpWG.Wait() above
+			// would otherwise wait for a cancellation that never comes,
+			// turning a port conflict back into a hang.
+			serveOver := make(chan struct{})
+			httpWG.Add(1)
 			go func() {
-				<-cmd.Context().Done()
+				defer httpWG.Done()
+				select {
+				case <-cmd.Context().Done():
+				case <-serveOver:
+					return
+				}
 				shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer cancel()
+				// Shutdown waits for in-flight handlers to return, bounded
+				// by shutdownCtx. That wait is the whole value of the join.
 				_ = httpSrv.Shutdown(shutdownCtx)
 			}()
 
 			slog.Info("controller listening", "addr", addr, "data", dataDir)
-			if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-				return err
+			serveErr := httpSrv.ListenAndServe()
+			close(serveOver)
+			if serveErr != nil && serveErr != http.ErrServerClosed {
+				return serveErr
 			}
 			return nil
 		},

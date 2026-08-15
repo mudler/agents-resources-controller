@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -8,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -16,6 +18,7 @@ import (
 	"github.com/mudler/agents-resources-controller/internal/model"
 	"github.com/mudler/agents-resources-controller/internal/notify"
 	"github.com/mudler/agents-resources-controller/internal/store"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -397,6 +400,118 @@ func TestAnEventEmittedJustBeforeShutdownIsStillDelivered(t *testing.T) {
 		t.Fatal("rc serve returned without delivering the event still queued at shutdown; " +
 			"the notifier was not drained on the way out")
 	}
+}
+
+// The third emitter is an HTTP request handler, and ListenAndServe returns
+// when the LISTENER closes, not when handlers finish. So a fault POST caught
+// in that window would answer 200 while its event was dropped by an
+// already-closed notifier: a worker told its quarantine was recorded, and an
+// operator never told a device left the pool. The same window could also
+// hand a live handler a database that st.Close had already closed.
+//
+// The handler is held in flight without any seam in production code: the
+// request's body is written in two pieces over a raw connection, leaving the
+// handler blocked decoding it. A test-only delay inside the handler would
+// have proven the same thing, but this way there is nothing extra in the
+// binary an operator runs, and the mechanism is one a real slow client
+// reproduces on its own.
+func TestAnEventFromAHandlerStillInFlightAtShutdownIsStillDelivered(t *testing.T) {
+	delivered := make(chan notify.Event, 8)
+	hook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var e notify.Event
+		if err := json.NewDecoder(r.Body).Decode(&e); err == nil {
+			select {
+			case delivered <- e:
+			default:
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(hook.Close)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	addr := ln.Addr().String()
+	require.NoError(t, ln.Close())
+
+	t.Setenv("RC_TOKENS", "wtok:worker,ctok:client")
+	cmd := NewServeCmd()
+	ctx, cancel := context.WithCancel(context.Background())
+	cmd.SetContext(ctx)
+	cmd.SetArgs([]string{"--addr", addr, "--data", t.TempDir(), "--webhook-url", hook.URL})
+	cmd.SilenceUsage = true
+	cmd.SilenceErrors = true
+
+	done := make(chan error, 1)
+	go func() { done <- cmd.Execute() }()
+	defer cancel()
+
+	require.Eventually(t, func() bool {
+		return registerWorkerRaw(t, "http://"+addr, "inflightbox") == nil
+	}, 5*time.Second, 50*time.Millisecond, "rc serve never came up")
+
+	body := `{"reason":"verify failed: 10-vram.sh: 512 MiB still allocated"}`
+	head := "POST /v1/devices/inflightbox:gpu0/fault HTTP/1.1\r\n" +
+		"Host: " + addr + "\r\n" +
+		"Authorization: Bearer wtok\r\n" +
+		"Content-Type: application/json\r\n" +
+		"Content-Length: " + strconv.Itoa(len(body)) + "\r\n" +
+		"Connection: close\r\n\r\n"
+
+	conn, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	defer conn.Close()
+	require.NoError(t, conn.SetDeadline(time.Now().Add(20*time.Second)))
+
+	// Half a JSON object: the handler is now blocked inside its decode.
+	_, err = conn.Write([]byte(head + body[:20]))
+	require.NoError(t, err)
+	time.Sleep(200 * time.Millisecond)
+
+	cancel()
+	time.Sleep(200 * time.Millisecond)
+
+	// Now let the handler finish. Its emit happens after the controller was
+	// already told to stop.
+	_, err = conn.Write([]byte(body[20:]))
+	require.NoError(t, err)
+
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	require.NoError(t, err, "the in-flight request never got a response")
+	defer resp.Body.Close()
+	// assert, not require: the two symptoms of the same missing join are
+	// worth seeing together — the handler running against a store that was
+	// closed under it, AND its event never being delivered — rather than
+	// the first one hiding the second.
+	assert.Equal(t, http.StatusOK, resp.StatusCode,
+		"the handler ran against a store that had already been closed under it")
+
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(20 * time.Second):
+		t.Fatal("rc serve did not shut down")
+	}
+
+	select {
+	case e := <-delivered:
+		require.Equal(t, notify.KindVerifyFailed, e.Kind)
+		require.Equal(t, "inflightbox:gpu0", e.Device)
+	default:
+		t.Fatal("the fault answered 200 but its event was never delivered; " +
+			"shutdown drained the notifier while the handler was still running")
+	}
+}
+
+// Every test that drives the reaper overrides both timings through shorten,
+// so nothing else in the suite would notice if the production defaults were
+// changed — the seam that made the reaper provable also made its real
+// settings unasserted. These are the values the controller actually ships
+// with: ten seconds between sweeps, and five minutes of silence before a
+// worker is written off.
+func TestReaperTimingDefaultsAreTheShippedOnes(t *testing.T) {
+	require.Equal(t, 10*time.Second, sweepInterval)
+	require.Equal(t, 5*time.Minute, sweepUnhealthyAfter)
 }
 
 // shorten swaps in a test-only value for one of the reaper's timings and
