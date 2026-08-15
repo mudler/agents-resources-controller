@@ -63,15 +63,16 @@ func sectionBetween(t *testing.T, out, startHeading, endHeading string) string {
 }
 
 // TestDescribeRendersLabelWithSourceAndAge pins the design's own example
-// verbatim: a label must show its value, its source, and a relative age
-// computed from how long ago it was actually confirmed — not the moment
-// describe happened to run.
+// verbatim: a label must show its value, its source, and a relative age —
+// computed by the controller (LabelAgeSeconds), not re-derived from
+// UpdatedAt against the CLI process's own clock.
 func TestDescribeRendersLabelWithSourceAndAge(t *testing.T) {
 	ts := describeServer(t, server.DescribeResponse{
 		Device: model.Device{ID: "gpubox:gpu0", State: model.DeviceReady},
 		Labels: []model.Label{
 			{Key: "vram", Value: "80G", Source: model.SourceDetected, UpdatedAt: time.Now().Add(-4 * time.Minute)},
 		},
+		LabelAgeSeconds: map[string]int{"vram/" + model.SourceDetected: 4 * 60},
 	})
 
 	out, err := runDescribe(t, ts)
@@ -80,6 +81,35 @@ func TestDescribeRendersLabelWithSourceAndAge(t *testing.T) {
 	require.Contains(t, out, "80G")
 	require.Contains(t, out, "detected")
 	require.Contains(t, out, "4m ago", "the label's age must be rendered as a relative age, not a raw timestamp")
+}
+
+// TestDescribeLabelAgeComesFromServerNotLocalClock is the falsifiable core
+// of this fix: it builds a label stamped only a minute old but gives it a
+// server-computed age of three hours — a combination that cannot arise from
+// the CLI computing time.Now().Sub(UpdatedAt) locally, only from actually
+// reading LabelAgeSeconds. If the CLI still computed the age from the
+// timestamp (as it did before this change), this would render "1m ago" and
+// the assertion below would fail.
+//
+// Verified failing first: before the CLI was switched to read
+// LabelAgeSeconds, this test failed with output containing "1m ago" and not
+// "3h ago".
+func TestDescribeLabelAgeComesFromServerNotLocalClock(t *testing.T) {
+	ts := describeServer(t, server.DescribeResponse{
+		Device: model.Device{ID: "gpubox:gpu0", State: model.DeviceReady},
+		Labels: []model.Label{
+			{Key: "vram", Value: "80G", Source: model.SourceDetected, UpdatedAt: time.Now().Add(-1 * time.Minute)},
+		},
+		LabelAgeSeconds: map[string]int{"vram/" + model.SourceDetected: 3 * 60 * 60},
+	})
+
+	out, err := runDescribe(t, ts)
+	require.NoError(t, err)
+	section := sectionBetween(t, out, "LABELS", "USAGE SHEET")
+	require.Contains(t, section, "3h ago",
+		"the rendered age must be the server's LabelAgeSeconds, not derived from the timestamp locally")
+	require.NotContains(t, section, "1m ago",
+		"a locally-derived age from the (much fresher) timestamp must not appear")
 }
 
 // TestDescribeShowsConflictingDeclaredValueBesideDetected is the guard
@@ -121,6 +151,7 @@ func TestDescribeShowsStaleSheetAge(t *testing.T) {
 		Device:          model.Device{ID: "gpubox:gpu0", State: model.DeviceReady},
 		Sheet:           "shared rack A1, ask #infra before recabling",
 		SheetUpdatedAt:  time.Now().Add(-100 * 24 * time.Hour),
+		SheetAgeSeconds: 100 * 24 * 60 * 60,
 		SheetIsHostWide: false,
 	})
 
@@ -134,6 +165,56 @@ func TestDescribeShowsStaleSheetAge(t *testing.T) {
 		"a sheet last edited ~100 days ago must show its own real age, not the request time")
 	require.NotContains(t, section, "0s ago")
 	require.Contains(t, section, "device note", "a device-specific sheet must be labelled as such, not left ambiguous with a host-wide one")
+}
+
+// TestDescribeSheetAgeComesFromServerNotLocalClock is the sheet-side twin of
+// TestDescribeLabelAgeComesFromServerNotLocalClock: SheetUpdatedAt says one
+// minute ago, but SheetAgeSeconds says three hours — a combination only
+// possible if the CLI reads SheetAgeSeconds rather than recomputing
+// now.Sub(SheetUpdatedAt). Verified failing first the same way: before the
+// switch, this rendered "1m ago", not "3h ago".
+func TestDescribeSheetAgeComesFromServerNotLocalClock(t *testing.T) {
+	ts := describeServer(t, server.DescribeResponse{
+		Device:          model.Device{ID: "gpubox:gpu0", State: model.DeviceReady},
+		Sheet:           "shared rack A1, ask #infra before recabling",
+		SheetUpdatedAt:  time.Now().Add(-1 * time.Minute),
+		SheetAgeSeconds: 3 * 60 * 60,
+		SheetIsHostWide: false,
+	})
+
+	out, err := runDescribe(t, ts)
+	require.NoError(t, err)
+
+	section := sectionBetween(t, out, "USAGE SHEET", "RECENT JOBS")
+	require.Contains(t, section, "3h ago",
+		"the rendered sheet age must be the server's SheetAgeSeconds, not derived from SheetUpdatedAt locally")
+	require.NotContains(t, section, "1m ago",
+		"a locally-derived age from the (much fresher) timestamp must not appear")
+}
+
+// TestDescribeFutureStampedLabelIsNotRenderedAsFresh pins the other defect
+// the brief calls out: a label whose UpdatedAt is ahead of the controller's
+// clock produces a NEGATIVE LabelAgeSeconds. The old `d < 0 { d = 0 }` clamp
+// would render that as "0s ago" — indistinguishable from the freshest
+// possible label, when it is actually the least trustworthy one on the
+// page (a clock disagreement, not a recent confirmation). The rendering
+// must say so, not go quiet about it.
+func TestDescribeFutureStampedLabelIsNotRenderedAsFresh(t *testing.T) {
+	ts := describeServer(t, server.DescribeResponse{
+		Device: model.Device{ID: "gpubox:gpu0", State: model.DeviceReady},
+		Labels: []model.Label{
+			{Key: "vram", Value: "80G", Source: model.SourceDetected, UpdatedAt: time.Now().Add(5 * time.Minute)},
+		},
+		LabelAgeSeconds: map[string]int{"vram/" + model.SourceDetected: -5 * 60},
+	})
+
+	out, err := runDescribe(t, ts)
+	require.NoError(t, err)
+	section := sectionBetween(t, out, "LABELS", "USAGE SHEET")
+	require.NotContains(t, section, "0s ago",
+		"a future-stamped label must not be laundered into looking like the freshest possible reading")
+	require.Contains(t, section, "future",
+		"a future-stamped label's anomaly must be visible in the rendered text")
 }
 
 // TestDescribeLabelsHostWideSheetDistinctlyFromDeviceSheet pins the other
@@ -172,8 +253,10 @@ func TestDescribeJSONOutputParsesBackIntoDescribeResponse(t *testing.T) {
 		Labels: []model.Label{
 			{Key: "vram", Value: "80G", Source: model.SourceDetected, UpdatedAt: time.Now().Add(-4 * time.Minute).Truncate(time.Second)},
 		},
+		LabelAgeSeconds: map[string]int{"vram/" + model.SourceDetected: 240},
 		Sheet:           "notes",
 		SheetUpdatedAt:  time.Now().Add(-time.Hour).Truncate(time.Second),
+		SheetAgeSeconds: 3600,
 		SheetIsHostWide: true,
 		RecentJobs: []model.Job{
 			{ID: "job0", DeviceID: "gpubox:gpu0", State: model.JobSucceeded, Command: []string{"./bench"}},
@@ -198,8 +281,10 @@ func TestDescribeJSONOutputParsesBackIntoDescribeResponse(t *testing.T) {
 		require.Equal(t, want.Labels[i].Source, got.Labels[i].Source)
 		require.True(t, want.Labels[i].UpdatedAt.Equal(got.Labels[i].UpdatedAt))
 	}
+	require.Equal(t, want.LabelAgeSeconds, got.LabelAgeSeconds)
 	require.Equal(t, want.Sheet, got.Sheet)
 	require.True(t, want.SheetUpdatedAt.Equal(got.SheetUpdatedAt))
+	require.Equal(t, want.SheetAgeSeconds, got.SheetAgeSeconds)
 	require.Equal(t, want.SheetIsHostWide, got.SheetIsHostWide)
 	require.Equal(t, want.RecentJobs, got.RecentJobs)
 }

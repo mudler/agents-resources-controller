@@ -57,7 +57,6 @@ func NewDescribeCmd() *cobra.Command {
 // the final Flush is reported rather than silently dropped, matching
 // RenderDevices and RenderJobs.
 func RenderDescribe(w io.Writer, out *server.DescribeResponse) error {
-	now := time.Now()
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
 
 	fmt.Fprintf(tw, "%s\t%s\n", out.Device.ID, out.Device.State)
@@ -71,20 +70,28 @@ func RenderDescribe(w io.Writer, out *server.DescribeResponse) error {
 
 	fmt.Fprintln(tw)
 	fmt.Fprintln(tw, "LABELS")
-	renderLabels(tw, out.Labels, now)
+	renderLabels(tw, out.Labels, out.LabelAgeSeconds)
 
 	fmt.Fprintln(tw)
 	fmt.Fprintln(tw, "USAGE SHEET")
-	renderSheet(tw, out.Sheet, out.SheetUpdatedAt, out.SheetIsHostWide, now)
+	renderSheet(tw, out.Sheet, out.SheetUpdatedAt, out.SheetAgeSeconds, out.SheetIsHostWide)
 
 	fmt.Fprintln(tw)
 	fmt.Fprintln(tw, "RECENT JOBS")
-	renderRecentJobs(tw, out.RecentJobs, now)
+	// Job history has no server-computed age field of its own: a still-
+	// running job's displayed duration is bounded by "now" only for the
+	// UI's benefit (it has no FinishedAt yet), not presented as a fact whose
+	// staleness an agent must trust the way a label's or sheet's age is.
+	renderRecentJobs(tw, out.RecentJobs, time.Now())
 
 	return tw.Flush()
 }
 
-func renderLabels(w io.Writer, labels []model.Label, now time.Time) {
+// renderLabels renders each label's age from ages, keyed by
+// key+"/"+source exactly as DescribeResponse.LabelAgeSeconds documents —
+// never by re-deriving it from the label's own UpdatedAt against this
+// process's clock, which is the whole defect this field exists to fix.
+func renderLabels(w io.Writer, labels []model.Label, ages map[string]int) {
 	if len(labels) == 0 {
 		fmt.Fprintln(w, "  (none)")
 		return
@@ -100,11 +107,17 @@ func renderLabels(w io.Writer, labels []model.Label, now time.Time) {
 		return sourceRank[sorted[i].Source] < sourceRank[sorted[j].Source]
 	})
 	for _, l := range sorted {
-		fmt.Fprintf(w, "  %s=%s\t%s %s\n", l.Key, l.Value, l.Source, formatAge(now.Sub(l.UpdatedAt)))
+		age := ages[l.Key+"/"+l.Source]
+		fmt.Fprintf(w, "  %s=%s\t%s %s\n", l.Key, l.Value, l.Source, formatAge(time.Duration(age)*time.Second))
 	}
 }
 
-func renderSheet(w io.Writer, body string, updatedAt time.Time, hostWide bool, now time.Time) {
+// renderSheet renders the sheet's age from ageSeconds — the controller's
+// own computation, per the same rule renderLabels follows — never from
+// now.Sub(updatedAt) against this process's clock. updatedAt is still used
+// to detect "no sheet at all", the one thing ageSeconds alone cannot tell
+// apart from "a sheet exactly at the controller's current clock".
+func renderSheet(w io.Writer, body string, updatedAt time.Time, ageSeconds int, hostWide bool) {
 	if body == "" && updatedAt.IsZero() {
 		fmt.Fprintln(w, "  (none on file)")
 		return
@@ -116,7 +129,7 @@ func renderSheet(w io.Writer, body string, updatedAt time.Time, hostWide bool, n
 	if hostWide {
 		scope = "host-wide note"
 	}
-	fmt.Fprintf(w, "  %s, updated %s\n", scope, formatAge(now.Sub(updatedAt)))
+	fmt.Fprintf(w, "  %s, updated %s\n", scope, formatAge(time.Duration(ageSeconds)*time.Second))
 	for _, line := range strings.Split(body, "\n") {
 		fmt.Fprintf(w, "  %s\n", line)
 	}
@@ -149,9 +162,17 @@ func renderRecentJobs(w io.Writer, jobs []model.Job, now time.Time) {
 // fact needs to see it: coarse enough to read at a glance, but never
 // omitted — a label unconfirmed for a week and a sheet last edited months
 // ago are exactly the ages that must not be rounded away or hidden.
+//
+// A negative duration means the timestamp is AHEAD of the clock that
+// produced the age — normally impossible, reachable when a worker's clock
+// runs fast relative to the controller's. Clamping that to zero, as an
+// earlier version of this function did, would render it as "0s ago": the
+// freshest possible reading, when a future-stamped fact is actually the
+// LEAST trustworthy one on the page. So it is reported as what it is
+// instead of being silently laundered into looking current.
 func formatAge(d time.Duration) string {
 	if d < 0 {
-		d = 0
+		return fmt.Sprintf("%s in the future (clock skew?)", formatAge(-d))
 	}
 	switch {
 	case d < time.Minute:
