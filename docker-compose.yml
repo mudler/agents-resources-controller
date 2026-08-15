@@ -20,6 +20,14 @@ services:
       # deliberate — an unauthenticated scheduler that can execute commands
       # on your GPU hosts is not something to fall back to silently.
       RC_TOKENS: ${RC_TOKENS:?set RC_TOKENS in .env, e.g. wtok:worker,ctok:client,atok:admin}
+      # Optional. Empty (the default) means no webhook and no notifier at
+      # all. Delivery is best-effort and never blocks scheduling: a full
+      # queue drops events rather than stalling a job or a sweep.
+      # A receiver on this host is reachable as host.docker.internal.
+      RC_WEBHOOK_URL: ${RC_WEBHOOK_URL:-}
+    extra_hosts:
+      # Lets RC_WEBHOOK_URL point at a receiver running on the Docker host.
+      - "host.docker.internal:host-gateway"
     ports:
       # Reachable from other machines: workers and clients live elsewhere.
       # RC_TOKENS is the ONLY thing standing between the network and a
