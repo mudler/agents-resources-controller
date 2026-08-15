@@ -109,14 +109,69 @@ func TestSweepEventsSplitWorkerLostFromDeviceUnhealthy(t *testing.T) {
 		{Kind: notify.KindWorkerLost, Device: "gpubox:gpu0", Reason: "worker_lost"},
 		{Kind: notify.KindDeviceUnhealthy, Device: "gpubox:gpu1", Reason: "fault"},
 		{Kind: notify.KindDeviceUnhealthy, Device: "gpubox:gpu2"},
-	}, sweepEvents(res, reasons))
+	}, sweepEvents(res, reasons, nil))
 }
 
 // A device demoted to unknown is not quarantined — it may well be back on
 // the next heartbeat — so it is not news anyone should be paged for.
 func TestSweepEventsIgnoreDevicesDemotedToUnknown(t *testing.T) {
 	res := store.SweepResult{DevicesUnknown: []string{"gpubox:gpu0"}}
-	require.Empty(t, sweepEvents(res, nil))
+	require.Empty(t, sweepEvents(res, nil, nil))
+}
+
+// One device, two reasons to report it in the same sweep: it is in
+// DevicesUnhealthy AND it is the device behind an expired lease. It left the
+// pool once, so it gets exactly one device-level event, whichever cause the
+// store ended up recording — a consumer counting unhealthy devices must not
+// be told twice about one quarantine.
+//
+// The second case is the one that matters for the dedupe specifically: when
+// the recorded reason is the expiry itself, nothing else stops the
+// lease-expiry branch from announcing a device the loop above already did.
+func TestSweepEventsAnnounceADeviceOnceEvenWhenBothCausesFire(t *testing.T) {
+	res := store.SweepResult{
+		DevicesUnhealthy: []string{"gpubox:gpu0"},
+		LeasesExpired:    []string{"job-1"},
+	}
+	leaseDevices := map[string]string{"job-1": "gpubox:gpu0"}
+
+	cases := []struct {
+		name   string
+		reason string
+		want   notify.Event
+	}{
+		{
+			name:   "recorded as worker loss",
+			reason: "worker_lost",
+			want:   notify.Event{Kind: notify.KindWorkerLost, Device: "gpubox:gpu0", Reason: "worker_lost"},
+		},
+		{
+			name:   "recorded as the expiry itself",
+			reason: "lease_expired",
+			want:   notify.Event{Kind: notify.KindDeviceUnhealthy, Device: "gpubox:gpu0", Reason: "lease_expired"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, []notify.Event{
+				tc.want,
+				{Kind: notify.KindLeaseExpired, Device: "gpubox:gpu0", Job: "job-1", Reason: "lease expired"},
+			}, sweepEvents(res, map[string]string{"gpubox:gpu0": tc.reason}, leaseDevices))
+		})
+	}
+}
+
+// A device whose lease expired but which was ALREADY out of the pool for
+// another cause keeps that cause, and was announced when it happened. Only
+// the expiry itself is news this time.
+func TestSweepEventsDoNotReAnnounceADeviceQuarantinedForAnotherCause(t *testing.T) {
+	res := store.SweepResult{LeasesExpired: []string{"job-1"}}
+	reasons := map[string]string{"gpubox:gpu0": "fault"}
+	leaseDevices := map[string]string{"job-1": "gpubox:gpu0"}
+
+	require.Equal(t, []notify.Event{
+		{Kind: notify.KindLeaseExpired, Device: "gpubox:gpu0", Job: "job-1", Reason: "lease expired"},
+	}, sweepEvents(res, reasons, leaseDevices))
 }
 
 // The whole sweep path, against a real store: a worker goes silent long
@@ -157,8 +212,17 @@ func TestSweepAndNotifyEmitsLeaseExpired(t *testing.T) {
 	require.Equal(t, []string{job.ID}, res.LeasesExpired)
 	require.Empty(t, res.DevicesUnhealthy, "the worker never went silent")
 
+	// The lease's device is quarantined by that same expiry, and SweepResult
+	// says nothing about it at all — but a device leaving the pool is the
+	// whole point of this event stream, so it is recovered from the lease
+	// row and announced alongside.
+	devices, err := st.Devices()
+	require.NoError(t, err)
+	require.Equal(t, model.DeviceUnhealthy, devices[0].State, "the expiry did quarantine the device")
+
 	require.Equal(t, []notify.Event{
-		{Kind: notify.KindLeaseExpired, Job: job.ID, Reason: "lease expired"},
+		{Kind: notify.KindLeaseExpired, Device: "gpubox:gpu0", Job: job.ID, Reason: "lease expired"},
+		{Kind: notify.KindDeviceUnhealthy, Device: "gpubox:gpu0", Reason: "lease_expired"},
 	}, flush())
 }
 
@@ -242,7 +306,7 @@ func TestReaperAnnouncesALostWorkerThroughTheConfiguredWebhook(t *testing.T) {
 	// Register a worker and then never heartbeat again, which is exactly
 	// what a host that fell off the network looks like.
 	require.Eventually(t, func() bool {
-		return registerReaperWorker(t, "http://"+addr) == nil
+		return registerWorkerRaw(t, "http://"+addr, "reaperbox") == nil
 	}, 5*time.Second, 50*time.Millisecond, "rc serve never came up")
 
 	deadline := time.After(10 * time.Second)
@@ -261,6 +325,80 @@ func TestReaperAnnouncesALostWorkerThroughTheConfiguredWebhook(t *testing.T) {
 	}
 }
 
+// An event emitted moments before the controller stops must still be
+// delivered. Nothing else in this package would notice if the notifier were
+// simply never closed: the delivery goroutine would leak, rc serve would
+// return while the event was still in flight, and the event would vanish
+// with the process — at exactly the moment an operator most wants to know
+// what happened.
+//
+// The webhook here answers slowly on purpose. That makes the property
+// measurable without any polling: the assertion is that the event has ALREADY
+// been delivered by the time cmd.Execute() returns, which can only be true
+// if shutdown waited for the queue to drain.
+func TestAnEventEmittedJustBeforeShutdownIsStillDelivered(t *testing.T) {
+	const webhookDelay = 500 * time.Millisecond
+
+	delivered := make(chan notify.Event, 8)
+	hook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var e notify.Event
+		err := json.NewDecoder(r.Body).Decode(&e)
+		time.Sleep(webhookDelay)
+		if err == nil {
+			select {
+			case delivered <- e:
+			default:
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(hook.Close)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	addr := ln.Addr().String()
+	require.NoError(t, ln.Close())
+
+	t.Setenv("RC_TOKENS", "wtok:worker,ctok:client")
+	cmd := NewServeCmd()
+	ctx, cancel := context.WithCancel(context.Background())
+	cmd.SetContext(ctx)
+	cmd.SetArgs([]string{"--addr", addr, "--data", t.TempDir(), "--webhook-url", hook.URL})
+	cmd.SilenceUsage = true
+	cmd.SilenceErrors = true
+
+	done := make(chan error, 1)
+	go func() { done <- cmd.Execute() }()
+	defer cancel()
+
+	baseURL := "http://" + addr
+	require.Eventually(t, func() bool {
+		return registerWorkerRaw(t, baseURL, "shutdownbox") == nil
+	}, 5*time.Second, 50*time.Millisecond, "rc serve never came up")
+
+	require.Equal(t, http.StatusOK, faultDeviceRaw(t, baseURL, "shutdownbox:gpu0",
+		"verify failed: 10-vram.sh: 512 MiB still allocated"))
+
+	// No pause here: the event is meant to still be in flight, or still
+	// queued, when the controller is told to stop.
+	cancel()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(20 * time.Second):
+		t.Fatal("rc serve did not shut down")
+	}
+
+	select {
+	case e := <-delivered:
+		require.Equal(t, notify.KindVerifyFailed, e.Kind)
+		require.Equal(t, "shutdownbox:gpu0", e.Device)
+	default:
+		t.Fatal("rc serve returned without delivering the event still queued at shutdown; " +
+			"the notifier was not drained on the way out")
+	}
+}
+
 // shorten swaps in a test-only value for one of the reaper's timings and
 // restores the real one afterwards.
 func shorten(t *testing.T, target *time.Duration, d time.Duration) {
@@ -270,10 +408,13 @@ func shorten(t *testing.T, target *time.Duration, d time.Duration) {
 	t.Cleanup(func() { *target = original })
 }
 
-func registerReaperWorker(t *testing.T, baseURL string) error {
+// registerWorkerRaw registers a one-device worker over plain HTTP, returning
+// the transport error unswallowed so a caller can poll it until the
+// controller is listening.
+func registerWorkerRaw(t *testing.T, baseURL, host string) error {
 	t.Helper()
 	body, err := json.Marshal(map[string]any{
-		"host":    "reaperbox",
+		"host":    host,
 		"devices": []map[string]string{{"name": "gpu0"}},
 	})
 	require.NoError(t, err)
@@ -288,6 +429,20 @@ func registerReaperWorker(t *testing.T, baseURL string) error {
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	return nil
+}
+
+func faultDeviceRaw(t *testing.T, baseURL, deviceID, reason string) int {
+	t.Helper()
+	body, err := json.Marshal(map[string]string{"reason": reason})
+	require.NoError(t, err)
+	req, err := http.NewRequest(http.MethodPost, baseURL+"/v1/devices/"+deviceID+"/fault", bytes.NewReader(body))
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer wtok")
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	return resp.StatusCode
 }
 
 func TestResolveWebhookURLPrefersTheFlagOverTheEnvironment(t *testing.T) {

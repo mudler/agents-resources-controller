@@ -30,6 +30,12 @@ import (
 // budget. The test first proves the wiring is live (the endpoint really is
 // hit, so --webhook-url is genuinely connected to the fault handler) and
 // only then leans on it.
+// notifyLatencyBound is what "never blocks" means concretely for a request
+// handler that emits an event: queueing is microseconds, so anything near a
+// second means the handler is waiting on the webhook. Generous enough to
+// survive a loaded CI machine, far below the ~30s a wedged delivery costs.
+const notifyLatencyBound = 2 * time.Second
+
 func TestJobsStillScheduleWhileTheWebhookHangs(t *testing.T) {
 	hit := make(chan struct{}, 8)
 	release := make(chan struct{})
@@ -79,9 +85,17 @@ func TestJobsStillScheduleWhileTheWebhookHangs(t *testing.T) {
 
 	// Quarantine gpu0 with a verify-sourced fault. That emits an event, and
 	// its delivery wedges against the hanging endpoint.
+	//
+	// The bound is the actual claim being tested. "The request eventually
+	// succeeded" would still hold if emitting blocked for the webhook's
+	// whole timeout budget — it just would not be non-blocking. An emit
+	// that waits on delivery shows up here and nowhere else.
+	started := time.Now()
 	faultResp := postRawJSON(t, baseURL, "wtok", "/v1/devices/hookbox:gpu0/fault",
 		server.FaultRequest{Reason: "verify failed: 10-vram.sh: 512 MiB still allocated"})
 	require.Equal(t, http.StatusOK, faultResp)
+	require.Less(t, time.Since(started), notifyLatencyBound,
+		"the fault handler waited on webhook delivery instead of queueing it")
 
 	select {
 	case <-hit:
@@ -104,8 +118,11 @@ func TestJobsStillScheduleWhileTheWebhookHangs(t *testing.T) {
 	require.Equal(t, model.JobQueued, jobB.State)
 
 	// A terminal report that is itself a watchdog trip: it emits a second
-	// event behind the wedged one and still frees the device.
+	// event behind the wedged one, and must return just as promptly.
+	started = time.Now()
 	reportRawWatchdogKill(t, baseURL, "wtok", jobA.ID, workerID)
+	require.Less(t, time.Since(started), notifyLatencyBound,
+		"the status handler waited on webhook delivery instead of queueing it")
 
 	require.Eventually(t, func() bool {
 		j, err := cl.Job(context.Background(), jobB.ID)

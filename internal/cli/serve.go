@@ -102,18 +102,6 @@ func NewServeCmd() *cobra.Command {
 			if hook != "" {
 				slog.Info("event webhook configured", "url", hook)
 			}
-			// Registered before the reaper and scheduler joins below so
-			// LIFO unwinding runs it AFTER both loops have stopped: nothing
-			// may still be emitting when the queue is drained, or those
-			// events are dropped on the floor at the one moment an operator
-			// most wants to know what happened.
-			defer func() {
-				ctx, cancel := context.WithTimeout(context.Background(), notifierCloseTimeout)
-				defer cancel()
-				if err := notifier.Close(ctx); err != nil {
-					slog.Warn("gave up delivering queued notifications", "err", err)
-				}
-			}()
 
 			srv := server.New(server.Config{
 				Store: st, Logs: logs, Clock: c, Tokens: tokens, Notifier: notifier,
@@ -202,6 +190,28 @@ func NewServeCmd() *cobra.Command {
 			defer schedulerWG.Wait()
 			defer cancelReaper()
 
+			// Draining the notifier is the last thing that happens, and it
+			// does its own stopping and joining rather than relying on where
+			// it sits in the defer stack. Order matters here — an event
+			// emitted by a loop that is still running after the queue has
+			// been drained is dropped silently, at exactly the moment an
+			// operator most wants to know what happened — and a property
+			// this load-bearing should not rest on a reader noticing that
+			// LIFO unwinding puts this defer in the right place. Both calls
+			// below are idempotent, so the outer defers repeating them
+			// costs nothing.
+			defer func() {
+				cancelReaper()
+				reaperWG.Wait()
+				schedulerWG.Wait()
+
+				ctx, cancel := context.WithTimeout(context.Background(), notifierCloseTimeout)
+				defer cancel()
+				if err := notifier.Close(ctx); err != nil {
+					slog.Warn("gave up delivering queued notifications", "err", err)
+				}
+			}()
+
 			httpSrv := &http.Server{Addr: addr, Handler: srv.Handler()}
 			go func() {
 				<-cmd.Context().Done()
@@ -263,23 +273,51 @@ func webhookSink(url string) notify.Sink {
 // branch covers a reason written by another path in between, and a reason
 // nobody recorded, neither of which should be reported as a lost worker on
 // no evidence.
-func sweepEvents(res store.SweepResult, reasons map[string]string) []notify.Event {
+//
+// An expired lease quarantines its device too, and SweepResult does not
+// report that at all — LeasesExpired holds job (or lease) IDs, and
+// DevicesUnhealthy only ever holds devices demoted for worker silence. So
+// that device is recovered here, from the lease row, and announced: a device
+// silently leaving the pool is the one thing an event stream about vanishing
+// capacity must never omit. It is reported only when the device's CURRENT
+// quarantine reason is the expiry itself; a device already out of the pool
+// for another cause keeps that cause and was already announced when it
+// happened.
+func sweepEvents(res store.SweepResult, reasons, leaseDevices map[string]string) []notify.Event {
 	// Devices demoted to unknown are absent on purpose: unknown is not a
 	// quarantine, and the next heartbeat routinely undoes it.
 	out := make([]notify.Event, 0, len(res.DevicesUnhealthy)+len(res.JobsLost)+len(res.LeasesExpired))
+	// announced guards against reporting one device twice in a single
+	// sweep: a device can lose its worker and have its lease expire in the
+	// same pass, and two events for one quarantine would make any consumer
+	// counting unhealthy devices overstate the damage.
+	announced := make(map[string]bool, len(res.DevicesUnhealthy))
 	for _, id := range res.DevicesUnhealthy {
 		reason := reasons[id]
 		kind := notify.KindDeviceUnhealthy
 		if reason == quarantineWorkerLost {
 			kind = notify.KindWorkerLost
 		}
+		announced[id] = true
 		out = append(out, notify.Event{Kind: kind, Device: id, Reason: reason})
 	}
 	for _, id := range res.JobsLost {
 		out = append(out, notify.Event{Kind: notify.KindJobLost, Job: id, Reason: sweepJobLostReason})
 	}
 	for _, id := range res.LeasesExpired {
-		out = append(out, notify.Event{Kind: notify.KindLeaseExpired, Job: id, Reason: sweepLeaseExpiredReason})
+		device := leaseDevices[id]
+		out = append(out, notify.Event{
+			Kind: notify.KindLeaseExpired, Job: id, Device: device, Reason: sweepLeaseExpiredReason,
+		})
+		if device == "" || announced[device] {
+			continue
+		}
+		announced[device] = true
+		if reasons[device] == quarantineLeaseExpired {
+			out = append(out, notify.Event{
+				Kind: notify.KindDeviceUnhealthy, Device: device, Reason: quarantineLeaseExpired,
+			})
+		}
 	}
 	if len(out) == 0 {
 		return nil
@@ -293,6 +331,9 @@ const (
 	// It is unexported there, and it is a stored value in a live database,
 	// so it is matched by value here rather than re-exported.
 	quarantineWorkerLost = "worker_lost"
+	// quarantineLeaseExpired likewise mirrors the reason the reaper stores
+	// on a device whose lease lapsed with nobody renewing it.
+	quarantineLeaseExpired = "lease_expired"
 	// sweepJobLostReason and sweepLeaseExpiredReason are the exact
 	// kill_reason strings the reaper records on the jobs it ends, so an
 	// operator reading `rc ps` sees the same words the webhook told them.
@@ -314,15 +355,33 @@ func sweepAndNotify(st *store.Store, n *notify.Notifier, grace, unhealthyAfter t
 		return res, err
 	}
 
+	// Two post-commit reads at most, and none at all on the overwhelmingly
+	// common sweep that changed nothing.
+	var leaseDevices map[string]string
+	if len(res.LeasesExpired) > 0 {
+		leaseDevices, err = st.LeaseDevices(res.LeasesExpired)
+		if err != nil {
+			slog.Error("read devices behind expired leases for event notifications", "err", err)
+			leaseDevices = nil
+		}
+	}
+
+	quarantined := make([]string, 0, len(res.DevicesUnhealthy)+len(leaseDevices))
+	quarantined = append(quarantined, res.DevicesUnhealthy...)
+	for _, id := range res.LeasesExpired {
+		if device := leaseDevices[id]; device != "" {
+			quarantined = append(quarantined, device)
+		}
+	}
 	var reasons map[string]string
-	if len(res.DevicesUnhealthy) > 0 {
-		reasons, err = st.QuarantineReasons(res.DevicesUnhealthy)
+	if len(quarantined) > 0 {
+		reasons, err = st.QuarantineReasons(quarantined)
 		if err != nil {
 			slog.Error("read quarantine reasons for event notifications", "err", err)
 			reasons = nil
 		}
 	}
-	for _, e := range sweepEvents(res, reasons) {
+	for _, e := range sweepEvents(res, reasons, leaseDevices) {
 		// Never blocks: a wedged webhook drops events, it does not hold up
 		// the reaper.
 		n.Notify(e)

@@ -683,7 +683,21 @@ func (s *Server) handleJobStatus(w http.ResponseWriter, r *http.Request) {
 	// Only a terminal report can be a watchdog trip, and only one whose
 	// reason names a watchdog — see isWatchdogReason for why the `killed`
 	// state is not the signal.
-	if isWatchdogReason(req.Reason) {
+	//
+	// job.State is the state BEFORE the Release above, which is what makes
+	// this idempotent. Release deliberately treats an already-terminal job
+	// as a silent success (see store.Release), and the ownership check
+	// above still passes afterwards, so a worker retrying a terminal report
+	// whose response was lost — reportTerminalWithRetry tries five times —
+	// would otherwise page an operator once per attempt for one runaway job.
+	//
+	// A hold is excluded outright. Its --ttl becomes MaxRuntimeSeconds, so
+	// the worker's sleeper is killed by the wall-clock watchdog on every
+	// single hold that runs to its end: that is the hold expiring exactly as
+	// asked, in the same category as `rc kill`, not an incident. It would
+	// also be the highest-volume event in the whole set, which is the
+	// fastest way to teach an operator to ignore the webhook.
+	if !job.State.Terminal() && job.Kind != model.LeaseKindHold && isWatchdogReason(req.Reason) {
 		s.emit(notify.Event{
 			Kind: notify.KindWatchdogTrip, Job: jobID, Device: job.DeviceID, Reason: req.Reason,
 		})

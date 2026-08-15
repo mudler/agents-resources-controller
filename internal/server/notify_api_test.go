@@ -152,6 +152,22 @@ func TestHookFaultEmitsDeviceUnhealthy(t *testing.T) {
 	}, flush(t, n, sink))
 }
 
+// The verify prefix is matched as a prefix, and as the WHOLE prefix. The
+// fault endpoint carries free text a hook wrote, so a reason that merely
+// begins with the word "verify" is not a verify probe's report and must not
+// be filed as one — a consumer counting verify_failed is counting dirty
+// devices, not hooks that happened to mention verification.
+func TestFaultReasonThatOnlyStartsWithTheWordVerifyIsNotAVerifyFailure(t *testing.T) {
+	ts, _, n, sink := newNotifyingServer(t)
+
+	reason := "verifying vram: hook exited 1"
+	faultDevice(t, ts, "gpubox:gpu0", reason)
+
+	require.Equal(t, []notify.Event{
+		{Kind: notify.KindDeviceUnhealthy, Device: "gpubox:gpu0", Reason: reason},
+	}, flush(t, n, sink))
+}
+
 // A verify failure happens while the job that dirtied the device is still
 // in flight (the worker verifies before it reports the job terminal), so the
 // event can and must name that job.
@@ -162,6 +178,15 @@ func TestVerifyFaultNamesTheJobStillOnTheDevice(t *testing.T) {
 		DeviceID: "gpubox:gpu0", Command: []string{"./bench"}, Submitter: "agent-a", LeaseTTL: time.Minute,
 	})
 	require.NoError(t, err)
+
+	// A second job, live on the OTHER device and allocated later, so the
+	// event has to name the job on the faulted device rather than simply
+	// the newest job running anywhere.
+	other, err := st.Allocate(store.AllocateRequest{
+		DeviceID: "gpubox:gpu1", Command: []string{"./bench"}, Submitter: "agent-b", LeaseTTL: time.Minute,
+	})
+	require.NoError(t, err)
+	require.NotEqual(t, job.ID, other.ID)
 
 	reason := "verify failed: 10-vram.sh: 512 MiB still allocated"
 	faultDevice(t, ts, "gpubox:gpu0", reason)
@@ -222,6 +247,17 @@ func TestTerminalReportEmitsWatchdogTripOnlyForAWatchdogReason(t *testing.T) {
 			reason: "exit status 1",
 		},
 		{
+			// The watchdog reasons are matched as PREFIXES, not searched
+			// for anywhere in the string. A job that failed on its own and
+			// whose reason quotes its output — a trainer printing the very
+			// words the watchdog uses — is not a watchdog trip, and paging
+			// on it would make the event depend on what a job happens to
+			// print.
+			name:   "a failure whose own output mentions a watchdog",
+			state:  model.JobFailed,
+			reason: "exit status 1: log tail: max_runtime exceeded (4h0m0s) in upstream scheduler",
+		},
+		{
 			name:  "an ordinary success",
 			state: model.JobSucceeded,
 		},
@@ -256,6 +292,94 @@ func TestTerminalReportEmitsWatchdogTripOnlyForAWatchdogReason(t *testing.T) {
 			require.Equal(t, want, got)
 		})
 	}
+}
+
+// A worker whose terminal report got no response retries it — up to five
+// times (see worker.reportTerminalWithRetry). store.Release is idempotent by
+// design and the ownership check still passes after the release, so nothing
+// downstream suppresses a repeat: without an explicit guard one runaway job
+// pages an operator once per attempt.
+func TestRetriedTerminalReportEmitsOneWatchdogTrip(t *testing.T) {
+	ts, st, n, sink := newNotifyingServer(t)
+
+	job, err := st.Allocate(store.AllocateRequest{
+		DeviceID: "gpubox:gpu0", Command: []string{"./bench"}, Submitter: "agent-a", LeaseTTL: time.Minute,
+	})
+	require.NoError(t, err)
+
+	code := 137
+	report := server.StatusRequest{
+		WorkerID: job.WorkerID, State: model.JobKilled, ExitCode: &code,
+		Reason: "max_runtime exceeded (4h0m0s)",
+	}
+	for range 3 {
+		resp := post(t, ts, "wtok", "/v1/jobs/"+job.ID+"/status", report)
+		require.Equal(t, http.StatusOK, resp.StatusCode, "a retried terminal report is still accepted")
+		resp.Body.Close()
+	}
+
+	require.Equal(t, []notify.Event{{
+		Kind: notify.KindWatchdogTrip, Job: job.ID, Device: "gpubox:gpu0",
+		Reason: "max_runtime exceeded (4h0m0s)",
+	}}, flush(t, n, sink), "the job tripped one watchdog, so one event")
+}
+
+// A hold's --ttl becomes its MaxRuntimeSeconds, so the worker's sleeper is
+// stopped by the wall-clock watchdog on EVERY hold that runs to its end. A
+// hold expiring is a scheduled end, like `rc kill` — and unlike a runaway
+// job, it is the normal case, so paging on it would be the highest-volume
+// false alarm in the whole event set.
+func TestHoldReachingItsTTLEmitsNothing(t *testing.T) {
+	ts, st, n, sink := newNotifyingServer(t)
+
+	hold, err := st.Enqueue(store.EnqueueRequest{
+		DeviceID: "gpubox:gpu0", Command: []string{"hold"}, Submitter: "mudler",
+		Kind: model.LeaseKindHold, Reason: "manual profiling", MaxRuntime: 30 * time.Minute,
+	})
+	require.NoError(t, err)
+	assigned, err := st.ScheduleOnce()
+	require.NoError(t, err)
+	require.Len(t, assigned, 1)
+	require.Equal(t, model.LeaseKindHold, assigned[0].Kind)
+
+	// Exactly what the worker reports when the sleeper's TTL runs out.
+	code := 137
+	resp := post(t, ts, "wtok", "/v1/jobs/"+hold.ID+"/status", server.StatusRequest{
+		WorkerID: assigned[0].WorkerID, State: model.JobKilled, ExitCode: &code,
+		Reason: "max_runtime exceeded (30m0s)",
+	})
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	resp.Body.Close()
+
+	require.Empty(t, flush(t, n, sink), "a hold reaching its own TTL is not an incident")
+}
+
+// The other direction of the same guard: an ordinary job stopped by the same
+// watchdog still reports, so excluding holds must not be a blanket mute.
+func TestOrdinaryJobHittingMaxRuntimeStillEmits(t *testing.T) {
+	ts, st, n, sink := newNotifyingServer(t)
+
+	job, err := st.Enqueue(store.EnqueueRequest{
+		DeviceID: "gpubox:gpu0", Command: []string{"./bench"}, Submitter: "agent-a",
+		MaxRuntime: 30 * time.Minute,
+	})
+	require.NoError(t, err)
+	assigned, err := st.ScheduleOnce()
+	require.NoError(t, err)
+	require.Len(t, assigned, 1)
+
+	code := 137
+	resp := post(t, ts, "wtok", "/v1/jobs/"+job.ID+"/status", server.StatusRequest{
+		WorkerID: assigned[0].WorkerID, State: model.JobKilled, ExitCode: &code,
+		Reason: "max_runtime exceeded (30m0s)",
+	})
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	resp.Body.Close()
+
+	require.Equal(t, []notify.Event{{
+		Kind: notify.KindWatchdogTrip, Job: job.ID, Device: "gpubox:gpu0",
+		Reason: "max_runtime exceeded (30m0s)",
+	}}, flush(t, n, sink))
 }
 
 // A "running" report is not terminal and must never be mistaken for one,
