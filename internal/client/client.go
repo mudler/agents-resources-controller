@@ -64,6 +64,13 @@ type SubmitOptions struct {
 	// NoWait opts out of stage 2's queue: a busy device fails fast with
 	// ErrNoDevice instead of the job sitting queued behind it.
 	NoWait bool
+	// Kind is model.LeaseKindJob or model.LeaseKindHold; empty means job.
+	// Callers submitting an ordinary job never set this — use Hold instead
+	// of setting it here directly, since the controller rejects a hold
+	// submission (Kind == model.LeaseKindHold) that also carries a Command.
+	Kind string
+	// Reason is why a hold was taken; meaningless for an ordinary job.
+	Reason string
 }
 
 func (c *Client) do(ctx context.Context, method, path string, body io.Reader) (*http.Response, error) {
@@ -99,6 +106,8 @@ func (c *Client) Submit(ctx context.Context, opts SubmitOptions) (*model.Job, er
 		MaxRuntimeSeconds:  int(opts.MaxRuntime.Seconds()),
 		IdleTimeoutSeconds: int(opts.IdleTimeout.Seconds()),
 		NoWait:             opts.NoWait,
+		Kind:               opts.Kind,
+		Reason:             opts.Reason,
 	})
 	if err != nil {
 		return nil, err
@@ -120,6 +129,50 @@ func (c *Client) Submit(ctx context.Context, opts SubmitOptions) (*model.Job, er
 		return nil, err
 	}
 	return &job, nil
+}
+
+// HoldOptions configures rc hold: taking a device for a human to use
+// directly (a shell), not for a job. Give exactly one of DeviceID or
+// Selector, matching SubmitOptions.
+type HoldOptions struct {
+	DeviceID  string
+	Selector  string
+	Submitter string
+	// Reason is why the device is being held (e.g. "manual profiling"),
+	// shown by rc devices and the dashboard.
+	Reason string
+	// TTL is required: unlike an ordinary job's MaxRuntime, a hold has no
+	// "device default" to fall back on, since the whole point is a human
+	// deciding how long they need the device. Capped by the device's
+	// max_runtime exactly as a job's MaxRuntime is — rejected, never
+	// clamped.
+	TTL time.Duration
+}
+
+// Hold submits a hold: a job with kind "hold" and no command of its own.
+// The worker chooses the sleeper it actually runs (internal/worker's
+// execute) — never this client, never the caller — so a hold can never be
+// used to run arbitrary code under a different label; see
+// server.handleSubmit, which rejects a hold submission that carries a
+// command. Hold goes through the exact same Submit/Enqueue/ScheduleOnce
+// path an ordinary job does: the same allocation transaction, the same
+// queue, the same wall-clock watchdog for expiry.
+func (c *Client) Hold(ctx context.Context, opts HoldOptions) (*model.Job, error) {
+	return c.Submit(ctx, SubmitOptions{
+		DeviceID:   opts.DeviceID,
+		Selector:   opts.Selector,
+		Submitter:  opts.Submitter,
+		MaxRuntime: opts.TTL,
+		Kind:       model.LeaseKindHold,
+		Reason:     opts.Reason,
+	})
+}
+
+// Release ends a hold — or, for that matter, any job — early. It is a thin
+// alias over Kill so ownership is checked identically: only the job's own
+// submitter, or an admin token, may release what they didn't hold.
+func (c *Client) Release(ctx context.Context, jobID, submitter string) error {
+	return c.Kill(ctx, jobID, submitter)
 }
 
 func (c *Client) Job(ctx context.Context, id string) (*model.Job, error) {
