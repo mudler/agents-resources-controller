@@ -61,6 +61,35 @@ func (s *Store) LabelsFor(deviceID string) ([]model.Label, error) {
 	return out, rows.Err()
 }
 
+// AllLabels returns every stored label row for every device, grouped by
+// device ID, in one query. It exists so a caller building a view across the
+// whole fleet (deviceViews, behind both /v1/state and /v1/devices) can show
+// each device's labels without issuing one LabelsFor query per device on top
+// of the Devices()/Leases() pair it already runs — the same N+1 concern the
+// task 7 review round found in handleExplain and fixed there.
+func (s *Store) AllLabels() (map[string][]model.Label, error) {
+	rows, err := s.db.Query(
+		`SELECT device_id, key, value, source, updated_at FROM device_labels
+		 ORDER BY device_id, key, source`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := map[string][]model.Label{}
+	for rows.Next() {
+		var deviceID string
+		var l model.Label
+		var updated int64
+		if err := rows.Scan(&deviceID, &l.Key, &l.Value, &l.Source, &updated); err != nil {
+			return nil, err
+		}
+		l.UpdatedAt = time.Unix(updated, 0).UTC()
+		out[deviceID] = append(out[deviceID], l)
+	}
+	return out, rows.Err()
+}
+
 // LabelSnapshot returns the effective labels the scheduler matches against:
 // device ID -> key -> value, with a detected value winning over a declared
 // one for the same key.

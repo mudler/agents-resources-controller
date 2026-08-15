@@ -52,6 +52,20 @@
   #updated.stale { color:var(--unhealthy); font-weight:700; }
   .cmd { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px;
          margin-top:6px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  /* Label chips: detected (a probe confirmed it) gets the solid, filled
+     treatment since it is what the scheduler actually trusts (see
+     store.LabelSnapshot — detected wins a same-key conflict); declared (an
+     operator wrote it in worker.yaml) gets an outlined, lighter treatment so
+     the two are told apart at a glance without reading either's text, the
+     same distinction `rc describe` draws with its "detected"/"declared"
+     column. */
+  .labels { display:flex; flex-wrap:wrap; gap:5px; margin-top:8px; }
+  .chip { font-size:11px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+          padding:2px 7px; border-radius:100px; line-height:1.6; }
+  .chip-detected { background:var(--ink); color:var(--bg); }
+  .chip-declared { background:transparent; color:var(--ink); border:1px solid var(--line); }
+  .no-labels { color:var(--muted); font-size:12px; font-style:italic; margin-top:8px; }
+  .labels-stale { color:var(--warn); font-size:11px; margin-top:6px; font-weight:600; }
   table { width:100%; border-collapse:collapse; }
   th,td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); font-size:13px; }
   th { color:var(--muted); font-weight:600; font-size:11px; text-transform:uppercase; letter-spacing:.06em; }
@@ -165,6 +179,68 @@
     return Math.floor(seconds / 3600) + "h" + Math.floor((seconds % 3600) / 60) + "m";
   }
 
+  // labelSourceRank orders chips detected-before-declared, matching
+  // internal/cli/describe.go's sourceRank: detected is what the scheduler
+  // actually trusts (store.LabelSnapshot), so it reads first, with declared
+  // right beside it — close enough that a conflicting hand-entered value is
+  // never hidden behind the one that "won".
+  var labelSourceRank = { detected: 0, declared: 1 };
+
+  // oldestLabelAgeSeconds finds how long ago the least-recently-confirmed
+  // label on a device was last seen, in seconds, or null if the device has
+  // no labels at all. Computed against this browser tab's own clock, like
+  // every other age on this page — a skewed client clock renders a skewed
+  // age here exactly as it does for "updated Ns ago" above.
+  function oldestLabelAgeSeconds(labels) {
+    if (!labels || !labels.length) return null;
+    var oldest = null;
+    labels.forEach(function (l) {
+      var t = Date.parse(l.updated_at);
+      if (!isNaN(t) && (oldest === null || t < oldest)) oldest = t;
+    });
+    if (oldest === null) return null;
+    return Math.max(0, Math.floor((Date.now() - oldest) / 1000));
+  }
+
+  // renderLabelChips shows every label as a "key=value" chip, detected and
+  // declared visually distinguished (see the .chip-detected/.chip-declared
+  // CSS), so a conflicting declared value stays visible next to the
+  // detected one that actually wins rather than being overwritten away.
+  // Every value comes from a probe script or an operator's worker.yaml —
+  // both untrusted as far as this page is concerned — so each chip's text
+  // is set via textContent, never innerHTML.
+  function renderLabelChips(box, labels) {
+    box.textContent = "";
+    if (!labels || !labels.length) {
+      var none = document.createElement("div");
+      none.className = "no-labels";
+      none.textContent = "no labels";
+      box.appendChild(none);
+      return;
+    }
+    var sorted = labels.slice().sort(function (a, b) {
+      if (a.key !== b.key) return a.key < b.key ? -1 : 1;
+      return (labelSourceRank[a.source] || 0) - (labelSourceRank[b.source] || 0);
+    });
+    var chips = document.createElement("div");
+    chips.className = "labels";
+    sorted.forEach(function (l) {
+      var chip = document.createElement("span");
+      chip.className = "chip " + (l.source === "detected" ? "chip-detected" : "chip-declared");
+      chip.textContent = l.key + "=" + l.value;
+      chips.appendChild(chip);
+    });
+    box.appendChild(chips);
+
+    var age = oldestLabelAgeSeconds(labels);
+    if (age !== null && age > 3600) {
+      var stale = document.createElement("div");
+      stale.className = "labels-stale";
+      stale.textContent = "⚠ oldest label " + ago(age) + " ago";
+      box.appendChild(stale);
+    }
+  }
+
   function renderDevices(views) {
     var box = document.getElementById("devices");
     box.textContent = "";
@@ -195,17 +271,43 @@
       var meta = document.createElement("div");
       meta.className = "meta";
       var bits = [];
-      if (v.holder) bits.push("held by " + v.holder + " for " + ago(v.elapsed_seconds));
+      if (v.holder) {
+        var held = "held by " + v.holder;
+        // A hold's reason rides the lease row precisely so it can stand in
+        // for its meaningless placeholder command — see
+        // internal/cli/ps.go's RenderDevices, which draws the same
+        // "holder (reason)" distinction for `rc devices`.
+        if (v.kind === "hold" && v.reason) held += " (" + v.reason + ")";
+        held += " for " + ago(v.elapsed_seconds);
+        bits.push(held);
+      }
       if (stale) bits.push((staleHeld ? "⚠ no contact " : "no contact ") + ago(v.heartbeat_age_seconds));
       meta.textContent = bits.join(" · ") || "idle";
       card.appendChild(meta);
 
-      if (v.command && v.command.length) {
+      // A hold's command is a fixed, meaningless placeholder the worker
+      // never actually runs (see server.holdCommand) — showing it would
+      // tell an operator nothing. Its reason is the whole point of a hold,
+      // so that's what renders here instead, and it stays out of this line
+      // entirely for a hold with no reason given.
+      if (v.kind === "hold") {
+        if (v.reason) {
+          var holdReason = document.createElement("div");
+          holdReason.className = "cmd";
+          holdReason.textContent = "hold: " + v.reason;
+          card.appendChild(holdReason);
+        }
+      } else if (v.command && v.command.length) {
         var cmd = document.createElement("div");
         cmd.className = "cmd";
         cmd.textContent = v.command.join(" ");
         card.appendChild(cmd);
       }
+
+      var labelsBox = document.createElement("div");
+      renderLabelChips(labelsBox, d.labels);
+      card.appendChild(labelsBox);
+
       box.appendChild(card);
     });
   }

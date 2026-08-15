@@ -622,6 +622,13 @@ func (s *Server) deviceViews() ([]DeviceView, error) {
 	if err != nil {
 		return nil, err
 	}
+	// One query for every device's labels, not one per device — see
+	// AllLabels's own doc comment for why deviceViews in particular must
+	// avoid that N+1 shape.
+	labels, err := s.cfg.Store.AllLabels()
+	if err != nil {
+		return nil, err
+	}
 	byDevice := map[string]struct {
 		holder string
 		jobID  string
@@ -642,6 +649,7 @@ func (s *Server) deviceViews() ([]DeviceView, error) {
 	now := s.cfg.Clock.Now()
 	out := make([]DeviceView, 0, len(devices))
 	for _, d := range devices {
+		d.Labels = labels[d.ID]
 		v := DeviceView{
 			Device:              d,
 			HeartbeatAgeSeconds: int(now.Sub(d.LastHeartbeatAt).Seconds()),

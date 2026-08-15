@@ -49,6 +49,11 @@ const (
 // for its one device at registration (worker.DeviceConfig.MaxRuntime),
 // exercised by TestWatchdogKillsAnOverrunningJob.
 //
+// opts customizes the one device newFleet's worker registers beyond what
+// deviceMaxRuntime already covers — see fleetOption and withHooks, used by
+// hold_test.go to exercise the acquire/release lifecycle hooks against a
+// real worker rather than reimplementing this whole setup a second time.
+//
 // It returns a client authenticated as a client-role token, the store (for
 // tests that want to assert against it directly), and the device's ID
 // ("testbox:dev0"). Everything it starts is torn down via t.Cleanup, which
@@ -56,7 +61,7 @@ const (
 // asserted) first, then the scheduler loop is stopped and joined, then the
 // httptest server is closed, and only then is the store closed — so nothing
 // registered here can touch the store after it's shut.
-func newFleet(t *testing.T, deviceMaxRuntime time.Duration) (*client.Client, *store.Store, string) {
+func newFleet(t *testing.T, deviceMaxRuntime time.Duration, opts ...fleetOption) (*client.Client, *store.Store, string) {
 	t.Helper()
 
 	dir := t.TempDir()
@@ -107,10 +112,15 @@ func newFleet(t *testing.T, deviceMaxRuntime time.Duration) (*client.Client, *st
 		<-schedDone
 	})
 
+	dev := worker.DeviceConfig{Name: fleetDevice, MaxRuntime: deviceMaxRuntime}
+	for _, opt := range opts {
+		opt(&dev)
+	}
+
 	wkCtx, cancelWk := context.WithCancel(context.Background())
 	wk := worker.New(worker.Config{
 		ControllerURL: ts.URL, Token: "wtok", Host: fleetHost,
-		Devices:           []worker.DeviceConfig{{Name: fleetDevice, MaxRuntime: deviceMaxRuntime}},
+		Devices:           []worker.DeviceConfig{dev},
 		HeartbeatInterval: time.Second, PollWait: time.Second,
 	})
 	workerDone := make(chan error, 1)
@@ -143,4 +153,24 @@ func newFleet(t *testing.T, deviceMaxRuntime time.Duration) (*client.Client, *st
 	}, 15*time.Second, 100*time.Millisecond, "worker never registered its device")
 
 	return cl, st, fleetHost + ":" + fleetDevice
+}
+
+// fleetOption customizes the one device newFleet's worker declares, for a
+// test that needs more than the bare name-and-ceiling every other test here
+// is content with.
+type fleetOption func(*worker.DeviceConfig)
+
+// withHooks arms the device's acquire/release lifecycle hooks and shortens
+// its release_linger to lingerSeconds — long enough to keep the hold_test.go
+// scenario (queue a job behind a hold, then release it) from tripping the
+// linger's own "another job landed, skip the release" rule, but short enough
+// that the test can still watch the release actually fire on a real, though
+// generous, require.Eventually bound instead of waiting out the 30s
+// production default.
+func withHooks(onAcquire, onRelease string, linger time.Duration) fleetOption {
+	return func(d *worker.DeviceConfig) {
+		d.OnAcquire = onAcquire
+		d.OnRelease = onRelease
+		d.ReleaseLinger = linger
+	}
 }
