@@ -184,13 +184,28 @@
   // actually trusts (store.LabelSnapshot), so it reads first, with declared
   // right beside it — close enough that a conflicting hand-entered value is
   // never hidden behind the one that "won".
-  var labelSourceRank = { detected: 0, declared: 1 };
+  //
+  // isDetectedSource is the one place that decides "detected" vs
+  // everything else, used by BOTH the sort order above and the chip's CSS
+  // class below, so the two can never disagree about a label whose source
+  // is neither "detected" nor "declared" (which should not happen, but a
+  // label that reaches this page with a source this page has never heard
+  // of must still sort and render as the SAME thing, not sort like a
+  // detected label while rendering with the declared chip's outline).
+  function isDetectedSource(source) { return source === "detected"; }
 
   // oldestLabelAgeSeconds finds how long ago the least-recently-confirmed
   // label on a device was last seen, in seconds, or null if the device has
-  // no labels at all. Computed against this browser tab's own clock, like
-  // every other age on this page — a skewed client clock renders a skewed
-  // age here exactly as it does for "updated Ns ago" above.
+  // no labels at all.
+  //
+  // Unlike heartbeat_age_seconds and elapsed_seconds — which the server
+  // already reduces to a seconds count before it ever reaches this page, so
+  // they are immune to this browser's own clock — a label only carries an
+  // absolute updated_at timestamp on the wire, so this function measures it
+  // against Date.now(), the same way updateFreshness's "updated Ns ago"
+  // does. A browser clock skewed by more than an hour can therefore show a
+  // false staleness warning here (or hide a real one) without any of the
+  // other ages on this page being affected at all.
   function oldestLabelAgeSeconds(labels) {
     if (!labels || !labels.length) return null;
     var oldest = null;
@@ -220,13 +235,13 @@
     }
     var sorted = labels.slice().sort(function (a, b) {
       if (a.key !== b.key) return a.key < b.key ? -1 : 1;
-      return (labelSourceRank[a.source] || 0) - (labelSourceRank[b.source] || 0);
+      return (isDetectedSource(a.source) ? 0 : 1) - (isDetectedSource(b.source) ? 0 : 1);
     });
     var chips = document.createElement("div");
     chips.className = "labels";
     sorted.forEach(function (l) {
       var chip = document.createElement("span");
-      chip.className = "chip " + (l.source === "detected" ? "chip-detected" : "chip-declared");
+      chip.className = "chip " + (isDetectedSource(l.source) ? "chip-detected" : "chip-declared");
       chip.textContent = l.key + "=" + l.value;
       chips.appendChild(chip);
     });

@@ -339,13 +339,12 @@ cap server-side as a second line of defence), so a hand-edited `host.md`
 can never grow the database unboundedly. The cap is per sheet, not per
 registration.
 
-**Write a `host.d/<device-name>.md` for every device whose sheet you want
-`rc describe` to show.** `host.md` is meant to be a fallback for a device
-with none of its own, but verified against a running worker, that
-fallback did not surface for a device with no `host.d` file once the
-worker had registered at least once — see this stage's report for the
-reproduction. Give every device its own file (it can simply repeat the
-host-wide text) rather than relying on the fallback.
+**A device with no `host.d/<device-name>.md` of its own falls back to
+`host.md`.** Writing one `host.md` for a box is the common case, and
+`rc describe` shows it for every device on that host until (and unless)
+that device gets a sheet of its own; `sheet_is_host_wide` in the JSON
+output (and the "device note"/"host-wide note" label in the text output)
+says which one actually landed.
 
 `rc describe <device-id>` is the one command that shows everything known
 about a device before you write a command for it: its state and current

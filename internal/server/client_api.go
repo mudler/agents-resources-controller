@@ -166,13 +166,27 @@ func (s *Server) handleDescribe(w http.ResponseWriter, r *http.Request) {
 	// one actually landed is reported back (sheetIsHostWide) so the
 	// rendering — and the agent reading it — can tell "applies to this
 	// card" from "applies to the whole box".
+	//
+	// The fallback triggers on an empty body alone, NOT "empty body and a
+	// zero timestamp" as an earlier version of this check required. A real
+	// worker's readSheets always sends an explicit (if empty) per-device
+	// entry for every device it declares — a missing host.d/<name>.md reads
+	// the same as an empty one — so applyDeviceFacts stores a real,
+	// non-zero-timestamped row for a device that has never actually had its
+	// own sheet. Requiring a zero timestamp on top of an empty body meant
+	// that row's mere existence, from the device's first registration
+	// onward, permanently defeated this fallback: host.md — the single most
+	// common way to document a box — never surfaced for any of its devices.
+	// An empty body has nothing to show either way, so falling back on it
+	// alone is correct: there is no useful distinction left to make between
+	// "never registered a sheet" and "registered an empty one".
 	sheet, sheetAt, err := s.cfg.Store.HostDoc(view.Device.Host, id)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
 		return
 	}
 	sheetIsHostWide := false
-	if sheet == "" && sheetAt.IsZero() {
+	if sheet == "" {
 		sheet, sheetAt, err = s.cfg.Store.HostDoc(view.Device.Host, "")
 		if err != nil {
 			writeErr(w, http.StatusInternalServerError, "store_error", err.Error())

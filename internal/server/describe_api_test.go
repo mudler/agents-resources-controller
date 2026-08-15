@@ -116,6 +116,45 @@ func TestDescribeSheetFallsBackToHostWideWhenNoDeviceSheet(t *testing.T) {
 	require.True(t, out.SheetIsHostWide, "the fallback sheet must be flagged as host-wide, not attributed to this device")
 }
 
+// TestDescribeSheetFallsBackToHostWideEvenAfterAnExplicitEmptyDeviceSheet
+// pins the exact shape a REAL worker registers in, not just the synthetic
+// "DeviceSheets omitted entirely" shape the test above uses: worker.go's
+// readSheets sends an explicit (if empty) entry in device_sheets for every
+// device it declares, whether or not that device has its own host.d/<name>.md
+// — a missing per-device file reads as "" the same way an empty one would.
+// That means applyDeviceFacts stores a REAL host_docs row for gpu0 with an
+// empty body and a real (non-zero) timestamp on this very first
+// registration — the exact row shape that used to defeat the "empty body
+// AND zero timestamp" fallback check in handleDescribe forever, because
+// that row's timestamp is never zero from here on. A device that only ever
+// gets this "I have nothing of my own" empty entry must still see the
+// host-wide sheet.
+func TestDescribeSheetFallsBackToHostWideEvenAfterAnExplicitEmptyDeviceSheet(t *testing.T) {
+	ts, _, _, _ := newServer(t)
+
+	reg := post(t, ts, "wtok", "/v1/workers/register", server.RegisterRequest{
+		Host: "gpubox", Devices: []server.DeviceSpec{{Name: "gpu0"}},
+		Sheet: ptr("# gpubox\nshared rack A1, ask #infra before touching cabling"),
+		// This is what a real worker with no host.d/gpu0.md sends: gpu0 IS
+		// present in the map, mapped to "" — not omitted, the way the test
+		// above's bare RegisterRequest (no DeviceSheets field at all) does.
+		DeviceSheets: map[string]string{"gpu0": ""},
+	})
+	reg.Body.Close()
+	require.Equal(t, http.StatusOK, reg.StatusCode)
+
+	resp := get(t, ts, "ctok", "/v1/devices/gpubox:gpu0/describe")
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	var out server.DescribeResponse
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&out))
+	require.Contains(t, out.Sheet, "shared rack A1",
+		"an explicit empty per-device sheet must still fall back to the host-wide one, not shadow it with nothing")
+	require.True(t, out.SheetIsHostWide,
+		"the fallback sheet must be flagged as host-wide even though gpu0 has its own (empty) host_docs row")
+}
+
 // TestDescribeIncludesHolderAndRecentJobs proves the device-status and
 // job-history halves of the response actually carry real data end to end —
 // not just an empty slice a looser test wouldn't have caught missing.
