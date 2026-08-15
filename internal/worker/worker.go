@@ -162,6 +162,15 @@ type Worker struct {
 	// story as the fields above: only ever touched from the sequential
 	// register()/pushLabels() call chain.
 	probeSourceDevices map[string]map[string]bool
+
+	// probeSourceClearWarned is the once-per-episode marker for the OTHER
+	// half of that ruling: a drop-in that failed while this process has no
+	// record of the devices it covers preserves nothing, so whatever it used
+	// to report is about to be cleared. gatherLabels warns about that once
+	// per source per episode (reset when the source succeeds again, pruned
+	// when it disappears), for the same alert-fatigue reason labelOmitWarned
+	// exists — an outage lasts many passes.
+	probeSourceClearWarned map[string]bool
 }
 
 func New(cfg Config) *Worker {
@@ -190,7 +199,8 @@ func New(cfg Config) *Worker {
 		deviceHooks:     map[string]*deviceHookState{},
 		labelOmitWarned: map[string]bool{},
 
-		probeSourceDevices: map[string]map[string]bool{},
+		probeSourceDevices:     map[string]map[string]bool{},
+		probeSourceClearWarned: map[string]bool{},
 	}
 }
 

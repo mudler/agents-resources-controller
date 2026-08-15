@@ -31,8 +31,9 @@ type ProbeResult struct {
 	// could not confirm, because a source understood to speak for that
 	// device failed: nvidia-smi found on PATH but erroring, timing out, or
 	// emitting something that doesn't parse; nvidia-smi not found on PATH
-	// THIS pass despite having been found on a PREVIOUS pass by this same
-	// worker process (see gatherLabels for the "seen at startup" rule this
+	// THIS pass despite having been found on this worker process's FIRST
+	// pass (that one snapshot, w.nvidiaSmiSeenAtStartup, is the whole
+	// history kept — see gatherLabels for the "seen at startup" rule this
 	// depends on; a host that has never once seen nvidia-smi does NOT mark
 	// anything unconfirmed for that reason, or a device's labels could never
 	// be cleared on a GPU-less host); or a drop-in probe erroring, being
@@ -153,7 +154,17 @@ func (w *Worker) gatherLabels(ctx context.Context) ProbeResult {
 	// memory nothing ever cleans up. A source that ran and FAILED carries
 	// its entry forward explicitly, via unconfirm.
 	sourceDevices := make(map[string]map[string]bool, len(w.probeSourceDevices))
-	defer func() { w.probeSourceDevices = sourceDevices }()
+	defer func() {
+		w.probeSourceDevices = sourceDevices
+		// probeSourceClearWarned is pruned against the same rebuild, so a
+		// source that is gone cannot leave a marker behind that silences the
+		// warning if a script of that name ever comes back.
+		for source := range w.probeSourceClearWarned {
+			if _, known := sourceDevices[source]; !known {
+				delete(w.probeSourceClearWarned, source)
+			}
+		}
+	}()
 
 	// merge is called only for a source that actually SUCCEEDED: it folds
 	// that source's facts in and records which devices it named, replacing
@@ -161,17 +172,47 @@ func (w *Worker) gatherLabels(ctx context.Context) ProbeResult {
 	// speaking for gpu0.
 	merge := func(source string, facts map[string]string) {
 		sourceDevices[source] = mergeProbeFacts(&res, facts, deviceNames, source)
+		delete(w.probeSourceClearWarned, source) // recovered: a later failure warns again
 	}
 
 	// unconfirm is the failure half: this source could not be confirmed
 	// this pass, so every device it is understood to speak for is
 	// unconfirmed, and its memory of them is carried forward unchanged
-	// (nothing this pass learned anything about it).
+	// (nothing this pass learned anything about it). Carrying it forward is
+	// what makes preservation last as long as the outage does: without it a
+	// device would be preserved on the first failing pass and then, its
+	// scope forgotten, sent as a present empty map on the second — the
+	// clear this whole mechanism exists to prevent, arriving one probe
+	// interval late.
 	unconfirm := func(source string, devices map[string]bool) {
 		sourceDevices[source] = devices
 		for name := range devices {
 			res.Unconfirmed[name] = true
 		}
+	}
+
+	// dropInFailed is unconfirm for a drop-in probe, whose scope — unlike
+	// nvidia-smi's — is known only from what it named the last time it
+	// worked. When there is no such record, this source covers no device and
+	// nothing is preserved for it: whatever it used to report is about to be
+	// cleared. That is the deliberate ruling (see ProbeResult.Unconfirmed),
+	// but it must not be SILENT. Without this line an operator sees "probe
+	// failed; skipped" on the worker and, entirely separately, labels
+	// vanishing and submits being rejected, with nothing connecting the two
+	// but a hunch — and no notify event covers labels. Warned once per
+	// episode, per source, in the same shape labelOmitWarned uses for the
+	// omission warning: an outage lasts many passes and a line per pass
+	// teaches an operator to stop reading the stream.
+	dropInFailed := func(path string) {
+		devices := w.probeSourceDevices[path]
+		unconfirm(path, devices)
+		if len(devices) > 0 || w.probeSourceClearWarned[path] {
+			return
+		}
+		slog.Warn("probe failed and has not succeeded once since this worker started; "+
+			"it is treated as covering no device, so anything it used to report is cleared rather than preserved",
+			"probe", path, "devices", declaredDeviceNames(w.cfg.Devices))
+		w.probeSourceClearWarned[path] = true
 	}
 
 	merge("builtin", builtinLabels())
@@ -241,11 +282,15 @@ func (w *Worker) gatherLabels(ctx context.Context) ProbeResult {
 		// the whole fleet's detected labels the way a directory that ran and
 		// legitimately reported nothing would.
 		slog.Warn("read probe dir", "dir", w.cfg.ProbeDir, "err", err)
-		for source, devices := range w.probeSourceDevices {
+		for source := range w.probeSourceDevices {
 			if _, ran := sourceDevices[source]; ran {
-				continue // a built-in, already resolved above
+				// A built-in, already resolved above: nvidia-smi that ran
+				// perfectly well this pass must not be re-clouded by a
+				// failure that belongs to the drop-in directory — that is
+				// this task's own bug class, one branch over.
+				continue
 			}
-			unconfirm(source, devices)
+			dropInFailed(source)
 		}
 		return res
 	}
@@ -268,8 +313,7 @@ func (w *Worker) gatherLabels(ctx context.Context) ProbeResult {
 			// purposes, from one that ran and failed outright. That goes for
 			// every probe still ahead of this one too, not just this one.
 			for _, skipped := range names[i:] {
-				skippedPath := filepath.Join(w.cfg.ProbeDir, skipped)
-				unconfirm(skippedPath, w.probeSourceDevices[skippedPath])
+				dropInFailed(filepath.Join(w.cfg.ProbeDir, skipped))
 			}
 			break
 		}
@@ -278,7 +322,7 @@ func (w *Worker) gatherLabels(ctx context.Context) ProbeResult {
 		info, err := os.Stat(path)
 		if err != nil {
 			slog.Warn("stat probe; skipped", "probe", path, "err", err)
-			unconfirm(path, w.probeSourceDevices[path])
+			dropInFailed(path)
 			continue
 		}
 		if info.Mode()&0o111 == 0 {
@@ -288,12 +332,23 @@ func (w *Worker) gatherLabels(ctx context.Context) ProbeResult {
 		facts, err := runProbe(ctx, path, w.cfg.ProbeTimeout)
 		if err != nil {
 			slog.Warn("probe failed; skipped", "probe", path, "err", err)
-			unconfirm(path, w.probeSourceDevices[path])
+			dropInFailed(path)
 			continue
 		}
 		merge(path, facts)
 	}
 	return res
+}
+
+// declaredDeviceNames lists this host's device names, sorted, for a log line
+// that has to say which devices a decision affects.
+func declaredDeviceNames(devices []DeviceConfig) []string {
+	names := make([]string, 0, len(devices))
+	for _, d := range devices {
+		names = append(names, d.Name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 // nvidiaSource names nvidia-smi as a probe source, both in the warning
@@ -634,8 +689,9 @@ func kernelRelease() (string, bool) {
 // true, so a device's stale GPU facts would survive either. Fix round 3
 // measured the fallout on a host that has NEVER had nvidia-smi at all: with
 // found permanently false, gatherLabels' caller had no way to tell that
-// apart from "nvidia-smi vanished after being seen", so ProbeResult.Failed
-// stayed true on EVERY pass forever, and a device's detected labels could
+// apart from "nvidia-smi vanished after being seen", so every pass reported
+// a failure forever (the pass-wide flag that preceded
+// ProbeResult.Unconfirmed), and a device's detected labels could
 // never be cleared by ANY means on such a host — not even the ordinary
 // "a drop-in probe stopped reporting a key" case Task 3 explicitly
 // supports. gatherLabels (its only caller) now resolves the distinction
