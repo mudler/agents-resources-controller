@@ -76,8 +76,13 @@ type Lease struct {
 }
 
 type Job struct {
-	ID                 string            `json:"id"`
-	Selector           string            `json:"selector"`
+	ID       string `json:"id"`
+	Selector string `json:"selector"`
+	// Kind is LeaseKindJob or LeaseKindHold. A hold is a job whose command
+	// the worker chooses for itself (see internal/worker's execute) rather
+	// than anything the submitter supplied — see server.handleSubmit, which
+	// rejects a hold submission that carries one.
+	Kind               string            `json:"kind"`
 	Command            []string          `json:"command"`
 	Cwd                string            `json:"cwd"`
 	Env                map[string]string `json:"env,omitempty"`
@@ -92,9 +97,13 @@ type Job struct {
 	WorkerID           string            `json:"worker_id"`
 	ExitCode           *int              `json:"exit_code,omitempty"`
 	KillReason         string            `json:"kill_reason,omitempty"`
-	SubmittedAt        time.Time         `json:"submitted_at"`
-	StartedAt          *time.Time        `json:"started_at,omitempty"`
-	FinishedAt         *time.Time        `json:"finished_at,omitempty"`
+	// Reason is why a hold was taken (e.g. "manual profiling"), shown by
+	// rc devices and the dashboard via the lease row it is copied onto at
+	// assignment. Empty for an ordinary job.
+	Reason      string     `json:"reason,omitempty"`
+	SubmittedAt time.Time  `json:"submitted_at"`
+	StartedAt   *time.Time `json:"started_at,omitempty"`
+	FinishedAt  *time.Time `json:"finished_at,omitempty"`
 }
 
 type Worker struct {

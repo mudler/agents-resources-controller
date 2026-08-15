@@ -211,11 +211,11 @@ func (s *Store) Job(id string) (*model.Job, error) {
 	err := s.db.QueryRow(
 		`SELECT id, selector, command, cwd, env, submitter, idempotency_key, state,
 		        device_id, worker_id, exit_code, kill_reason, submitted_at, started_at, finished_at,
-		        priority, max_runtime, idle_timeout, queued_at
+		        priority, max_runtime, idle_timeout, queued_at, kind, reason
 		 FROM jobs WHERE id = ?`, id,
 	).Scan(&j.ID, &j.Selector, &cmdJSON, &j.Cwd, &envJSON, &j.Submitter, &idem, &j.State,
 		&j.DeviceID, &j.WorkerID, &exitCode, &j.KillReason, &submitted, &started, &finished,
-		&priority, &maxRuntime, &idleTimeout, &queuedAt)
+		&priority, &maxRuntime, &idleTimeout, &queuedAt, &j.Kind, &j.Reason)
 	if err != nil {
 		return nil, err
 	}
@@ -276,11 +276,11 @@ func (s *Store) assignQueued(jobID, deviceID string) (*model.Job, error) {
 		return nil, fmt.Errorf("select device: %w", err)
 	}
 
-	var submitter string
+	var submitter, kind, reason string
 	var ttl int64
 	if err := tx.QueryRow(
-		`SELECT submitter, max_runtime FROM jobs WHERE id = ? AND state = ?`,
-		jobID, string(model.JobQueued)).Scan(&submitter, &ttl); err != nil {
+		`SELECT submitter, max_runtime, kind, reason FROM jobs WHERE id = ? AND state = ?`,
+		jobID, string(model.JobQueued)).Scan(&submitter, &ttl, &kind, &reason); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, errJobNoLongerQueued
 		}
@@ -314,10 +314,14 @@ func (s *Store) assignQueued(jobID, deviceID string) (*model.Job, error) {
 	if ttl > 0 {
 		expiry = now.Add(time.Duration(ttl)*time.Second + leaseGraceOverRuntime)
 	}
+	// kind and reason are copied straight from the job row onto the lease
+	// it is granted: for a hold this is what lets rc devices and the
+	// dashboard label the holder as a hold with its reason, rather than a
+	// mysterious sleep, without a join back to jobs.
 	if _, err := tx.Exec(
-		`INSERT INTO leases (id, device_id, holder, job_id, acquired_at, expires_at)
-		 VALUES (?, ?, ?, ?, ?, ?)`,
-		uuid.NewString(), deviceID, submitter, jobID, now.Unix(), expiry.Unix()); err != nil {
+		`INSERT INTO leases (id, device_id, holder, job_id, acquired_at, expires_at, kind, reason)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		uuid.NewString(), deviceID, submitter, jobID, now.Unix(), expiry.Unix(), kind, reason); err != nil {
 		return nil, fmt.Errorf("insert lease: %w", err)
 	}
 	if _, err := tx.Exec(`DELETE FROM reservations WHERE device_id = ?`, deviceID); err != nil {

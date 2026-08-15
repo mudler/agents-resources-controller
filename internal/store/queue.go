@@ -41,6 +41,14 @@ type EnqueueRequest struct {
 	Priority       int
 	MaxRuntime     time.Duration
 	IdleTimeout    time.Duration
+	// Kind is model.LeaseKindJob or model.LeaseKindHold; empty defaults to
+	// LeaseKindJob. Validating that a hold carries no command and has a
+	// TTL is the submit handler's job (server.handleSubmit), not this
+	// layer's — Enqueue only persists what it is given.
+	Kind string
+	// Reason is why a hold was taken; carried through to the job row and,
+	// at assignment, copied onto the lease row (see assignQueued).
+	Reason string
 }
 
 // SetDeviceMaxRuntime records the ceiling a host declares for one of its
@@ -188,15 +196,21 @@ func (s *Store) Enqueue(req EnqueueRequest) (*model.Job, error) {
 		key = req.IdempotencyKey
 	}
 
+	kind := req.Kind
+	if kind == "" {
+		kind = model.LeaseKindJob
+	}
+
 	id := uuid.NewString()
 	if _, err := tx.Exec(
 		`INSERT INTO jobs (id, selector, command, cwd, env, submitter, idempotency_key,
 		                   state, device_id, worker_id, submitted_at, queued_at,
-		                   priority, max_runtime, idle_timeout)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?)`,
+		                   priority, max_runtime, idle_timeout, kind, reason)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?)`,
 		id, req.Selector, string(cmdJSON), req.Cwd, string(envJSON), req.Submitter, key,
 		string(model.JobQueued), req.DeviceID, now.Unix(), now.Unix(),
 		req.Priority, int64(req.MaxRuntime.Seconds()), int64(req.IdleTimeout.Seconds()),
+		kind, req.Reason,
 	); err != nil {
 		return nil, fmt.Errorf("insert queued job: %w", err)
 	}

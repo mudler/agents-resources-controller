@@ -346,7 +346,7 @@ func (s *Store) Devices() ([]model.Device, error) {
 
 func (s *Store) Leases() ([]model.Lease, error) {
 	rows, err := s.db.Query(
-		`SELECT id, device_id, holder, job_id, acquired_at, expires_at
+		`SELECT id, device_id, holder, job_id, acquired_at, expires_at, kind, reason
 		 FROM leases WHERE released_at IS NULL ORDER BY acquired_at`)
 	if err != nil {
 		return nil, err
@@ -357,7 +357,7 @@ func (s *Store) Leases() ([]model.Lease, error) {
 	for rows.Next() {
 		var l model.Lease
 		var acq, exp int64
-		if err := rows.Scan(&l.ID, &l.DeviceID, &l.Holder, &l.JobID, &acq, &exp); err != nil {
+		if err := rows.Scan(&l.ID, &l.DeviceID, &l.Holder, &l.JobID, &acq, &exp, &l.Kind, &l.Reason); err != nil {
 			return nil, err
 		}
 		l.AcquiredAt = time.Unix(acq, 0).UTC()

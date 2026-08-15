@@ -97,6 +97,20 @@ var migrations = []struct {
 			`ALTER TABLE leases ADD COLUMN reason TEXT NOT NULL DEFAULT ''`,
 		},
 	},
+	{
+		name: "stage3 hold job kind",
+		stmts: []string{
+			// A hold is a job (kind='hold'), not a second lease mechanism —
+			// see task 8's design note. These mirror the columns already
+			// added to leases above; the job's own copy is what Enqueue
+			// writes at submission and QueuedJobs/ActiveJobs read back, and
+			// assignQueued copies it onto the lease row it creates so
+			// rc devices and the dashboard can label the holder without a
+			// join back to jobs.
+			`ALTER TABLE jobs ADD COLUMN kind TEXT NOT NULL DEFAULT 'job'`,
+			`ALTER TABLE jobs ADD COLUMN reason TEXT NOT NULL DEFAULT ''`,
+		},
+	},
 }
 
 // migrate brings the database up to len(migrations). It runs each pending
