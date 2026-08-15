@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/mudler/agents-resources-controller/internal/model"
+	"github.com/mudler/agents-resources-controller/internal/selector"
 	"github.com/mudler/agents-resources-controller/internal/store"
 )
 
@@ -87,7 +88,12 @@ type DescribeResponse struct {
 	Labels              []model.Label `json:"labels,omitempty"`
 	Sheet               string        `json:"sheet,omitempty"`
 	SheetUpdatedAt      time.Time     `json:"sheet_updated_at,omitempty"`
-	RecentJobs          []model.Job   `json:"recent_jobs,omitempty"`
+	// SheetIsHostWide is true when Sheet fell back to the host-wide note
+	// because this device has none of its own — an agent reading "don't run
+	// more than two jobs here" needs to know whether that applies to the
+	// whole box or just this card.
+	SheetIsHostWide bool        `json:"sheet_is_host_wide,omitempty"`
+	RecentJobs      []model.Job `json:"recent_jobs,omitempty"`
 }
 
 // ExplainResponse answers "if I submitted this selector right now, what
@@ -132,18 +138,23 @@ func (s *Server) handleDescribe(w http.ResponseWriter, r *http.Request) {
 
 	// Prefer the device's own sheet; a device with none of its own still
 	// gets the host-wide one, so describe never goes silent about
-	// documentation that exists just because it lives one level up.
+	// documentation that exists just because it lives one level up. Which
+	// one actually landed is reported back (sheetIsHostWide) so the
+	// rendering — and the agent reading it — can tell "applies to this
+	// card" from "applies to the whole box".
 	sheet, sheetAt, err := s.cfg.Store.HostDoc(view.Device.Host, id)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
 		return
 	}
+	sheetIsHostWide := false
 	if sheet == "" && sheetAt.IsZero() {
 		sheet, sheetAt, err = s.cfg.Store.HostDoc(view.Device.Host, "")
 		if err != nil {
 			writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
 			return
 		}
+		sheetIsHostWide = true
 	}
 
 	recent, err := s.cfg.Store.RecentJobsForDevice(id, describeRecentJobs)
@@ -161,6 +172,7 @@ func (s *Server) handleDescribe(w http.ResponseWriter, r *http.Request) {
 		Labels:              labels,
 		Sheet:               sheet,
 		SheetUpdatedAt:      sheetAt,
+		SheetIsHostWide:     sheetIsHostWide,
 		RecentJobs:          recent,
 	})
 }
@@ -176,29 +188,49 @@ func (s *Server) handleExplain(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "bad_request", "selector query parameter required")
 		return
 	}
-
-	matching, err := s.cfg.Store.MatchingDevices(sel)
+	parsed, err := selector.Parse(sel)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "bad_selector", err.Error())
 		return
 	}
 
+	// The label snapshot and device list are fetched exactly ONCE for this
+	// whole request and matched against locally — for the requested
+	// selector AND for every queued selector job below — rather than
+	// calling store.MatchingDevices (its own LabelSnapshot + Devices pair)
+	// once per queued job. At MaxOpenConns(1) every store query serialises
+	// against the scheduler and the heartbeat handler, so a deep selector
+	// queue behind a per-job round trip would let a diagnostic command —
+	// exactly the kind someone re-runs repeatedly while debugging — stall
+	// job scheduling fleet-wide. The matching logic itself is unchanged:
+	// this calls the same selector.Selector.Match that MatchingDevices
+	// calls internally, just against a shared snapshot instead of a fresh
+	// one per selector.
+	snapshot, err := s.cfg.Store.LabelSnapshot()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
+		return
+	}
 	devices, err := s.cfg.Store.Devices()
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
 		return
 	}
-	stateByID := make(map[string]model.DeviceState, len(devices))
-	for _, d := range devices {
-		stateByID[d.ID] = d.State
-	}
 
-	matchSet := make(map[string]bool, len(matching))
-	free := make([]string, 0, len(matching))
-	for _, id := range matching {
-		matchSet[id] = true
-		if stateByID[id] == model.DeviceReady {
-			free = append(free, id)
+	// Devices() is already ordered by ID, so appending matches in that
+	// order keeps Matching sorted the same way store.MatchingDevices
+	// guarantees.
+	matching := make([]string, 0, len(devices))
+	free := make([]string, 0, len(devices))
+	matchSet := make(map[string]bool, len(devices))
+	for _, d := range devices {
+		if !parsed.Match(snapshot[d.ID]) {
+			continue
+		}
+		matching = append(matching, d.ID)
+		matchSet[d.ID] = true
+		if d.State == model.DeviceReady {
+			free = append(free, d.ID)
 		}
 	}
 
@@ -220,14 +252,14 @@ func (s *Server) handleExplain(w http.ResponseWriter, r *http.Request) {
 		}
 		// A queued selector job could land on any of ITS candidates; it
 		// counts against this explain's depth if the two candidate sets
-		// overlap at all — reusing MatchingDevices again rather than a
-		// second notion of "could this land here".
-		candidates, err := s.cfg.Store.MatchingDevices(j.Selector)
+		// overlap at all, matched against the same shared snapshot rather
+		// than a fresh store round trip per job.
+		jobSel, err := selector.Parse(j.Selector)
 		if err != nil {
 			continue
 		}
-		for _, c := range candidates {
-			if matchSet[c] {
+		for _, d := range devices {
+			if matchSet[d.ID] && jobSel.Match(snapshot[d.ID]) {
 				depth++
 				break
 			}
@@ -267,6 +299,18 @@ func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 			fmt.Sprintf("priority %d is out of range: it must be between %d and %d — priority is a nudge within one device's queue, not a scheduling language",
 				req.Priority, MinPriority, MaxPriority))
 		return
+	}
+	// A malformed selector is validated here, before Enqueue, so it maps to
+	// the same 400 bad_selector handleExplain already gives — not a 500.
+	// store.Enqueue wraps selector.Parse's error as "selector: %w" with no
+	// sentinel to test for, so without this pre-check it falls through to
+	// the generic store_error 500 below: a typo'd selector would read as
+	// "the controller is broken" instead of naming the bad term.
+	if req.Selector != "" {
+		if _, err := selector.Parse(req.Selector); err != nil {
+			writeErr(w, http.StatusBadRequest, "bad_selector", err.Error())
+			return
+		}
 	}
 
 	// Submitting always enqueues: ScheduleOnce below is the only place a

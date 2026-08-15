@@ -90,6 +90,7 @@ func TestDescribeReturnsSheetAndAge(t *testing.T) {
 	require.Equal(t, "gpu0 runs the nightly eval suite", out.Sheet)
 	require.WithinDuration(t, stamped, out.SheetUpdatedAt, time.Second,
 		"the sheet's age must reflect when it was actually written, however long ago")
+	require.False(t, out.SheetIsHostWide, "a device's own sheet must not be reported as the host-wide fallback")
 }
 
 // TestDescribeSheetFallsBackToHostWideWhenNoDeviceSheet: a device with no
@@ -112,6 +113,7 @@ func TestDescribeSheetFallsBackToHostWideWhenNoDeviceSheet(t *testing.T) {
 	var out server.DescribeResponse
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&out))
 	require.Contains(t, out.Sheet, "shared rack A1")
+	require.True(t, out.SheetIsHostWide, "the fallback sheet must be flagged as host-wide, not attributed to this device")
 }
 
 // TestDescribeIncludesHolderAndRecentJobs proves the device-status and

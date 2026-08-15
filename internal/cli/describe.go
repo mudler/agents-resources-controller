@@ -75,7 +75,7 @@ func RenderDescribe(w io.Writer, out *server.DescribeResponse) error {
 
 	fmt.Fprintln(tw)
 	fmt.Fprintln(tw, "USAGE SHEET")
-	renderSheet(tw, out.Sheet, out.SheetUpdatedAt, now)
+	renderSheet(tw, out.Sheet, out.SheetUpdatedAt, out.SheetIsHostWide, now)
 
 	fmt.Fprintln(tw)
 	fmt.Fprintln(tw, "RECENT JOBS")
@@ -104,12 +104,19 @@ func renderLabels(w io.Writer, labels []model.Label, now time.Time) {
 	}
 }
 
-func renderSheet(w io.Writer, body string, updatedAt, now time.Time) {
+func renderSheet(w io.Writer, body string, updatedAt time.Time, hostWide bool, now time.Time) {
 	if body == "" && updatedAt.IsZero() {
 		fmt.Fprintln(w, "  (none on file)")
 		return
 	}
-	fmt.Fprintf(w, "  updated %s\n", formatAge(now.Sub(updatedAt)))
+	// Which scope this note applies to matters as much as its age: an
+	// agent reading "don't run more than two jobs here" needs to know
+	// whether that's a rule for the whole box or just this card.
+	scope := "device note"
+	if hostWide {
+		scope = "host-wide note"
+	}
+	fmt.Fprintf(w, "  %s, updated %s\n", scope, formatAge(now.Sub(updatedAt)))
 	for _, line := range strings.Split(body, "\n") {
 		fmt.Fprintf(w, "  %s\n", line)
 	}

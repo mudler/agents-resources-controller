@@ -244,6 +244,47 @@ func TestSubmitRejectsEmptySubmitter(t *testing.T) {
 	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
 }
 
+// TestSubmitRejectsBothDeviceIDAndSelector pins the HTTP layer's half of the
+// exactly-one-of rule: store.Enqueue already rejects this combination, but
+// nothing previously proved handleSubmit's own pre-check (which runs before
+// Enqueue is ever reached) actually rejects it too, at this layer, with a
+// 400.
+func TestSubmitRejectsBothDeviceIDAndSelector(t *testing.T) {
+	ts, _, _, _ := newServer(t)
+	registerWorker(t, ts)
+
+	resp := post(t, ts, "ctok", "/v1/jobs", server.SubmitRequest{
+		DeviceID: "gpubox:gpu0", Selector: "vram>=40G",
+		Command: []string{"./bench"}, Submitter: "agent-a",
+	})
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+}
+
+// TestSubmitWithMalformedSelectorReturns400NotStoreError guards the review
+// finding: store.Enqueue wraps a selector parse failure as "selector: %w",
+// which matched none of handleSubmit's errors.Is branches and fell through
+// to a 500 store_error — telling the agent the CONTROLLER is broken for a
+// typo in ITS OWN selector, and hiding which term was wrong. A malformed
+// selector must read exactly like /v1/explain's identical case: 400
+// bad_selector, with the real reason in the message.
+func TestSubmitWithMalformedSelectorReturns400NotStoreError(t *testing.T) {
+	ts, _, _, _ := newServer(t)
+	registerWorker(t, ts)
+
+	resp := post(t, ts, "ctok", "/v1/jobs", server.SubmitRequest{
+		Selector: "not-a-valid-term", Command: []string{"./bench"}, Submitter: "agent-a",
+	})
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode,
+		"a malformed selector must be the caller's mistake (400), not reported as a controller failure (500)")
+
+	var body map[string]string
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
+	require.Equal(t, "bad_selector", body["error"])
+	require.NotEqual(t, "store_error", body["error"])
+}
+
 // TestSubmitWakesWaitingWorkerLongPoll is the only coverage of poke: without
 // it, a worker blocked in the assignments long-poll would only ever see a
 // freshly assigned job after the wait window (up to 30s in production)

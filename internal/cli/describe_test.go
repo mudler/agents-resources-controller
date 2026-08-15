@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -43,6 +44,22 @@ func runDescribe(t *testing.T, ts *httptest.Server, args ...string) (string, err
 	cmd.SetArgs(append([]string{"gpubox:gpu0"}, args...))
 	err := cmd.Execute()
 	return out.String(), err
+}
+
+// sectionBetween returns the text strictly between two section headings, so
+// an assertion can be scoped to exactly the section it claims to test
+// instead of being satisfiable by an unrelated line elsewhere in the
+// output (e.g. the heartbeat line, which also ends in "...ago"). Fails the
+// test outright if either heading is missing, since a caller asking for a
+// section that isn't there is a test bug, not a soft signal.
+func sectionBetween(t *testing.T, out, startHeading, endHeading string) string {
+	t.Helper()
+	start := strings.Index(out, startHeading)
+	require.GreaterOrEqualf(t, start, 0, "missing heading %q in output:\n%s", startHeading, out)
+	rest := out[start+len(startHeading):]
+	end := strings.Index(rest, endHeading)
+	require.GreaterOrEqualf(t, end, 0, "missing heading %q in output:\n%s", endHeading, out)
+	return rest[:end]
 }
 
 // TestDescribeRendersLabelWithSourceAndAge pins the design's own example
@@ -90,18 +107,55 @@ func TestDescribeShowsConflictingDeclaredValueBesideDetected(t *testing.T) {
 // TestDescribeShowsStaleSheetAge pins the "a sheet last edited in March"
 // scenario from the design: an old sheet's age must actually read as old,
 // not be silently rounded away or omitted because it's inconvenient.
+//
+// The assertion is scoped to the USAGE SHEET section specifically (via
+// sectionBetween), not the whole rendered output: an earlier version of
+// this test asserted Contains(out, "ago") and NotContains(out, "4m ago")
+// against the FULL output, both of which the unrelated "heartbeat 0s ago"
+// line already satisfies — a mutation that deleted the sheet's age line
+// entirely left every assertion in this test green. Verified: temporarily
+// no-op'ing renderSheet's `fmt.Fprintf(w, "  %s, updated %s\n", ...)` call
+// now fails this test (it did not fail the old version).
 func TestDescribeShowsStaleSheetAge(t *testing.T) {
 	ts := describeServer(t, server.DescribeResponse{
-		Device:         model.Device{ID: "gpubox:gpu0", State: model.DeviceReady},
-		Sheet:          "shared rack A1, ask #infra before recabling",
-		SheetUpdatedAt: time.Now().Add(-100 * 24 * time.Hour),
+		Device:          model.Device{ID: "gpubox:gpu0", State: model.DeviceReady},
+		Sheet:           "shared rack A1, ask #infra before recabling",
+		SheetUpdatedAt:  time.Now().Add(-100 * 24 * time.Hour),
+		SheetIsHostWide: false,
 	})
 
 	out, err := runDescribe(t, ts)
 	require.NoError(t, err)
-	require.Contains(t, out, "shared rack A1")
-	require.Contains(t, out, "ago", "the sheet's age must be shown, however old")
-	require.NotContains(t, out, "4m ago", "a sheet edited months ago must not read as minutes old")
+
+	section := sectionBetween(t, out, "USAGE SHEET", "RECENT JOBS")
+	require.Contains(t, section, "shared rack A1")
+	require.Contains(t, section, "updated", "the sheet's own line must report when it was updated")
+	require.Contains(t, section, "3mo ago",
+		"a sheet last edited ~100 days ago must show its own real age, not the request time")
+	require.NotContains(t, section, "0s ago")
+	require.Contains(t, section, "device note", "a device-specific sheet must be labelled as such, not left ambiguous with a host-wide one")
+}
+
+// TestDescribeLabelsHostWideSheetDistinctlyFromDeviceSheet pins the other
+// half of the same distinction: when describe falls back to the host-wide
+// note (no sheet of this device's own), the rendering must say so — an
+// agent reading "don't run more than two jobs here" needs to know whether
+// that rule is about the whole box or just this card.
+func TestDescribeLabelsHostWideSheetDistinctlyFromDeviceSheet(t *testing.T) {
+	ts := describeServer(t, server.DescribeResponse{
+		Device:          model.Device{ID: "gpubox:gpu0", State: model.DeviceReady},
+		Sheet:           "shared rack A1, ask #infra before recabling",
+		SheetUpdatedAt:  time.Now().Add(-time.Hour),
+		SheetIsHostWide: true,
+	})
+
+	out, err := runDescribe(t, ts)
+	require.NoError(t, err)
+
+	section := sectionBetween(t, out, "USAGE SHEET", "RECENT JOBS")
+	require.Contains(t, section, "host-wide")
+	require.NotContains(t, section, "device note",
+		"a host-wide fallback must not be mislabelled as this device's own note")
 }
 
 // TestDescribeJSONOutputParsesBackIntoDescribeResponse pins the machine-
@@ -118,8 +172,9 @@ func TestDescribeJSONOutputParsesBackIntoDescribeResponse(t *testing.T) {
 		Labels: []model.Label{
 			{Key: "vram", Value: "80G", Source: model.SourceDetected, UpdatedAt: time.Now().Add(-4 * time.Minute).Truncate(time.Second)},
 		},
-		Sheet:          "notes",
-		SheetUpdatedAt: time.Now().Add(-time.Hour).Truncate(time.Second),
+		Sheet:           "notes",
+		SheetUpdatedAt:  time.Now().Add(-time.Hour).Truncate(time.Second),
+		SheetIsHostWide: true,
 		RecentJobs: []model.Job{
 			{ID: "job0", DeviceID: "gpubox:gpu0", State: model.JobSucceeded, Command: []string{"./bench"}},
 		},
@@ -145,6 +200,7 @@ func TestDescribeJSONOutputParsesBackIntoDescribeResponse(t *testing.T) {
 	}
 	require.Equal(t, want.Sheet, got.Sheet)
 	require.True(t, want.SheetUpdatedAt.Equal(got.SheetUpdatedAt))
+	require.Equal(t, want.SheetIsHostWide, got.SheetIsHostWide)
 	require.Equal(t, want.RecentJobs, got.RecentJobs)
 }
 
