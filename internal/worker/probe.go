@@ -526,7 +526,7 @@ func nvidiaLabels(ctx context.Context, timeout time.Duration) (facts map[string]
 	stderr := &boundedBuffer{limit: maxProbeOutputBytes}
 	res := Run(ctx, JobSpec{
 		Command: []string{smi,
-			"--query-gpu=name,memory.total,driver_version", "--format=csv,noheader,nounits"},
+			"--query-gpu=name,memory.total,memory.free,driver_version", "--format=csv,noheader,nounits"},
 		MaxRuntime: timeout,
 		Stderr:     stderr,
 	}, stdout)
@@ -559,29 +559,47 @@ func nvidiaLabels(ctx context.Context, timeout time.Duration) (facts map[string]
 			continue
 		}
 		fields := strings.Split(line, ",")
-		if len(fields) != 3 {
+		if len(fields) != 4 {
 			slog.Warn("nvidia-smi line skipped; unexpected format", "line", line)
 			continue
 		}
 		model := strings.TrimSpace(fields[0])
 		vram := strings.TrimSpace(fields[1])
-		driver := strings.TrimSpace(fields[2])
+		vramFree := strings.TrimSpace(fields[2])
+		driver := strings.TrimSpace(fields[3])
 
 		prefix := fmt.Sprintf("gpu%d", i)
 		facts[prefix+".vendor"] = "nvidia"
 		facts[prefix+".model"] = model
-		// memory.total under --format=nounits is a bare MiB count. Emit it
-		// suffixed ("M") in the form internal/selector's parseQuantity
-		// actually understands (K/M/G/T), not "MiB": a trailing "B" is not
-		// one of those suffixes, so "24576MiB" fails to parse as a
-		// quantity and Match silently falls back to comparing it as a
-		// STRING against the selector's value. That is not a cosmetic
+		// memory.total and memory.free under --format=nounits are bare MiB
+		// counts. Emit them suffixed ("M") in the form internal/selector's
+		// parseQuantity actually understands (K/M/G/T), not "MiB": a
+		// trailing "B" is not one of those suffixes, so "24576MiB" fails to
+		// parse as a quantity and Match silently falls back to comparing it
+		// as a STRING against the selector's value. That is not a cosmetic
 		// difference — "vram>=40G" then compares "9000MiB" against "40G"
 		// lexicographically ('9' > '4'), matching a 9GB card against a 40GB
 		// request. See probe_nvidia_internal_test.go for the regression
 		// test against the real selector package.
 		facts[prefix+".vram"] = vram + "M"
+		facts[prefix+".vram_free"] = vramFree + "M"
 		facts[prefix+".driver"] = driver
+
+		// CUDA version is deliberately NOT emitted here. --query-gpu has no
+		// cuda_version field (confirmed against nvidia-smi's own
+		// --help-query-gpu listing) — the only place nvidia-smi reports it
+		// is the plain-text header of `nvidia-smi -q`/`nvidia-smi` with no
+		// --query-gpu at all, once per invocation, not per GPU. Getting it
+		// would mean a second exec of nvidia-smi per probe pass plus a
+		// fragile text-header parse (a HOST-wide fact bolted onto a
+		// per-device CSV row for no reason), against a string NVIDIA does
+		// not document as stable across driver releases. A wrong or
+		// silently-empty "cuda" label would be worse than no label: a
+		// selector like `--select 'cuda>=12'` fails LOUD (rejected at
+		// submit, no matching device) if the label never appears, versus
+		// failing SILENT if a fragile parse ever produced a stale or empty
+		// value. See README's probes section for the same call made in
+		// operator-facing docs.
 	}
 	return facts, true, false
 }

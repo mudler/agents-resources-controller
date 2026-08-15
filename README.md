@@ -25,6 +25,8 @@ for a human rather than a job.
 | Verify probes between jobs | Nothing checks VRAM was released after a job |
 | Webhook notifications | Poll `rc ps` / `rc devices`, or watch `/v1/events` |
 | Dashboard actions (kill/hold from the browser) | `rc kill` from a terminal; the dashboard is read-only |
+| A `cuda` label from the built-in GPU probe | `nvidia-smi --query-gpu` has no `cuda_version` field (see "Capability probes and labels" below); write a drop-in probe if you need it |
+| A controller-side operator annotation layered over a usage sheet | The spec allows one ("the host file wins on conflict"), but it was never built — a usage sheet is exactly what the host's `host.md`/`host.d/*.md` say, full stop; `host_docs` is keyed `(host, device_id)` with no annotation layer on top |
 
 ## Controller
 
@@ -253,11 +255,22 @@ A device's detected labels come from two kinds of probe, both run under
 - **Built-in**, no configuration needed: `cpus`, `mem_total_bytes`,
   `disk_free_bytes`, and `kernel` are host-wide facts gathered directly.
   If `nvidia-smi` is on the worker's `PATH`, it also runs
-  `nvidia-smi --query-gpu=name,memory.total,driver_version` and turns each
-  row into `gpu<N>.vendor`, `gpu<N>.model`, `gpu<N>.vram` (as a `K/M/G/T`
-  quantity, e.g. `24576M`, so selectors can compare it numerically), and
-  `gpu<N>.driver` — only for device names this host actually declared as
-  `gpu<N>`.
+  `nvidia-smi --query-gpu=name,memory.total,memory.free,driver_version` and
+  turns each row into `gpu<N>.vendor`, `gpu<N>.model`, `gpu<N>.vram` and
+  `gpu<N>.vram_free` (both as a `K/M/G/T` quantity, e.g. `24576M`, so
+  selectors can compare them numerically), and `gpu<N>.driver` — only for
+  device names this host actually declared as `gpu<N>`.
+
+  **No `cuda` label is emitted.** `nvidia-smi --query-gpu` has no
+  `cuda_version` field; the CUDA version only appears in the plain-text
+  header of a bare `nvidia-smi`/`nvidia-smi -q` invocation, once per
+  process, not per GPU. Getting it would mean a second nvidia-smi
+  invocation per probe pass plus a text-header parse against a format
+  NVIDIA does not document as stable — judged not worth it for a label
+  this system can do without: a selector like `--select 'cuda>=12'`
+  fails loud (rejected at submit — no device matches) rather than
+  silently matching on a stale or fragile-parsed value. Write a drop-in
+  probe if you need it and are willing to own that parse.
 - **Drop-in**: any executable file in `probe_dir` (default `/etc/rc/probe.d`),
   run in sorted filename order on top of the built-ins. Each probe must
   write **one flat JSON object to stdout** — string, number, and boolean
@@ -338,6 +351,14 @@ that truncates before pushing it (the controller also enforces the same
 cap server-side as a second line of defence), so a hand-edited `host.md`
 can never grow the database unboundedly. The cap is per sheet, not per
 registration.
+
+**There is no controller-side annotation layer over a usage sheet.** The
+design allows one — an operator annotation the controller carries on top
+of the host's own file, with the host file winning on conflict — but it
+was never built: `host_docs` is stored keyed by `(host, device_id)` alone,
+with nothing layered above it. Whatever `host.md`/`host.d/<device>.md`
+says on the host is exactly what `rc describe` shows; there is no
+separate, controller-held annotation to reconcile it against.
 
 **A device with no `host.d/<device-name>.md` of its own falls back to
 `host.md`.** Writing one `host.md` for a box is the common case, and

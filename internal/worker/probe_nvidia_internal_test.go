@@ -23,9 +23,9 @@ func TestNvidiaLabelsParsesPresentDriver(t *testing.T) {
 	dir := t.TempDir()
 	fake := filepath.Join(dir, "nvidia-smi")
 	script := "#!/bin/sh\n" +
-		`echo "NVIDIA GeForce RTX 4090, 24576, 550.54.15"` + "\n" +
-		`echo "NVIDIA A100-SXM4-80GB, 81920, 550.54.15"` + "\n" +
-		`echo "Small Card, 9000, 550.54.15"` + "\n"
+		`echo "NVIDIA GeForce RTX 4090, 24576, 20000, 550.54.15"` + "\n" +
+		`echo "NVIDIA A100-SXM4-80GB, 81920, 81000, 550.54.15"` + "\n" +
+		`echo "Small Card, 9000, 500, 550.54.15"` + "\n"
 	if err := os.WriteFile(fake, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -37,18 +37,21 @@ func TestNvidiaLabelsParsesPresentDriver(t *testing.T) {
 	}
 
 	want := map[string]string{
-		"gpu0.vendor": "nvidia",
-		"gpu0.model":  "NVIDIA GeForce RTX 4090",
-		"gpu0.vram":   "24576M",
-		"gpu0.driver": "550.54.15",
-		"gpu1.vendor": "nvidia",
-		"gpu1.model":  "NVIDIA A100-SXM4-80GB",
-		"gpu1.vram":   "81920M",
-		"gpu1.driver": "550.54.15",
-		"gpu2.vendor": "nvidia",
-		"gpu2.model":  "Small Card",
-		"gpu2.vram":   "9000M",
-		"gpu2.driver": "550.54.15",
+		"gpu0.vendor":    "nvidia",
+		"gpu0.model":     "NVIDIA GeForce RTX 4090",
+		"gpu0.vram":      "24576M",
+		"gpu0.vram_free": "20000M",
+		"gpu0.driver":    "550.54.15",
+		"gpu1.vendor":    "nvidia",
+		"gpu1.model":     "NVIDIA A100-SXM4-80GB",
+		"gpu1.vram":      "81920M",
+		"gpu1.vram_free": "81000M",
+		"gpu1.driver":    "550.54.15",
+		"gpu2.vendor":    "nvidia",
+		"gpu2.model":     "Small Card",
+		"gpu2.vram":      "9000M",
+		"gpu2.vram_free": "500M",
+		"gpu2.driver":    "550.54.15",
 	}
 	for k, v := range want {
 		if facts[k] != v {
@@ -125,8 +128,8 @@ func TestProbedVRAMComparesCorrectlyThroughSelector(t *testing.T) {
 	dir := t.TempDir()
 	fake := filepath.Join(dir, "nvidia-smi")
 	script := "#!/bin/sh\n" +
-		`echo "Big Card, 81920, 550.54.15"` + "\n" + // 80G
-		`echo "Small Card, 9000, 550.54.15"` + "\n" // ~8.79G, the review's own example
+		`echo "Big Card, 81920, 80000, 550.54.15"` + "\n" + // 80G
+		`echo "Small Card, 9000, 8000, 550.54.15"` + "\n" // ~8.79G, the review's own example
 	if err := os.WriteFile(fake, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -158,5 +161,25 @@ func TestProbedVRAMComparesCorrectlyThroughSelector(t *testing.T) {
 	}
 	if !loose.Match(map[string]string{"vram": smallVRAM}) {
 		t.Errorf("selector vram>=8G should match a %s card", smallVRAM)
+	}
+
+	// vram_free (fix round 4 — free VRAM was omitted entirely) must be the
+	// exact same suffixed-quantity shape as vram, for the exact same
+	// reason: a bare "MiB" suffix would silently fall back to string
+	// comparison and let a selector match the wrong card.
+	bigFree := facts["gpu0.vram_free"]
+	smallFree := facts["gpu1.vram_free"]
+	if bigFree != "80000M" || smallFree != "8000M" {
+		t.Fatalf("unexpected vram_free facts: gpu0=%q gpu1=%q", bigFree, smallFree)
+	}
+	freeSel, err := selector.Parse("vram_free>=40G")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !freeSel.Match(map[string]string{"vram_free": bigFree}) {
+		t.Errorf("selector vram_free>=40G should match a card with %s free", bigFree)
+	}
+	if freeSel.Match(map[string]string{"vram_free": smallFree}) {
+		t.Errorf("selector vram_free>=40G must NOT match a card with only %s free", smallFree)
 	}
 }

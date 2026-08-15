@@ -135,15 +135,20 @@ func TestHoldCtrlCOnAGrantedHoldReleasesIt(t *testing.T) {
 	require.Equal(t, "tester", releaseSubmitter.Load())
 }
 
-// TestHoldSubmissionCarryingCommandCwdOrEnvIsRefused proves the security
-// property the whole design rests on end to end, against the REAL
-// controller (not a stub echoing canned responses): the sleeper a hold
-// runs, where it runs, and what environment it inherits are all the
-// worker's choice, never the client's — not just the command. A submission
-// that smuggles a payload through cwd or env (e.g. LD_PRELOAD) instead of
-// command would let it run inside a process every view in the system labels
-// "hold", exactly the "arbitrary code under a different label" the guard
-// exists to prevent. rc hold itself has no flag to supply any of these, so
+// TestHoldSubmissionCarryingCommandCwdEnvOrIdleTimeoutIsRefused proves the
+// security and liveness properties the whole design rests on end to end,
+// against the REAL controller (not a stub echoing canned responses): the
+// sleeper a hold runs, where it runs, what environment it inherits, and
+// whether it is watched for idleness are all the worker's choice, never the
+// client's — not just the command. A submission that smuggles a payload
+// through cwd or env (e.g. LD_PRELOAD) instead of command would let it run
+// inside a process every view in the system labels "hold", exactly the
+// "arbitrary code under a different label" the guard exists to prevent. An
+// idle_timeout_seconds is a different kind of danger, not a payload but a
+// footgun: the worker's sleeper produces no output at all, so an idle
+// watchdog set on a hold would kill it almost immediately — the hold would
+// be granted and then vanish before the human who requested it could do
+// anything with it. rc hold itself has no flag to supply any of these, so
 // this drives the client directly, the way a caller bypassing the CLI (or a
 // future bug in it) could.
 //
@@ -151,7 +156,7 @@ func TestHoldCtrlCOnAGrantedHoldReleasesIt(t *testing.T) {
 // accepted one by 400 vs 201, not by which error the store happens to
 // return for a device it has never heard of — see the fix-round-1 review
 // note this replaced a version of this test for.
-func TestHoldSubmissionCarryingCommandCwdOrEnvIsRefused(t *testing.T) {
+func TestHoldSubmissionCarryingCommandCwdEnvOrIdleTimeoutIsRefused(t *testing.T) {
 	dir := t.TempDir()
 	c := clock.NewFake(time.Date(2026, 8, 13, 12, 0, 0, 0, time.UTC))
 	st, err := store.Open(filepath.Join(dir, "rc.db"), c)
@@ -182,6 +187,7 @@ func TestHoldSubmissionCarryingCommandCwdOrEnvIsRefused(t *testing.T) {
 		{"command", client.SubmitOptions{Command: []string{"true"}}},
 		{"cwd", client.SubmitOptions{Cwd: "/attacker/cwd"}},
 		{"env", client.SubmitOptions{Env: map[string]string{"LD_PRELOAD": "/tmp/evil.so"}}},
+		{"idle_timeout", client.SubmitOptions{IdleTimeout: time.Minute}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -196,9 +202,9 @@ func TestHoldSubmissionCarryingCommandCwdOrEnvIsRefused(t *testing.T) {
 		})
 	}
 
-	// A clean hold — none of command, cwd, or env — must still be accepted
-	// (201): the guard must reject exactly the fields that matter, not holds
-	// in general.
+	// A clean hold — none of command, cwd, env, or idle_timeout — must
+	// still be accepted (201): the guard must reject exactly the fields
+	// that matter, not holds in general.
 	job, err := cl.Submit(context.Background(), client.SubmitOptions{
 		DeviceID: "gpubox:gpu0", Submitter: "tester", MaxRuntime: time.Minute, Kind: model.LeaseKindHold,
 	})

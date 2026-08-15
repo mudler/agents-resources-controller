@@ -352,6 +352,11 @@ func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 				"a hold may not specify env: the worker's sleeper does not use it")
 			return
 		}
+		if req.IdleTimeoutSeconds != 0 {
+			writeErr(w, http.StatusBadRequest, "bad_request",
+				"a hold may not specify idle_timeout_seconds: the worker's sleeper produces no output, so an idle timeout would kill the hold almost immediately")
+			return
+		}
 		// --ttl is required for a hold, capped by the device's max_runtime
 		// exactly as a job's is (checked below via the ordinary ceiling
 		// path once MaxRuntimeSeconds is known to be positive) — rejected,

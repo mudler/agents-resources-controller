@@ -316,7 +316,7 @@ func TestPushLabelsOmitsADeviceWhoseProbeStartsFailing(t *testing.T) {
 func TestPushLabelsPreservesGPULabelsWhenNvidiaSmiBinaryDisappears(t *testing.T) {
 	binDir := t.TempDir()
 	fake := filepath.Join(binDir, "nvidia-smi")
-	script := "#!/bin/sh\n" + `echo "NVIDIA A100-SXM4-80GB, 81920, 550.54.15"` + "\n"
+	script := "#!/bin/sh\n" + `echo "NVIDIA A100-SXM4-80GB, 81920, 80000, 550.54.15"` + "\n"
 	require.NoError(t, os.WriteFile(fake, []byte(script), 0o755))
 	emptyPathDir := t.TempDir() // PATH pointing nowhere useful: nvidia-smi resolves to nothing
 
