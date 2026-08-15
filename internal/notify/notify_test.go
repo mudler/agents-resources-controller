@@ -109,38 +109,12 @@ func TestNotifyNeverBlocksWhenTheQueueIsFull(t *testing.T) {
 	require.Positive(t, n.Dropped(), "a full queue must drop and count, not block")
 }
 
-// TestCloseDrainsWhatItCan queues three events behind a sink that blocks
-// until released. Because the first delivery attempt is guaranteed to
-// still be in flight when Close runs, the other two events are guaranteed
-// to still be sitting in the queue (not yet consumed by run's own loop)
-// at that moment — this makes the drain-what's-queued path deterministic
-// instead of racing against run() draining the queue before Close is ever
-// called (which, left to chance, exercises the drain path in only a
-// minority of runs).
-func TestCloseDrainsWhatItCan(t *testing.T) {
-	sink := &recordingSink{block: make(chan struct{})}
-	n := notify.New(sink, opts())
-
-	n.Notify(notify.Event{Kind: notify.KindDeviceUnhealthy})
-	n.Notify(notify.Event{Kind: notify.KindWatchdogTrip})
-	n.Notify(notify.Event{Kind: notify.KindJobLost})
-
-	require.Eventually(t, func() bool { return sink.attempts.Load() >= 1 },
-		time.Second, time.Millisecond, "the first delivery attempt should have started")
-
-	closeDone := make(chan error, 1)
-	go func() { closeDone <- n.Close(context.Background()) }()
-
-	close(sink.block) // let delivery proceed now that Close is in flight
-
-	select {
-	case err := <-closeDone:
-		require.NoError(t, err)
-	case <-time.After(2 * time.Second):
-		t.Fatal("Close did not return after the sink was released")
-	}
-	require.Len(t, sink.delivered(), 3, "all three queued events should survive a graceful close")
-}
+// TestCloseDrainsWhatItCan lives in notify_internal_test.go (package
+// notify, not notify_test): it needs to synchronize directly on the
+// unexported closeRequested channel to be deterministic, and no black-box
+// arrangement of Notify/Close calls from outside the package can reliably
+// force a race between run()'s ordinary per-item receive and its shutdown
+// signal — see that file's comment for why.
 
 // TestNotifyAfterCloseDoesNotPanic also pins that a post-Close Notify is
 // dropped and counted, not merely non-panicking. With this Notifier's

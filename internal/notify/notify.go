@@ -239,6 +239,25 @@ func (n *Notifier) run() {
 	defer close(n.done)
 	defer n.cancel()
 	for {
+		// Shutdown takes priority over an ordinary queue receive. Without
+		// this non-blocking probe first, the select below would pick
+		// uniformly at random between "another item is ready" and
+		// "shutdown was requested" whenever both are true, which means
+		// whether the tail of the queue drains through this loop's normal
+		// per-item path or through drainRemaining is scheduler luck, not a
+		// guarantee — a poor property for the one path that runs when an
+		// operator is trying to stop the controller cleanly, and one that
+		// made this behavior effectively untestable from outside the
+		// package (the racing select took the ordinary path almost every
+		// time). The observable outcome is unchanged either way: every
+		// queued event still gets delivered on the way out, because
+		// drainRemaining drains exactly what this loop would have.
+		select {
+		case <-n.closeRequested:
+			n.drainRemaining()
+			return
+		default:
+		}
 		select {
 		case e := <-n.queue:
 			n.deliver(e)
