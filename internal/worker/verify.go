@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 )
 
 // verifyReasonPrefix marks a Reason as coming from runVerify rather than
@@ -52,7 +53,35 @@ type VerifyResult struct {
 // Reason, since one is already enough to quarantine the device and a
 // second failing script's stderr adds nothing an operator needs that the
 // first one didn't already say.
+//
+// Unlike a probe, whose failure is invisible-by-design (a dropped label is
+// harmless; gatherLabels' whole contract is "keep whatever succeeded"), a
+// verify script that cannot even be inspected must fail loud, not skip
+// silently: OK=true is read as "this device is clean", so anything that
+// stops a script from actually running — including a stat error, e.g. a
+// dangling symlink left behind by a package upgrade that removed a script's
+// target — has to be treated exactly like a script that ran and said no,
+// never like a script that was never there. gatherLabels' own analogous stat
+// branch (probe.go) can afford to just log and move on, because a probe
+// that never ran costs a label, not a false "verified clean".
+//
+// The whole pass is additionally bounded by cfg.VerifyPassBudget, not just
+// each script's own VerifyTimeout — see that field's doc comment for why —
+// and hitting that budget is treated the same way a stat error is: the pass
+// FAILS, with a reason that names the budget, rather than quietly returning
+// whatever partial result had accumulated so far. Stopping there (instead of
+// still attempting every remaining script) is deliberate: the budget's own
+// purpose is bounding how long this can run, and once it's gone, every
+// script still queued would fail the exact same way for the exact same
+// reason.
 func (w *Worker) runVerify(ctx context.Context, deviceID, jobID string) VerifyResult {
+	// The pass-wide budget is the only thing that bounds this call at all:
+	// runVerify is invoked with reportCtx (see execute), which is
+	// deliberately immune to Start's own shutdown cancellation, so nothing
+	// upstream will ever cut this short on its own.
+	ctx, cancel := context.WithTimeout(ctx, w.cfg.VerifyPassBudget)
+	defer cancel()
+
 	entries, err := os.ReadDir(w.cfg.VerifyDir)
 	if err != nil {
 		if !os.IsNotExist(err) {
@@ -76,12 +105,28 @@ func (w *Worker) runVerify(ctx context.Context, deviceID, jobID string) VerifyRe
 	// may run with none at startup), so RC_JOB_ID here is never blank.
 	env := hookEnv("verify", deviceID, jobID, "")
 
+	// failOnce records the pass's first failure, whatever kind, and is a
+	// no-op on every call after the first — see the doc comment above for
+	// why only the first failure's reason survives.
 	result := VerifyResult{OK: true}
+	failOnce := func(reason string) {
+		if result.OK {
+			result = VerifyResult{OK: false, Reason: reason}
+		}
+	}
+
 	for _, name := range names {
+		if ctx.Err() != nil {
+			failOnce(budgetExceededReason(w.cfg.VerifyPassBudget))
+			break
+		}
+
 		path := filepath.Join(w.cfg.VerifyDir, name)
 		info, err := os.Stat(path)
 		if err != nil {
-			slog.Warn("stat verify script; skipped", "script", path, "err", err)
+			// Fail loud, not skip silently — see the doc comment above.
+			slog.Error("stat verify script; failing the pass", "script", path, "err", err)
+			failOnce(verifyReasonPrefix + name + ": stat: " + err.Error())
 			continue
 		}
 		if info.Mode()&0o111 == 0 {
@@ -101,17 +146,30 @@ func (w *Worker) runVerify(ctx context.Context, deviceID, jobID string) VerifyRe
 			continue // this script passed; keep going regardless
 		}
 
-		if !result.OK {
-			continue // an earlier script already failed the pass; still run the rest, but its reason already won
+		if ctx.Err() != nil {
+			// The pass budget, not this script's own outcome, is why this
+			// run didn't finish cleanly: attribute the failure to the
+			// budget, not to whatever half-finished detail Run captured on
+			// its way out, and stop — every script still queued would fail
+			// the same way for the same reason.
+			failOnce(budgetExceededReason(w.cfg.VerifyPassBudget))
+			break
 		}
 
 		reason := verifyReasonPrefix + name + ": " + verifyFailureDetail(res)
 		if tail := verifyStderrTail(stderr); tail != "" {
 			reason += ": " + tail
 		}
-		result = VerifyResult{OK: false, Reason: reason}
+		failOnce(reason)
 	}
 	return result
+}
+
+// budgetExceededReason renders the Reason used when a verify pass is cut
+// short by cfg.VerifyPassBudget rather than by any single script's own
+// outcome.
+func budgetExceededReason(budget time.Duration) string {
+	return fmt.Sprintf("%spass exceeded its %s budget", verifyReasonPrefix, budget)
 }
 
 // verifyFailureDetail renders why a verify script's Run result counts as a

@@ -38,6 +38,20 @@ const (
 	defaultVerifyDir     = "/etc/rc/verify.d"
 	defaultVerifyTimeout = 30 * time.Second
 
+	// defaultVerifyPassBudget bounds the WHOLE verify pass — every script in
+	// VerifyDir together, not each one's own VerifyTimeout summed — for
+	// exactly the reason probePassBudget exists for gatherLabels: without
+	// it, N scripts each capped at VerifyTimeout still serialise to
+	// N*VerifyTimeout, and runVerify runs on reportCtx, which is
+	// deliberately immune to Start's own shutdown cancellation (see
+	// execute's ordering comment), so nothing else would ever bound that
+	// total. See runVerify for what happens when it trips: unlike a probe
+	// pass, which simply skips whatever it didn't get to, a verify pass
+	// hitting its budget FAILS — an unfinished verify pass has proven
+	// nothing about the device, and treating it as a pass would silently
+	// recreate the exact fail-open bug a stat error was fixed for.
+	defaultVerifyPassBudget = 2 * time.Minute
+
 	// defaultSheetDir is where readSheets looks for host.md and
 	// host.d/<device>.md when the operator does not set sheet_dir.
 	defaultSheetDir = "/etc/rc"
@@ -76,6 +90,10 @@ type Config struct {
 	// a process group and its exit is treated as a failure. Optional;
 	// falls back to defaultVerifyTimeout.
 	VerifyTimeout time.Duration `yaml:"verify_timeout"`
+	// VerifyPassBudget bounds the WHOLE verify pass — every script in
+	// VerifyDir together — not each script's own VerifyTimeout summed.
+	// Optional; falls back to defaultVerifyPassBudget.
+	VerifyPassBudget time.Duration `yaml:"verify_pass_budget"`
 	// SheetDir is where this worker looks for its usage-sheet documentation:
 	// <SheetDir>/host.md and <SheetDir>/host.d/<device>.md. Optional; falls
 	// back to defaultSheetDir.
@@ -186,6 +204,9 @@ func (c Config) withDefaults() Config {
 	}
 	if c.VerifyTimeout <= 0 {
 		c.VerifyTimeout = defaultVerifyTimeout
+	}
+	if c.VerifyPassBudget <= 0 {
+		c.VerifyPassBudget = defaultVerifyPassBudget
 	}
 	if c.SheetDir == "" {
 		c.SheetDir = defaultSheetDir

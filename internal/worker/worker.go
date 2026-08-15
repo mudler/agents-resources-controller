@@ -179,25 +179,55 @@ func New(cfg Config) *Worker {
 
 // shutdownGrace bounds how long Start waits, once ctx is cancelled, for jobs
 // already running to actually finish and report before giving up on them. It
-// must comfortably cover Run's own worst case (SIGTERM, up to GraceCeiling —
-// default 10s — then SIGKILL, then up to a couple of seconds for a stubborn
-// process-group straggler: ~12s total) plus the terminal report's retry
-// budget — bounded to ~28s worst case by terminalReportAttemptTimeout, see
-// that constant for the arithmetic — for ~40s total, or a routine shutdown
-// would itself trigger the "abandoned job" path this exists to avoid. That
-// retry budget is only a real bound because each attempt has its own
-// timeout: without terminalReportAttemptTimeout, a blackholed controller
-// (connection accepted, nothing ever comes back) could let a single attempt
-// run for w's full 2-minute http.Client timeout, and five of those blow
-// through this 45s many times over.
+// comfortably covers the ordinary case: Run's own worst case for the job
+// itself (SIGTERM, up to GraceCeiling — default 10s — then SIGKILL, then up
+// to a couple of seconds for a stubborn process-group straggler: ~12s total)
+// plus the terminal report's retry budget — bounded to ~28s worst case by
+// terminalReportAttemptTimeout, see that constant for the arithmetic — is
+// ~40s, already close to this 45s window on its own. That retry budget is
+// only a real bound because each attempt has its own timeout: without
+// terminalReportAttemptTimeout, a blackholed controller (connection
+// accepted, nothing ever comes back) could let a single attempt run for w's
+// full 2-minute http.Client timeout, and five of those blow through this 45s
+// many times over.
 //
-// One path can still exceed it: a job whose acquire hook failed makes two
-// retried calls back to back (its terminal report, then the device fault
-// report), so an unreachable controller costs up to ~56s there. That trade
-// is deliberate — a device the hook has just called unusable must not stay
-// schedulable because we were in a hurry to exit — and it costs a log line,
-// not correctness: the job in question never started, so there is no
-// process to abandon.
+// Two paths can exceed it, and both are worth stating honestly rather than
+// papering over with arithmetic that no longer holds:
+//
+//   - A job whose acquire hook failed makes two retried calls back to back
+//     (its terminal report, then the device fault report), so an
+//     unreachable controller costs up to ~56s there. This predates verify
+//     and is unchanged by it.
+//   - The verify pass (runVerify, called from execute between Run returning
+//     and the terminal report) runs on reportCtx, which is deliberately
+//     immune to shutdown cancellation — see execute's own ordering comment
+//     for why a job ending during shutdown must still be verified before
+//     its device looks free again. That means a hanging verify script is
+//     bounded only by its own VerifyTimeout (default 30s) and
+//     VerifyPassBudget (default 2m), never by shutdownGrace: one hanging
+//     script alone already costs up to VerifyTimeout + GraceCeiling +
+//     stragglerWait (~42s at defaults) before Run gives up on it, and if
+//     verify then fails, reportFault is retried on the SAME ~28s budget as
+//     the terminal report, and runs BEFORE it. Stacked worst case: ~12s
+//     (kill the job) + ~42s (one hanging verify script) + ~28s (fault
+//     report retries) + ~28s (terminal report retries) ≈ 110s — well past
+//     this 45s window.
+//
+// When shutdownGrace wins that race, Start returns anyway, mid-flight retry
+// loops and all. This is not silent data loss about the DEVICE: a device
+// this process no longer controls, verified or not, is exactly what the
+// controller's own worker_lost sweep (grace HeartbeatGrace, default 30s;
+// swept unhealthy after unhealthyAfter, default 5 minutes — see
+// internal/cli/serve.go) and the next registration's reconciliation both
+// exist to catch, so the device still ends up quarantined or reconciled
+// rather than quietly handed out dirty. What IS lost is precision about the
+// JOB: its true exit code and, if verify was mid-pass or never got to run
+// at all, any verify-sourced quarantine reason never reach the controller,
+// and the job itself is reconciled as lost by the same sweep rather than
+// reported with its honest terminal state. This trade — a bounded shutdown
+// for the ordinary case, at the cost of losing JOB-reporting precision (not
+// device safety) in an already-rare pileup of a failed hook or a hanging
+// verify script during the exact moment of shutdown — is deliberate.
 const shutdownGrace = 45 * time.Second
 
 // startupReleaseBudget bounds the whole startup reconciliation pass — every
