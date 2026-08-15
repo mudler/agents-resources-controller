@@ -311,6 +311,12 @@
   function returnToGate() {
     stopLive();
     sessionStorage.removeItem("rc_token");
+    // The last action's outcome belongs to the session that caused it: a
+    // "cleared gpubox:gpu0" left in the header above a token prompt reads
+    // as the state of a page the operator is no longer connected to. This
+    // is the ONLY place #act is cleared — deliberately not on every poll,
+    // for the reason its CSS comment gives.
+    actOK("");
     gate.classList.remove("hide");
     app.classList.add("hide");
   }

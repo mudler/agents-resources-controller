@@ -97,6 +97,58 @@ func TestDashboardPromptsForTheAdminTokenAndKeepsNothing(t *testing.T) {
 		"only the admin-token prompt should exist")
 }
 
+// assignment matches `target = value` (not ==, ===, !=, <=, >= or =>) and
+// captures the assignment target and everything up to the statement's
+// semicolon.
+var assignment = regexp.MustCompile(`(?s)([A-Za-z_$][\w$.]*)\s*=[^=>]([^;]*)`)
+
+// quoted matches a string literal, stripped from an assignment's right-hand
+// side before looking for the admin token there: `var note = "admin token
+// used";` copies nothing, and a test that cannot tell it from `stash =
+// admin;` would be noise rather than a guard.
+var quoted = regexp.MustCompile(`"[^"]*"|'[^']*'`)
+
+var adminIdentifier = regexp.MustCompile(`\badmin\b`)
+
+// TestDashboardNeverCopiesTheAdminTokenAnywhere closes the one regression
+// the assertions above cannot see. Keeping `admin = null;` exactly where it
+// is, while adding a module-level `var lastAdmin` and `lastAdmin = admin;`
+// just before the drop, passes every other test on this page and retains
+// the admin token for the life of the tab — and it is exactly what someone
+// adding a "retry the clear" affordance would write.
+//
+// So: between the prompt and the drop, `admin` may be assigned TO (it is
+// trimmed there), but its value may never be assigned to anything else.
+// Only that window is examined, because that is the only place in the file
+// where the identifier holds a real token at all.
+func TestDashboardNeverCopiesTheAdminTokenAnywhere(t *testing.T) {
+	body := dashboardBody(t)
+
+	start := strings.Index(body, "window.prompt(")
+	require.NotEqual(t, -1, start, "the admin prompt must exist")
+	drop := regexp.MustCompile(`(?m)^\s*admin = null;`).FindStringIndex(body[start:])
+	require.NotNil(t, drop, "the drop must exist and must follow the prompt")
+	span := body[start : start+drop[1]]
+
+	for _, m := range assignment.FindAllStringSubmatch(span, -1) {
+		target, value := m[1], quoted.ReplaceAllString(m[2], "")
+		if target == "admin" {
+			continue // assigning to admin itself is the trim, and the drop
+		}
+		// The request itself is the one destination the token is allowed to
+		// reach: `var pending = fetch(... "Bearer " + admin ...)` binds a
+		// promise, not the token. Every other assignment binds whatever
+		// `admin` evaluates to, which is the copy this test is about.
+		if strings.HasPrefix(strings.TrimSpace(value), "fetch(") {
+			continue
+		}
+		require.False(t, adminIdentifier.MatchString(value),
+			"the prompted admin token is copied out of `admin` by `%s =%s`: "+
+				"between the prompt and the drop its value may reach the request and nothing else",
+			target, m[2])
+	}
+}
+
 // TestDashboardShipsNoTokenLiteral guards the served asset against a
 // credential ever being baked into it — the admin token above all, since it
 // clears devices fleet-wide, but the worker and client tokens too. The page
