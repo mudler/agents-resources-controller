@@ -147,6 +147,21 @@ type Worker struct {
 	// above, only ever touched from the sequential register()/pushLabels()
 	// call chain, never concurrently.
 	labelOmitWarned map[string]bool
+
+	// probeSourceDevices remembers, per probe source (a drop-in's full path,
+	// or nvidiaSource), which devices its most recent SUCCESSFUL run in this
+	// process named. It is how gatherLabels attributes a source's failure to
+	// the devices that source actually speaks for, instead of freezing every
+	// device on the host behind one broken script — see
+	// ProbeResult.Unconfirmed for the ruling and the defect that forced it.
+	//
+	// gatherLabels REBUILDS this map every pass rather than mutating it, so
+	// a source deleted from the probe directory stops being remembered (and
+	// its facts clear the ordinary way), and so a probe directory whose
+	// script names churn cannot grow it without bound. Same concurrency
+	// story as the fields above: only ever touched from the sequential
+	// register()/pushLabels() call chain.
+	probeSourceDevices map[string]map[string]bool
 }
 
 func New(cfg Config) *Worker {
@@ -174,6 +189,8 @@ func New(cfg Config) *Worker {
 		hooks:           hooks,
 		deviceHooks:     map[string]*deviceHookState{},
 		labelOmitWarned: map[string]bool{},
+
+		probeSourceDevices: map[string]map[string]bool{},
 	}
 }
 
@@ -635,14 +652,23 @@ func (w *Worker) pushLabels(ctx context.Context) {
 // correct for a device whose probes ran and legitimately found nothing (a
 // card removed), wrong for a device whose probes simply failed to run this
 // pass. Those two cases produce an identical empty per-device map, so the
-// only place left to distinguish them is res.Failed: when nothing capable of
-// producing device-scoped facts failed anywhere this pass, an empty device
-// is trustworthy and is sent as an explicit clear; when something did fail,
-// every device that came back empty is OMITTED from the returned map
-// entirely (its key is simply absent, not present as {}) rather than sent
-// as a clear — see applyDeviceFacts (server-side) for why omission, not an
-// empty map, is what actually protects it: only a present key gets
-// ReplaceLabels called on it at all.
+// only place left to distinguish them is res.Unconfirmed: a device NOT named
+// there had every source that speaks for it run to completion, so an empty
+// result for it is trustworthy and is sent as an explicit clear; a device
+// named there is OMITTED from the returned map entirely (its key is simply
+// absent, not present as {}) rather than sent as a clear — see
+// applyDeviceFacts (server-side) for why omission, not an empty map, is what
+// actually protects it: only a present key gets ReplaceLabels called on it
+// at all.
+//
+// That omission is also why res.Unconfirmed had to stop being one pass-wide
+// bool (Stage 3's ProbeResult.Failed): a device omitted here never gets
+// ReplaceLabels called on it AT ALL, so it stops receiving the host-wide
+// facts under the "" key too — and one broken drop-in anywhere on the box
+// therefore froze disk_free_bytes and mem_total_bytes on every device of
+// that host, while builtinLabels went on gathering them perfectly well every
+// pass. See ProbeResult.Unconfirmed for the whole ruling; the shape of this
+// function is unchanged, it is the attribution feeding it that got narrow.
 //
 // A nil return — meaning "say nothing about detected labels at all" — is
 // reserved for the one case where there is nothing to say about anything:
@@ -684,24 +710,24 @@ func labelsPayload(res ProbeResult, warned map[string]bool) map[string]map[strin
 			delete(warned, name) // recovered with real facts: a future failure logs again
 			continue
 		}
-		if !res.Failed {
-			// Confirmed clean: this device's probes ran (or there simply
-			// were none configured) and nothing failed anywhere this
-			// pass, so an empty result here is trustworthy.
+		if !res.Unconfirmed[name] {
+			// Confirmed clean: every source that speaks for this device
+			// ran (or there simply are none) and none of them failed, so
+			// an empty result here is trustworthy.
 			out[name] = m
 			delete(warned, name) // confirmed empty and cleared normally: same reset
 			continue
 		}
-		// Something that can produce device-scoped facts failed this
-		// pass — nvidia-smi found but broken, or found-then-vanished
-		// after this worker had already seen it present (fix round 3:
-		// NOT "never found at all" — see gatherLabels for why that case
-		// no longer sets Failed) — so this device's empty result proves
+		// A source that speaks for THIS device could not be confirmed this
+		// pass — nvidia-smi found but broken, or found-then-vanished after
+		// this worker had already seen it present (NOT "never found at
+		// all" — see gatherLabels for why that case is no failure), or a
+		// drop-in that reported this device's facts last time it worked and
+		// has now started failing — so this device's empty result proves
 		// nothing about it. Omit it entirely so applyDeviceFacts
-		// (server-side) leaves whatever is already stored for it
-		// untouched.
+		// (server-side) leaves whatever is already stored for it untouched.
 		//
-		// Two limitations accepted alongside this ruling, not overlooked:
+		// Three limitations accepted alongside this ruling, not overlooked:
 		//   - A preserved label never expires on its own. A device that
 		//     genuinely lost its GPU (decommissioned, card pulled) keeps
 		//     advertising it indefinitely until either its probe starts
@@ -709,11 +735,26 @@ func labelsPayload(res ProbeResult, warned map[string]bool) map[string]map[strin
 		//     an operator intervenes by hand. No staleness/TTL mechanism
 		//     is built here — that belongs with the verify-probe work
 		//     planned for the next stage, not invented ad hoc in this fix.
-		//   - Failed is a single pass-wide bool (see ProbeResult.Failed),
-		//     not attributed to any one probe or device, so ONE flaky
-		//     drop-in anywhere on the host freezes every OTHER empty
-		//     device's labels too, not just the one the flaky probe was
-		//     ever meant to cover. Accepted for now.
+		//   - An omitted device is frozen WHOLE: it stops receiving this
+		//     pass's host-wide facts along with the device-scoped ones it
+		//     is being preserved for, because the wire has exactly one
+		//     lever per device (present or absent) and no way to say
+		//     "refresh the host facts, keep the device facts". Narrowing
+		//     the attribution (ProbeResult.Unconfirmed) shrinks how often
+		//     that happens to the devices whose OWN source broke; it does
+		//     not remove it for those devices. Removing it entirely would
+		//     mean either a per-source store server-side or replaying
+		//     cached values as if freshly probed — the second of which
+		//     would refresh every label's updated_at and quietly retire the
+		//     staleness the dashboard shows an operator, which is worse
+		//     than the freeze.
+		//   - A device that gets SOME facts this pass (a second probe still
+		//     reporting gpu0.temp) is sent, not omitted, so the broken
+		//     source's own keys for it are cleared rather than preserved:
+		//     the payload carries one map per device, so anything absent
+		//     from it is a clear. Unchanged from Stage 3, and it is the
+		//     honest reading of a partial report — the alternative would
+		//     drop the facts that DID come back.
 		if !warned[name] {
 			slog.Warn("device's probe source failed or was unavailable this pass; preserving its previously detected labels instead of clearing them",
 				"device", name)

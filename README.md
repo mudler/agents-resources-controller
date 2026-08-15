@@ -290,13 +290,26 @@ registration, and every later probe pass proceed regardless — a wedged
 up or serving jobs.
 
 The one deliberate exception to "a probe that stops reporting a key just
-means that fact is gone": if `nvidia-smi` was present on `PATH` when this
-worker process started and later disappears (a driver upgrade mid-run is
-the canonical case), that device's previously-detected labels are
+means that fact is gone": a source that **fails** — as opposed to running
+and reporting nothing — leaves the labels of the devices it covers
 **preserved** rather than cleared, because wiping them is a fleet-wide
-guess and a stale label is scoped to one device. If `nvidia-smi` was never
-present since this worker started, its absence is not a failure and
-labels clear normally, the same as any other probe that stops reporting.
+guess and a stale label is scoped to one device. `nvidia-smi` present on
+`PATH` when this worker process started and gone now (a driver upgrade
+mid-run is the canonical case) counts as a failure; `nvidia-smi` never
+present since this worker started does not, and those labels clear
+normally, the same as any other probe that stops reporting.
+
+Preservation is scoped to the failing source and to the devices that
+source covers: for `nvidia-smi`, the devices it has reported (or, before
+it has ever reported any, those a `gpu<N>` key could name at all); for a
+drop-in script, the devices it named the last time it ran successfully in
+this worker process. Every other device keeps refreshing, so one broken
+drop-in no longer freezes host-wide facts — `disk_free_bytes`,
+`mem_total_bytes` — on devices it has nothing to do with. A script that
+has not once succeeded since this worker started covers no device, so its
+failure preserves nothing: after a worker restart, a probe that is broken
+from the outset clears what it used to report rather than freezing it
+forever.
 
 **Probes, like lease lifecycle hooks, run operator-supplied scripts as the
 worker user with no additional sandboxing** — the same blast radius as any

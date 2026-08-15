@@ -534,6 +534,141 @@ func TestPushLabelsClearsGPULabelsOnAHostThatNeverHadNvidiaSmi(t *testing.T) {
 	}
 }
 
+// TestOneBrokenDropInDoesNotFreezeFactsFromWorkingSources is Stage 3's final
+// review finding, measured live and driven here through the REAL gatherLabels
+// path end to end rather than a hand-built ProbeResult:
+//
+//	"With a second, unrelated probe broken, disk_free_bytes and
+//	mem_total_bytes froze at their last good values on both devices while
+//	builtinLabels() kept succeeding, because a device omitted from the
+//	payload never gets ReplaceLabels called at all. A buggy
+//	/etc/rc/probe.d/50-custom.sh on a full box leaves disk_free_bytes=72G
+//	advertised forever; --select 'disk_free_bytes>=50G' routes a job there
+//	and it dies on write."
+//
+// Two drop-ins: 20-disk.sh reports a HOST-scoped fact (re-read from a file
+// this test rewrites mid-flight, so a refresh is observable rather than
+// assumed), and 50-custom.sh reports a DEVICE-scoped fact for gpu1 once and
+// then breaks for good. Under the pass-wide Failed flag this replaces, ONE
+// broken script made every empty device unconfirmed, so gpu0 was omitted
+// from every subsequent push and never received the host facts again — the
+// freeze above. What must happen instead:
+//
+//   - gpu0 is a PRESENT key in the push, which is what makes the controller
+//     call ReplaceLabels with the host facts merged in for it (see
+//     applyDeviceFacts server-side, and TestRegisterStoresDetectedAndDeclaredLabels
+//     which pins that a device with no facts of its own still inherits the
+//     "" key's) — and the value it carries is the NEW one, not the old.
+//   - gpu1, the device the broken script actually speaks for, is still
+//     omitted: narrow preservation, exactly as before.
+func TestOneBrokenDropInDoesNotFreezeFactsFromWorkingSources(t *testing.T) {
+	probeDir := t.TempDir()
+	stateDir := t.TempDir() // kept OUT of probeDir: nothing here is a probe
+	diskValue := filepath.Join(stateDir, "disk_free_bytes")
+	require.NoError(t, os.WriteFile(diskValue, []byte("72000000000"), 0o644))
+
+	// The working source: a host-scoped fact, re-read on every run.
+	require.NoError(t, os.WriteFile(filepath.Join(probeDir, "20-disk.sh"),
+		[]byte("#!/bin/sh\nprintf '{\"disk_free_bytes\":\"%s\"}\\n' \"$(cat "+diskValue+")\"\n"), 0o755))
+
+	// The unrelated broken source: reports gpu1's own fact on its first run
+	// (so it has a contribution worth preserving), then fails forever.
+	marker := filepath.Join(stateDir, "custom-ran")
+	custom := "#!/bin/sh\n" +
+		"if [ -f " + marker + " ]; then\n" +
+		"  echo 'custom: line 3: jq: command not found' >&2\n" +
+		"  exit 127\n" +
+		"fi\n" +
+		"touch " + marker + "\n" +
+		`echo '{"gpu1.custom":"present"}'` + "\n"
+	require.NoError(t, os.WriteFile(filepath.Join(probeDir, "50-custom.sh"), []byte(custom), 0o755))
+
+	registered := make(chan registerBody, 1)
+	pushed := make(chan map[string]any, 16)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/workers/register":
+			var body registerBody
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			select {
+			case registered <- body:
+			default:
+			}
+			_ = json.NewEncoder(w).Encode(map[string]string{"worker_id": "w1"})
+		case "/v1/workers/w1/labels":
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			select {
+			case pushed <- body:
+			default:
+			}
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	wk := worker.New(worker.Config{
+		ControllerURL:     ts.URL,
+		Token:             "t",
+		Host:              "gpubox",
+		Devices:           []worker.DeviceConfig{{Name: "gpu0"}, {Name: "gpu1"}},
+		HeartbeatInterval: 500 * time.Millisecond,
+		PollWait:          50 * time.Millisecond,
+		ProbeDir:          probeDir,
+		ProbeInterval:     150 * time.Millisecond,
+	})
+	go func() { _ = wk.Start(ctx) }()
+
+	// Pass 1, inside register(): both drop-ins work, so everything reports.
+	var regBody registerBody
+	select {
+	case regBody = <-registered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("register never reached the controller")
+	}
+	require.Equal(t, "72000000000", regBody.Labels[""]["disk_free_bytes"],
+		"sanity: the working drop-in's host fact must reach the first pass")
+	require.Equal(t, "present", regBody.Labels["gpu1"]["custom"],
+		"sanity: the soon-to-break drop-in's device fact must reach the first pass, or there is nothing to preserve later")
+
+	// The box fills up. Every later pass reports the new value — and every
+	// later pass also runs the now-broken 50-custom.sh.
+	require.NoError(t, os.WriteFile(diskValue, []byte("512"), 0o644))
+
+	deadline := time.After(15 * time.Second)
+	for {
+		select {
+		case pushBody := <-pushed:
+			labels, _ := pushBody["labels"].(map[string]any)
+			host, _ := labels[""].(map[string]any)
+			if host["disk_free_bytes"] != "512" {
+				continue // a push from before the value changed
+			}
+
+			gpu0, hasGPU0 := labels["gpu0"]
+			require.True(t, hasGPU0,
+				"gpu0 must be a PRESENT key so the refreshed host facts actually reach it — omitting it "+
+					"(as one pass-wide failure flag did) is what left disk_free_bytes frozen at its last good value "+
+					"while the probe that gathered it kept succeeding")
+			require.Empty(t, gpu0, "gpu0 has no device-scoped facts of its own; the host facts reach it via the \"\" key")
+
+			_, hasGPU1 := labels["gpu1"]
+			require.False(t, hasGPU1,
+				"gpu1 is the device the BROKEN drop-in speaks for: its facts are unconfirmed, so it must still be "+
+					"omitted rather than cleared")
+			return
+		case <-deadline:
+			t.Fatal("no push carried the refreshed disk_free_bytes value")
+		}
+	}
+}
+
 // logCapture is a trivial io.Writer collecting everything written to it,
 // used to assert on log output without depending on slog's exact handler
 // formatting beyond "the text shows up somewhere".

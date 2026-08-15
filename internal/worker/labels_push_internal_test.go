@@ -15,7 +15,7 @@ import (
 // to nil here, not {}, or a fleet-wide probe outage on a host with no
 // working built-ins at all would wipe every device's detected labels on the
 // next push. This is the defensive, essentially-never-hit case; the REAL
-// everyday guard is per-device, see the Failed-flag tests below — a real
+// everyday guard is per-device, see the Unconfirmed tests below — a real
 // gatherLabels pass almost always has non-empty Host (builtinLabels always
 // yields at least "cpus"), which is exactly why a pass-wide-only guard was
 // found inert in fix round 1: see
@@ -36,7 +36,6 @@ func TestLabelsPayloadIncludesEverythingWhenPassProducedAnything(t *testing.T) {
 	res := ProbeResult{
 		Host:   map[string]string{"kernel": "6.8.0"},
 		Device: map[string]map[string]string{"gpu0": {"vram": "80G"}, "gpu1": {}},
-		Failed: false,
 	}
 	out := labelsPayload(res, map[string]bool{})
 	require.NotNil(t, out)
@@ -52,15 +51,15 @@ func TestLabelsPayloadIncludesEverythingWhenPassProducedAnything(t *testing.T) {
 // host — the old pass-wide "everything empty" guard therefore never fired
 // in production no matter what happened to a device's own probes. The
 // actual protection has to be per device: gpu0's own facts vanished this
-// pass (its probe failed — res.Failed is true), so gpu0 must be OMITTED
-// from the output entirely — not sent as {}, which ReplaceLabels would
-// still turn into a clear — while gpu1 (whose own facts came through fine)
-// and the host-wide key are unaffected.
+// pass (a source that speaks for it failed — res.Unconfirmed names it), so
+// gpu0 must be OMITTED from the output entirely — not sent as {}, which
+// ReplaceLabels would still turn into a clear — while gpu1 (whose own facts
+// came through fine) and the host-wide key are unaffected.
 func TestLabelsPayloadOmitsFailedDeviceButKeepsHostAndOtherDevices(t *testing.T) {
 	res := ProbeResult{
-		Host:   map[string]string{"cpus": "8"},
-		Device: map[string]map[string]string{"gpu0": {}, "gpu1": {"vram": "40G"}},
-		Failed: true,
+		Host:        map[string]string{"cpus": "8"},
+		Device:      map[string]map[string]string{"gpu0": {}, "gpu1": {"vram": "40G"}},
+		Unconfirmed: map[string]bool{"gpu0": true},
 	}
 	out := labelsPayload(res, map[string]bool{})
 	require.NotNil(t, out)
@@ -80,13 +79,38 @@ func TestLabelsPayloadSendsExplicitClearWhenNothingFailed(t *testing.T) {
 	res := ProbeResult{
 		Host:   map[string]string{"cpus": "8"},
 		Device: map[string]map[string]string{"gpu0": {}},
-		Failed: false,
 	}
 	out := labelsPayload(res, map[string]bool{})
 	require.NotNil(t, out)
 	gpu0, hasGPU0Key := out["gpu0"]
 	require.True(t, hasGPU0Key, "a confirmed-clean empty device must still be a present key")
 	require.Empty(t, gpu0)
+}
+
+// TestLabelsPayloadOmitsOnlyTheUnconfirmedOfTwoEmptyDevices is the Stage 4
+// narrowing at this layer: two devices, both with no facts of their own,
+// only ONE of them behind a failed source. The unconfirmed one is preserved
+// by omission; the other is a present key, which is the only way the
+// controller ever applies the "" key's host facts to it (see
+// applyDeviceFacts server-side). Under the pass-wide flag both were omitted,
+// and the second device's disk_free_bytes/mem_total_bytes froze along with
+// facts it had nothing to do with.
+func TestLabelsPayloadOmitsOnlyTheUnconfirmedOfTwoEmptyDevices(t *testing.T) {
+	res := ProbeResult{
+		Host:        map[string]string{"disk_free_bytes": "512"},
+		Device:      map[string]map[string]string{"gpu0": {}, "gpu1": {}},
+		Unconfirmed: map[string]bool{"gpu1": true},
+	}
+	out := labelsPayload(res, map[string]bool{})
+	require.NotNil(t, out)
+	require.Equal(t, map[string]string{"disk_free_bytes": "512"}, out[""])
+
+	gpu0, hasGPU0Key := out["gpu0"]
+	require.True(t, hasGPU0Key, "a device no failure speaks for must stay a present key, or it never sees the fresh host facts")
+	require.Empty(t, gpu0)
+
+	_, hasGPU1Key := out["gpu1"]
+	require.False(t, hasGPU1Key, "the device whose own source failed is still preserved by omission")
 }
 
 // A pass with no host facts but SOME device fact is not "nothing": the ""
@@ -118,9 +142,9 @@ func TestLabelsPayloadWarnsOnceThenStaysQuietForTheSameEpisode(t *testing.T) {
 	t.Cleanup(func() { slog.SetDefault(orig) })
 
 	res := ProbeResult{
-		Host:   map[string]string{"cpus": "8"},
-		Device: map[string]map[string]string{"gpu0": {}},
-		Failed: true,
+		Host:        map[string]string{"cpus": "8"},
+		Device:      map[string]map[string]string{"gpu0": {}},
+		Unconfirmed: map[string]bool{"gpu0": true},
 	}
 	warned := map[string]bool{}
 
@@ -152,9 +176,9 @@ func TestLabelsPayloadWarnsAgainAfterRecovery(t *testing.T) {
 
 	warned := map[string]bool{}
 	failing := ProbeResult{
-		Host:   map[string]string{"cpus": "8"},
-		Device: map[string]map[string]string{"gpu0": {}},
-		Failed: true,
+		Host:        map[string]string{"cpus": "8"},
+		Device:      map[string]map[string]string{"gpu0": {}},
+		Unconfirmed: map[string]bool{"gpu0": true},
 	}
 	labelsPayload(failing, warned)
 	require.Equal(t, 1, countOccurrences(buf.String(), "gpu0"))
@@ -163,7 +187,6 @@ func TestLabelsPayloadWarnsAgainAfterRecovery(t *testing.T) {
 	recovered := ProbeResult{
 		Host:   map[string]string{"cpus": "8"},
 		Device: map[string]map[string]string{"gpu0": {"vram": "80G"}},
-		Failed: false,
 	}
 	out := labelsPayload(recovered, warned)
 	require.Equal(t, "80G", out["gpu0"]["vram"])
