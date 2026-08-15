@@ -312,15 +312,30 @@ func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	case model.LeaseKindHold:
-		// The sleeper a hold runs is the worker's choice, never the
-		// submitter's (see internal/worker's execute) — this is the one
-		// place that guarantee is actually enforced: a hold submission
-		// carrying a command is refused outright rather than silently
-		// discarded, so "--kind hold" can never become a way to run
-		// arbitrary code labelled as something else.
+		// The sleeper a hold runs — its command, its working directory, and
+		// its environment — is the worker's choice, never the submitter's
+		// (see internal/worker's execute). This is the one place that
+		// guarantee is actually enforced: a hold submission carrying any of
+		// the three is refused outright, rejected rather than silently
+		// blanked, so "--kind hold" can never become a way to run arbitrary
+		// code (or point it at an attacker-chosen cwd, or hand it
+		// LD_PRELOAD via env) labelled as something else. Blanking instead
+		// of rejecting was considered and rejected: a client sending these
+		// for a hold is confused about what a hold is, and silently
+		// discarding two thirds of its request is worse than telling it so.
 		if len(req.Command) != 0 {
 			writeErr(w, http.StatusBadRequest, "bad_request",
 				"a hold may not specify a command: the worker supplies its own")
+			return
+		}
+		if req.Cwd != "" {
+			writeErr(w, http.StatusBadRequest, "bad_request",
+				"a hold may not specify a cwd: the worker's sleeper does not use one")
+			return
+		}
+		if len(req.Env) != 0 {
+			writeErr(w, http.StatusBadRequest, "bad_request",
+				"a hold may not specify env: the worker's sleeper does not use it")
 			return
 		}
 		// --ttl is required for a hold, capped by the device's max_runtime

@@ -16,14 +16,17 @@ import (
 	"github.com/mudler/agents-resources-controller/internal/model"
 )
 
-// sleepInfinity is the command execute runs for a hold (kind == "hold"),
+// holdSleeper is the command execute runs for a hold (kind == "hold"),
 // standing in for whatever the job row's Command actually says: a hold's
 // command is this worker's choice, never the client's — see execute's own
-// comment for why. GNU coreutils' `sleep infinity` has run on every device
-// host this project targets since long before this project existed; the
-// wall-clock watchdog (JobSpec.MaxRuntime), not this command, is what
-// actually bounds how long it runs.
-var sleepInfinity = []string{"sleep", "infinity"}
+// comment for why. "2147483647" (2^31-1 seconds, ~68 years) rather than GNU
+// coreutils' `sleep infinity`: POSIX sleep(1) only guarantees an integer
+// argument, and this worker runs on whatever the operator's box happens to
+// be — busybox (a realistic device-host userland) has no "infinity" — so
+// the portable spelling of "longer than this will ever need to run" is used
+// instead. The wall-clock watchdog (JobSpec.MaxRuntime), not this command,
+// is what actually bounds how long it runs.
+var holdSleeper = []string{"sleep", "2147483647"}
 
 type assignment struct {
 	JobID              string            `json:"job_id"`
@@ -992,14 +995,14 @@ func (w *Worker) execute(ctx context.Context, a assignment) {
 	// job row (see server.holdCommand) and rejects a hold submission that
 	// carries a command of its own, but the guarantee that nothing a
 	// client sent ever runs is enforced here too, not only there — a.Command
-	// is simply never looked at for a hold. sleepInfinity, not a duration
+	// is simply never looked at for a hold. holdSleeper, not a duration
 	// derived from a.MaxRuntimeSeconds: the wall-clock watchdog already
 	// enforces the TTL (see JobSpec.MaxRuntime below), so the sleeper only
 	// needs to outlast it, and letting the watchdog be the one clock avoids
 	// two independent timers ever disagreeing about when a hold ends.
 	command := a.Command
 	if a.Kind == model.LeaseKindHold {
-		command = sleepInfinity
+		command = holdSleeper
 	}
 
 	sink := &logSink{w: w, jobID: a.JobID, ctx: reportCtx}

@@ -74,6 +74,10 @@ func NewHoldCmd() *cobra.Command {
 
 			c := client.New(controllerURL(), controllerToken())
 
+			// Hold never sets NoWait — a hold always blocks in the queue
+			// rather than failing fast on a busy device — so unlike rc run
+			// there is no client.ErrNoDevice case to handle here: the
+			// server can only ever return that 409 in response to NoWait.
 			job, err := c.Hold(ctx, client.HoldOptions{
 				DeviceID:  device,
 				Selector:  selector,
@@ -81,9 +85,6 @@ func NewHoldCmd() *cobra.Command {
 				Reason:    reason,
 				TTL:       ttl,
 			})
-			if errors.Is(err, client.ErrNoDevice) {
-				return fmt.Errorf("%s is busy and could not be queued", target)
-			}
 			if err != nil {
 				return err
 			}

@@ -135,20 +135,33 @@ func TestHoldCtrlCOnAGrantedHoldReleasesIt(t *testing.T) {
 	require.Equal(t, "tester", releaseSubmitter.Load())
 }
 
-// TestHoldSubmissionCarryingACommandIsRefused proves the security property
-// the whole design rests on end to end, against the REAL controller (not a
-// stub echoing canned responses): the sleeper a hold runs is the worker's
-// choice, never the client's, so the server must reject a submission that
-// is kind=hold and also names a command — otherwise --kind hold would be a
-// way to run arbitrary code labelled as something else. rc hold itself has
-// no flag to supply a command, so this drives the client directly, the way
-// a caller bypassing the CLI (or a future bug in it) could.
-func TestHoldSubmissionCarryingACommandIsRefused(t *testing.T) {
+// TestHoldSubmissionCarryingCommandCwdOrEnvIsRefused proves the security
+// property the whole design rests on end to end, against the REAL
+// controller (not a stub echoing canned responses): the sleeper a hold
+// runs, where it runs, and what environment it inherits are all the
+// worker's choice, never the client's — not just the command. A submission
+// that smuggles a payload through cwd or env (e.g. LD_PRELOAD) instead of
+// command would let it run inside a process every view in the system labels
+// "hold", exactly the "arbitrary code under a different label" the guard
+// exists to prevent. rc hold itself has no flag to supply any of these, so
+// this drives the client directly, the way a caller bypassing the CLI (or a
+// future bug in it) could.
+//
+// The device is registered so a rejected case is distinguished from an
+// accepted one by 400 vs 201, not by which error the store happens to
+// return for a device it has never heard of — see the fix-round-1 review
+// note this replaced a version of this test for.
+func TestHoldSubmissionCarryingCommandCwdOrEnvIsRefused(t *testing.T) {
 	dir := t.TempDir()
 	c := clock.NewFake(time.Date(2026, 8, 13, 12, 0, 0, 0, time.UTC))
 	st, err := store.Open(filepath.Join(dir, "rc.db"), c)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
+
+	require.NoError(t, st.UpsertWorker(
+		model.Worker{ID: "w1", Host: "gpubox", LastHeartbeatAt: c.Now()},
+		[]model.Device{{ID: "gpubox:gpu0", Host: "gpubox", Name: "gpu0", WorkerID: "w1", State: model.DeviceReady}},
+	))
 
 	logs, err := logstore.New(filepath.Join(dir, "logs"))
 	require.NoError(t, err)
@@ -162,15 +175,35 @@ func TestHoldSubmissionCarryingACommandIsRefused(t *testing.T) {
 
 	cl := client.New(ts.URL, "ctok")
 
-	_, err = cl.Submit(context.Background(), client.SubmitOptions{
-		DeviceID:   "gpubox:gpu0",
-		Submitter:  "tester",
-		Command:    []string{"true"},
-		MaxRuntime: time.Minute,
-		Kind:       model.LeaseKindHold,
+	cases := []struct {
+		name string
+		opts client.SubmitOptions
+	}{
+		{"command", client.SubmitOptions{Command: []string{"true"}}},
+		{"cwd", client.SubmitOptions{Cwd: "/attacker/cwd"}},
+		{"env", client.SubmitOptions{Env: map[string]string{"LD_PRELOAD": "/tmp/evil.so"}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := tc.opts
+			opts.DeviceID = "gpubox:gpu0"
+			opts.Submitter = "tester"
+			opts.MaxRuntime = time.Minute
+			opts.Kind = model.LeaseKindHold
+			_, err := cl.Submit(context.Background(), opts)
+			require.Error(t, err, "the controller must refuse a hold submission carrying "+tc.name)
+			require.Contains(t, err.Error(), "bad_request")
+		})
+	}
+
+	// A clean hold — none of command, cwd, or env — must still be accepted
+	// (201): the guard must reject exactly the fields that matter, not holds
+	// in general.
+	job, err := cl.Submit(context.Background(), client.SubmitOptions{
+		DeviceID: "gpubox:gpu0", Submitter: "tester", MaxRuntime: time.Minute, Kind: model.LeaseKindHold,
 	})
-	require.Error(t, err, "the controller must refuse a hold submission that carries a command")
-	require.Contains(t, err.Error(), "bad_request")
+	require.NoError(t, err, "a hold with no command, cwd, or env must be accepted")
+	require.NotNil(t, job)
 
 	// And the sibling rule: a hold with no --ttl must also be refused,
 	// rather than silently granted with no expiry.

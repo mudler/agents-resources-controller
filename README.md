@@ -21,7 +21,6 @@ service like LocalAI or ollama around a job's hold on a device).
 |---|---|
 | Capability probes (`/etc/rc/probe.d/*.sh`) and device labels | List device names in `worker.yaml` |
 | Per-host usage sheet (`/etc/rc/host.md`) and `rc describe` | Keep host notes wherever you keep them now |
-| Device selectors (`--select 'vram>=40G'`) | Address a device by exact ID: `-d gpubox:gpu0` |
 | Verify probes between jobs | Nothing checks VRAM was released after a job |
 | Webhook notifications | Poll `rc ps` / `rc devices`, or watch `/v1/events` |
 | Dashboard actions (kill/hold from the browser) | `rc kill` from a terminal; the dashboard is read-only |
