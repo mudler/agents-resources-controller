@@ -31,11 +31,18 @@ probe_interval: 5m
 # exit code are untouched: a dirty device says nothing about the run.
 #
 # Each script gets RC_EVENT=verify, RC_DEVICE, RC_JOB_ID, RC_SUBMITTER and
-# CUDA_VISIBLE_DEVICES in its environment, exactly like a lifecycle hook. A
-# non-executable file (a README alongside the scripts) is skipped, but a file
-# that cannot be stat'd at all — a dangling symlink — FAILS the pass: a
-# script that could not run has proven nothing, and "proved nothing" must
-# never be recorded as "verified clean".
+# CUDA_VISIBLE_DEVICES in its environment, the same way a lifecycle hook
+# does. RC_SUBMITTER is the submitter of the job that just finished — the
+# one whose run left the device in whatever state you are about to inspect —
+# so a script can name them in what it writes to stderr, or page them.
+#
+# A non-executable file (a README alongside the scripts) is skipped, and the
+# skip is logged at WARN: `chmod -x` is the normal way to disable a drop-in,
+# but a git checkout or an rsync without -p drops the exec bit by accident,
+# and a safety check that silently stops running is worse than one that was
+# never there. A file that cannot be stat'd at all — a dangling symlink —
+# FAILS the pass instead: a script that could not run has proven nothing,
+# and "proved nothing" must never be recorded as "verified clean".
 verify_dir: /etc/rc/verify.d
 # verify_timeout bounds any SINGLE verify script; it is killed as a process
 # group and its pass counted as failed if it runs over. Optional; defaults to

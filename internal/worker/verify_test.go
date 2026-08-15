@@ -36,7 +36,7 @@ func TestVerifyPassesWhenEveryScriptSucceeds(t *testing.T) {
 	writeVerify(t, dir, "10-ok.sh", `exit 0`)
 	writeVerify(t, dir, "20-ok.sh", `exit 0`)
 
-	res := newVerifyWorker(t, dir).RunVerifyForTest(context.Background(), "box:gpu0", "job1")
+	res := newVerifyWorker(t, dir).RunVerifyForTest(context.Background(), "box:gpu0", "job1", "agent-a")
 	require.True(t, res.OK)
 	require.Empty(t, res.Reason)
 }
@@ -45,7 +45,7 @@ func TestVerifyFailsAndCarriesTheScriptsStderr(t *testing.T) {
 	dir := t.TempDir()
 	writeVerify(t, dir, "10-vram.sh", `echo "72G still allocated" >&2; exit 1`)
 
-	res := newVerifyWorker(t, dir).RunVerifyForTest(context.Background(), "box:gpu0", "job1")
+	res := newVerifyWorker(t, dir).RunVerifyForTest(context.Background(), "box:gpu0", "job1", "agent-a")
 	require.False(t, res.OK)
 	require.Contains(t, res.Reason, "72G still allocated",
 		"the operator needs to know WHY the device was quarantined")
@@ -68,7 +68,7 @@ func TestVerifyRunsEveryScriptAndFailsIfAnyFails(t *testing.T) {
 	writeVerify(t, dir, "10-bad.sh", `exit 1`)
 	writeVerify(t, dir, "20-good.sh", `touch `+marker+`; exit 0`)
 
-	res := newVerifyWorker(t, dir).RunVerifyForTest(context.Background(), "box:gpu0", "job1")
+	res := newVerifyWorker(t, dir).RunVerifyForTest(context.Background(), "box:gpu0", "job1", "agent-a")
 	require.False(t, res.OK)
 	require.FileExists(t, marker, "a failing script must not stop the rest of the pass")
 }
@@ -85,7 +85,7 @@ func TestVerifyFirstFailureReasonWinsButAllScriptsStillRun(t *testing.T) {
 	writeVerify(t, dir, "10-first-bad.sh", `echo "first complaint" >&2; exit 1`)
 	writeVerify(t, dir, "20-second-bad.sh", `touch `+marker+`; echo "second complaint" >&2; exit 1`)
 
-	res := newVerifyWorker(t, dir).RunVerifyForTest(context.Background(), "box:gpu0", "job1")
+	res := newVerifyWorker(t, dir).RunVerifyForTest(context.Background(), "box:gpu0", "job1", "agent-a")
 	require.False(t, res.OK)
 	require.FileExists(t, marker, "the second failing script must still run, not be skipped once the first fails")
 	require.Contains(t, res.Reason, "10-first-bad.sh")
@@ -107,7 +107,7 @@ func TestVerifyTimesOutAsAFailure(t *testing.T) {
 	})
 
 	start := time.Now()
-	res := w.RunVerifyForTest(context.Background(), "box:gpu0", "job1")
+	res := w.RunVerifyForTest(context.Background(), "box:gpu0", "job1", "agent-a")
 	require.False(t, res.OK)
 	require.Less(t, time.Since(start), 10*time.Second, "a hanging script must not stall the pass")
 	require.Contains(t, res.Reason, "10-hang.sh")
@@ -115,22 +115,100 @@ func TestVerifyTimesOutAsAFailure(t *testing.T) {
 
 // The feature is off unless a host ships scripts.
 func TestVerifyPassesWhenThereAreNoScripts(t *testing.T) {
-	res := newVerifyWorker(t, t.TempDir()).RunVerifyForTest(context.Background(), "box:gpu0", "job1")
+	res := newVerifyWorker(t, t.TempDir()).RunVerifyForTest(context.Background(), "box:gpu0", "job1", "agent-a")
 	require.True(t, res.OK)
 }
 
 func TestVerifyPassesWhenTheDirectoryDoesNotExist(t *testing.T) {
 	res := newVerifyWorker(t, filepath.Join(t.TempDir(), "nope")).
-		RunVerifyForTest(context.Background(), "box:gpu0", "job1")
+		RunVerifyForTest(context.Background(), "box:gpu0", "job1", "agent-a")
 	require.True(t, res.OK)
 }
 
 func TestVerifyScriptSeesTheDeviceAndJob(t *testing.T) {
 	dir := t.TempDir()
-	writeVerify(t, dir, "10-env.sh", `[ "$RC_DEVICE" = "box:gpu0" ] && [ "$RC_JOB_ID" = "job1" ] || exit 1`)
+	writeVerify(t, dir, "10-env.sh",
+		`[ "$RC_DEVICE" = "box:gpu0" ] && [ "$RC_JOB_ID" = "job1" ] && [ "$RC_SUBMITTER" = "agent-a" ] || exit 1`)
 
-	res := newVerifyWorker(t, dir).RunVerifyForTest(context.Background(), "box:gpu0", "job1")
-	require.True(t, res.OK, "the script did not receive RC_DEVICE and RC_JOB_ID")
+	res := newVerifyWorker(t, dir).RunVerifyForTest(context.Background(), "box:gpu0", "job1", "agent-a")
+	require.True(t, res.OK, "the script did not receive RC_DEVICE, RC_JOB_ID and RC_SUBMITTER")
+}
+
+// TestVerifyScriptSeesTheSubmitterFromTheAssignment pins the WIRING, not the
+// environment builder: runVerify's own env test above would pass just as
+// happily against the version of execute that handed it a hardcoded "", which
+// is exactly the defect this closes. So this drives the real execute() path —
+// Worker.Start against an httptest controller handing out an assignment with
+// a submitter on it — and asserts the script sees that submitter and not an
+// empty string.
+//
+// A verify script's whole reason to want it is to name whoever's run left the
+// device dirty (page them, tag the quarantine, write it to a ticket); an
+// empty RC_SUBMITTER fails silently rather than loudly, which is why this is
+// worth a test of its own rather than trusting one argument at one call site.
+func TestVerifyScriptSeesTheSubmitterFromTheAssignment(t *testing.T) {
+	dir := t.TempDir()
+	seen := filepath.Join(dir, "submitter.txt")
+	// The script passes; what is under test is what it OBSERVED, so the
+	// device's fate is beside the point here (the ordering tests above cover
+	// that).
+	writeVerify(t, dir, "10-who.sh", `printf '%s' "$RC_SUBMITTER" > `+seen+`; exit 0`)
+
+	var (
+		mu     sync.Mutex
+		served bool
+	)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/workers/register":
+			json.NewEncoder(w).Encode(map[string]string{"worker_id": "w1"})
+		case "/v1/workers/w1/assignments":
+			mu.Lock()
+			first := !served
+			served = true
+			mu.Unlock()
+			if !first {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			json.NewEncoder(w).Encode(map[string]any{"assignments": []map[string]any{{
+				"job_id":    "job1",
+				"device_id": "gpubox:gpu0",
+				"command":   []string{"true"},
+				"submitter": "alice@lab",
+			}}})
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	wk := worker.New(worker.Config{
+		ControllerURL:     ts.URL,
+		Host:              "gpubox",
+		Devices:           []worker.DeviceConfig{{Name: "gpu0"}},
+		HeartbeatInterval: 500 * time.Millisecond,
+		PollWait:          20 * time.Millisecond,
+		VerifyDir:         dir,
+		VerifyTimeout:     2 * time.Second,
+	})
+	go func() { _ = wk.Start(ctx) }()
+
+	var got []byte
+	require.Eventually(t, func() bool {
+		b, err := os.ReadFile(seen)
+		if err != nil {
+			return false
+		}
+		got = b
+		return true
+	}, 10*time.Second, 20*time.Millisecond, "the verify script never ran")
+
+	require.Equal(t, "alice@lab", string(got),
+		"a verify script must see the submitter of the job that just finished, not an empty RC_SUBMITTER")
 }
 
 // TestVerifyFailsOnAScriptItCannotStat closes a fail-open gap found in
@@ -144,7 +222,7 @@ func TestVerifyFailsOnAScriptItCannotStat(t *testing.T) {
 	dir := t.TempDir()
 	require.NoError(t, os.Symlink(filepath.Join(dir, "does-not-exist.sh"), filepath.Join(dir, "10-dangling.sh")))
 
-	res := newVerifyWorker(t, dir).RunVerifyForTest(context.Background(), "box:gpu0", "job1")
+	res := newVerifyWorker(t, dir).RunVerifyForTest(context.Background(), "box:gpu0", "job1", "agent-a")
 	require.False(t, res.OK, "a script that cannot be stat'ed must fail the pass, not silently pass it")
 	require.True(t, strings.HasPrefix(res.Reason, "verify failed: "))
 	require.Contains(t, res.Reason, "10-dangling.sh")
@@ -171,7 +249,7 @@ func TestVerifyFailsWhenThePassBudgetIsExceeded(t *testing.T) {
 	})
 
 	start := time.Now()
-	res := w.RunVerifyForTest(context.Background(), "box:gpu0", "job1")
+	res := w.RunVerifyForTest(context.Background(), "box:gpu0", "job1", "agent-a")
 	require.False(t, res.OK, "a pass that never finishes has proven nothing about the device and must not read as clean")
 	require.Less(t, time.Since(start), 10*time.Second, "a stalled pass must not run past its own budget")
 	require.Contains(t, res.Reason, "budget")

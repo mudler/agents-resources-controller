@@ -452,18 +452,32 @@ The rest of the rules:
   RC_EVENT=verify
   RC_DEVICE=demobox:gpu0
   RC_JOB_ID=a427c77b-e788-43cb-9e4c-36354552e938
-  RC_SUBMITTER=
+  RC_SUBMITTER=alice@lab
   CUDA_VISIBLE_DEVICES=0
   ```
 
-  `RC_SUBMITTER` is present but **empty**: a verify pass is about the device,
-  and the worker does not carry the finished job's submitter into it.
-  `CUDA_VISIBLE_DEVICES` is derived from the device name's trailing integer,
-  exactly as a job's is, and is absent for a device name that has none.
+  `RC_SUBMITTER` is the submitter of the job that just finished — whoever's
+  run left the device in the state you are about to inspect — so a script can
+  name them in the reason it writes to stderr. `CUDA_VISIBLE_DEVICES` is
+  derived from the device name's trailing integer, exactly as a job's is, and
+  is absent for a device name that has none. Treat both as untrusted input
+  for the same reason a hook must (see "Lease lifecycle hooks"): the
+  submitter is free text chosen by whoever submitted the job.
 - **Every script still runs after an earlier one fails**, but only the FIRST
   failure's reason is kept: one is already enough to quarantine the device.
 - **A non-executable file is skipped**, so a `README` sitting alongside the
-  scripts is harmless. A file that cannot even be inspected is not: a
+  scripts is harmless and `chmod -x` disables a script the way it does in any
+  other drop-in directory. The skip is **logged at `WARN`** naming the file,
+  because the other way to lose the executable bit is by accident — a git
+  checkout, an `rsync` without `-p` — and a safety check that quietly stops
+  running is worse than one that was never installed:
+
+  ```
+  WARN verify script is not executable; skipped, so whatever it checks is NOT being checked
+       script=/etc/rc/verify.d/10-vram-free.sh mode=-rw-r--r--
+  ```
+
+  A file that cannot even be inspected is a different matter: a
   dangling symlink, or anything else whose `stat` fails, **fails the pass**.
   A verify script that could not be run has proven nothing, and "proved
   nothing" must never be recorded as "verified clean" — the one place this

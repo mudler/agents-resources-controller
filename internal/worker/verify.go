@@ -74,7 +74,7 @@ type VerifyResult struct {
 // purpose is bounding how long this can run, and once it's gone, every
 // script still queued would fail the exact same way for the exact same
 // reason.
-func (w *Worker) runVerify(ctx context.Context, deviceID, jobID string) VerifyResult {
+func (w *Worker) runVerify(ctx context.Context, deviceID, jobID, submitter string) VerifyResult {
 	// The pass-wide budget is the only thing that bounds this call at all:
 	// runVerify is invoked with reportCtx (see execute), which is
 	// deliberately immune to Start's own shutdown cancellation, so nothing
@@ -103,7 +103,13 @@ func (w *Worker) runVerify(ctx context.Context, deviceID, jobID string) VerifyRe
 	// RC_SUBMITTER, plus CUDA_VISIBLE_DEVICES when it resolves. A verify
 	// pass always has a job ID in hand (unlike an on_release hook, which
 	// may run with none at startup), so RC_JOB_ID here is never blank.
-	env := hookEnv("verify", deviceID, jobID, "")
+	//
+	// submitter is threaded in from the assignment (see execute) rather than
+	// passed as "": an acquire hook gets the real submitter, and a verify
+	// script that could not name whose run dirtied the device would be the
+	// odd one out for no reason anyone chose — a script paging the owner of
+	// the job that left VRAM pinned would silently page nobody.
+	env := hookEnv("verify", deviceID, jobID, submitter)
 
 	// failOnce records the pass's first failure, whatever kind, and is a
 	// no-op on every call after the first — see the doc comment above for
@@ -130,7 +136,24 @@ func (w *Worker) runVerify(ctx context.Context, deviceID, jobID string) VerifyRe
 			continue
 		}
 		if info.Mode()&0o111 == 0 {
-			continue // not executable: e.g. a README dropped alongside scripts
+			// Skipped, not failed: `chmod -x` is the standard way to disable
+			// a drop-in, and every run-parts-style directory in existence
+			// ignores non-executables — quarantining here would let a README
+			// or a stray .dpkg-dist take a GPU out of the pool.
+			//
+			// But say so. This is a CHECK NOT RUNNING, not merely a file
+			// being ignored: a git checkout, or an rsync without -p, silently
+			// drops the exec bit, and a verify script that stops running
+			// leaves every later pass reporting a device clean that nothing
+			// actually inspected. Warn, not Info — the operator's intent
+			// (a script sitting in verify.d) and the effect (it never runs)
+			// disagree, and that is exactly what a warning is for. Not
+			// Error, which this package reserves for a pass that actually
+			// fails; and it is edge-quiet by nature, one line per verify
+			// pass per stray file rather than per probe interval.
+			slog.Warn("verify script is not executable; skipped, so whatever it checks is NOT being checked",
+				"script", path, "mode", info.Mode().Perm())
+			continue
 		}
 
 		stdout := &boundedBuffer{limit: maxProbeOutputBytes}

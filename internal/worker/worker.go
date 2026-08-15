@@ -1116,7 +1116,7 @@ func (w *Worker) execute(ctx context.Context, a assignment) {
 	// a device already unhealthy stays quarantined when the report lands. The
 	// other order leaves it briefly schedulable while still dirty, which is
 	// the OOM this check exists to prevent.
-	if v := w.runVerify(reportCtx, a.DeviceID, a.JobID); !v.OK {
+	if v := w.runVerify(reportCtx, a.DeviceID, a.JobID, a.Submitter); !v.OK {
 		slog.Error("verify failed; quarantining device",
 			"device", a.DeviceID, "job", a.JobID, "reason", v.Reason)
 		w.reportFault(reportCtx, a.DeviceID, v.Reason)

@@ -12,6 +12,6 @@ func (w *Worker) GatherLabelsForTest(ctx context.Context) ProbeResult {
 // RunVerifyForTest is a thin exported wrapper over the unexported runVerify,
 // so the external worker_test package can exercise it without widening the
 // production API.
-func (w *Worker) RunVerifyForTest(ctx context.Context, deviceID, jobID string) VerifyResult {
-	return w.runVerify(ctx, deviceID, jobID)
+func (w *Worker) RunVerifyForTest(ctx context.Context, deviceID, jobID, submitter string) VerifyResult {
+	return w.runVerify(ctx, deviceID, jobID, submitter)
 }
