@@ -2,7 +2,7 @@ name: publish
 
 # Publishes the controller image to GitHub Container Registry.
 #
-# master  -> ghcr.io/<owner>/agents-resources-controller:edge
+# master  -> ghcr.io/<owner>/resource-controller:edge
 # v1.2.3  -> :1.2.3, :1.2, :1, :latest
 #
 # The image is the CONTROLLER. Workers are not containerised: a worker has to
@@ -60,7 +60,7 @@ jobs:
             type=semver,pattern={{major}}
             type=sha,format=long
           labels: |
-            org.opencontainers.image.title=agents-resources-controller
+            org.opencontainers.image.title=resource-controller
             org.opencontainers.image.description=Central controller for leasing exclusive GPU devices to agents
 
       - id: build

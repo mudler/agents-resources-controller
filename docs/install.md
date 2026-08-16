@@ -26,11 +26,11 @@ cat > .env <<EOF
 RC_TOKENS=$(openssl rand -hex 24):worker,$(openssl rand -hex 24):client,$(openssl rand -hex 24):admin
 EOF
 
-curl -fsSLO https://raw.githubusercontent.com/mudler/agents-resources-controller/master/docker-compose.yml
+curl -fsSLO https://raw.githubusercontent.com/mudler/resource-controller/master/docker-compose.yml
 docker compose up -d
 ```
 
-That pulls `ghcr.io/mudler/agents-resources-controller` and serves on
+That pulls `ghcr.io/mudler/resource-controller` and serves on
 `:8080`. Published tags:
 
 | Tag | What it is |
@@ -55,8 +55,8 @@ go install github.com/mudler/agents-resources-controller/cmd/rc@latest   # -> $G
 or build from a checkout:
 
 ```sh
-git clone https://github.com/mudler/agents-resources-controller
-cd agents-resources-controller
+git clone https://github.com/mudler/resource-controller
+cd resource-controller
 CGO_ENABLED=0 go build -o rc ./cmd/rc
 ```
 

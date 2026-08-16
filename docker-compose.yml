@@ -18,7 +18,7 @@ services:
     # To build from a checkout instead of pulling:
     #   docker compose build && docker compose up -d
     # (that overrides the tag above with your local build)
-    image: ghcr.io/mudler/agents-resources-controller:${RC_VERSION:-edge}
+    image: ghcr.io/mudler/resource-controller:${RC_VERSION:-edge}
     build: .
     pull_policy: ${RC_PULL_POLICY:-always}
     container_name: rc-controller
