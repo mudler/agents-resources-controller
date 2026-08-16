@@ -2,7 +2,8 @@ name: publish
 
 # Publishes the controller image to GitHub Container Registry.
 #
-# master  -> ghcr.io/<owner>/resource-controller:edge
+# master  -> ghcr.io/<owner>/resource-controller:master (and :edge, a
+#            rename-proof alias for the same image)
 # v1.2.3  -> :1.2.3, :1.2, :1, :latest
 #
 # The image is the CONTROLLER. Workers are not containerised: a worker has to
@@ -54,6 +55,12 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
+            # The branch name, as a fact: :master is that branch's tip, and a
+            # second branch would get its own tag from this same line.
+            type=ref,event=branch
+            # edge is the same image under a name that survives a branch
+            # rename — master -> main would break every consumer pinned to
+            # the branch tag, and this repo has already been renamed once.
             type=raw,value=edge,enable=${{ github.ref == 'refs/heads/master' }}
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
