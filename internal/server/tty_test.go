@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -14,7 +13,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mudler/resource-controller/internal/model"
 	"github.com/mudler/resource-controller/internal/server"
+	"github.com/mudler/resource-controller/internal/store"
 	"github.com/stretchr/testify/require"
 )
 
@@ -23,6 +24,29 @@ import (
 // message below instead of hanging until the package timeout kills every
 // other test's stack with it.
 const ttyDeadline = 5 * time.Second
+
+// newTTYServer is newServer with a worker registered and a job factory. The
+// relay validates the job once, when a half connects — exactly as the log
+// stream does — so a session needs a real job to open against.
+func newTTYServer(t *testing.T) (*httptest.Server, *store.Store, func() string) {
+	t.Helper()
+	ts, st, _, _ := newServer(t)
+	registerWorker(t, ts)
+
+	newJob := func() string {
+		t.Helper()
+		resp := post(t, ts, "ctok", "/v1/jobs", server.SubmitRequest{
+			DeviceID: "gpubox:gpu0", Command: []string{"/bin/sh"}, Submitter: "agent-a",
+		})
+		defer resp.Body.Close()
+		require.Equal(t, http.StatusCreated, resp.StatusCode)
+		var job model.Job
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&job))
+		require.NotEmpty(t, job.ID)
+		return job.ID
+	}
+	return ts, st, newJob
+}
 
 // ttyStream is one half of a session as the test drives it: the body it
 // writes to (POST halves), the body it reads from (GET halves), and the
@@ -150,7 +174,7 @@ func writeTTY(t *testing.T, w io.Writer, s string) {
 	require.NoError(t, err)
 }
 
-// session opens all four halves of one job's terminal.
+// ttySession opens all four halves of one job's terminal.
 type ttySession struct {
 	clientOut, clientIn, workerOut, workerIn *ttyStream
 }
@@ -177,8 +201,8 @@ func (s *ttySession) abort() {
 // The two directions are separate code paths — raw bytes one way, framed
 // bytes the other — so both are asserted.
 func TestTTYRelaysBytesInBothDirections(t *testing.T) {
-	ts, _, _, _ := newServer(t)
-	s := openTTYSession(t, ts, "job-1")
+	ts, _, newJob := newTTYServer(t)
+	s := openTTYSession(t, ts, newJob())
 
 	const banner = "root@gpubox:~# "
 	writeTTY(t, s.workerOut.w, banner)
@@ -195,10 +219,10 @@ func TestTTYRelaysBytesInBothDirections(t *testing.T) {
 // in another operator's shell on the same box, and their output in the wrong
 // terminal.
 func TestTTYSessionsAreIsolatedPerJob(t *testing.T) {
-	ts, _, _, _ := newServer(t)
+	ts, _, newJob := newTTYServer(t)
 
-	a := openTTYSession(t, ts, "job-a")
-	b := openTTYSession(t, ts, "job-b")
+	a := openTTYSession(t, ts, newJob())
+	b := openTTYSession(t, ts, newJob())
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -224,16 +248,17 @@ func TestTTYSessionsAreIsolatedPerJob(t *testing.T) {
 // the half that arrives first must be made to wait, not answered into a void.
 func TestTTYEitherHalfMayConnectFirst(t *testing.T) {
 	t.Run("client first", func(t *testing.T) {
-		ts, _, _, _ := newServer(t)
+		ts, _, newJob := newTTYServer(t)
+		job := newJob()
 
-		clientOut := openTTYGet(t, ts, "ctok", "/v1/jobs/job-c/tty/out")
-		clientIn := openTTYPost(t, ts, "ctok", "/v1/jobs/job-c/tty/in")
+		clientOut := openTTYGet(t, ts, "ctok", "/v1/jobs/"+job+"/tty/out")
+		clientIn := openTTYPost(t, ts, "ctok", "/v1/jobs/"+job+"/tty/in")
 		// Typed before the box is even listening: the bytes must be held,
 		// not dropped.
 		writeTTY(t, clientIn.w, "typed-ahead")
 
-		workerOut := openTTYPost(t, ts, "wtok", "/v1/jobs/job-c/tty/out")
-		workerIn := openTTYGet(t, ts, "wtok", "/v1/jobs/job-c/tty/in")
+		workerOut := openTTYPost(t, ts, "wtok", "/v1/jobs/"+job+"/tty/out")
+		workerIn := openTTYGet(t, ts, "wtok", "/v1/jobs/"+job+"/tty/in")
 
 		require.Equal(t, "typed-ahead", readTTY(t, workerIn.r, len("typed-ahead")))
 		writeTTY(t, workerOut.w, "late-banner")
@@ -241,17 +266,18 @@ func TestTTYEitherHalfMayConnectFirst(t *testing.T) {
 	})
 
 	t.Run("worker first", func(t *testing.T) {
-		ts, _, _, _ := newServer(t)
+		ts, _, newJob := newTTYServer(t)
+		job := newJob()
 
-		workerOut := openTTYPost(t, ts, "wtok", "/v1/jobs/job-w/tty/out")
-		workerIn := openTTYGet(t, ts, "wtok", "/v1/jobs/job-w/tty/in")
+		workerOut := openTTYPost(t, ts, "wtok", "/v1/jobs/"+job+"/tty/out")
+		workerIn := openTTYGet(t, ts, "wtok", "/v1/jobs/"+job+"/tty/in")
 		// Printed before anyone is watching. A relay that answered the
 		// worker into a void here would eat the first screen of output,
 		// which is exactly the screen with the prompt on it.
 		writeTTY(t, workerOut.w, "early-banner")
 
-		clientOut := openTTYGet(t, ts, "ctok", "/v1/jobs/job-w/tty/out")
-		clientIn := openTTYPost(t, ts, "ctok", "/v1/jobs/job-w/tty/in")
+		clientOut := openTTYGet(t, ts, "ctok", "/v1/jobs/"+job+"/tty/out")
+		clientIn := openTTYPost(t, ts, "ctok", "/v1/jobs/"+job+"/tty/in")
 
 		require.Equal(t, "early-banner", readTTY(t, clientOut.r, len("early-banner")))
 		writeTTY(t, clientIn.w, "late-keys")
@@ -263,8 +289,8 @@ func TestTTYEitherHalfMayConnectFirst(t *testing.T) {
 // never say anything again: when the worker's output half ends, the client's
 // ends too.
 func TestTTYWorkerHalfClosingEndsTheClientStream(t *testing.T) {
-	ts, _, _, _ := newServer(t)
-	s := openTTYSession(t, ts, "job-dead")
+	ts, _, newJob := newTTYServer(t)
+	s := openTTYSession(t, ts, newJob())
 
 	writeTTY(t, s.workerOut.w, "goodbye")
 	require.NoError(t, s.workerOut.w.Close())
@@ -282,25 +308,55 @@ func TestTTYWorkerHalfClosingEndsTheClientStream(t *testing.T) {
 	requireStreamEnds(t, s.clientIn.r, "the operator's input half outlived the session")
 }
 
+// A dropped keystroke connection is indistinguishable from a deliberate stdin
+// EOF, and both close the input pipe. If that pipe were never rebuilt, one
+// blip would leave the operator with a terminal that prints perfectly and
+// silently swallows every key for the rest of the job — no error, no way to
+// tell. Reconnecting must restore typing.
+func TestTTYInputHalfWorksAgainAfterAReconnect(t *testing.T) {
+	ts, _, newJob := newTTYServer(t)
+	job := newJob()
+	s := openTTYSession(t, ts, job)
+
+	writeTTY(t, s.clientIn.w, "before")
+	require.Equal(t, "before", readTTY(t, s.workerIn.r, len("before")))
+
+	// The operator's keystroke stream drops. The worker's half sees the end
+	// of input, as it should.
+	s.clientIn.abort()
+	requireStreamEnds(t, s.workerIn.r, "the worker's input half did not see the input end")
+
+	// Both ends dial their input stream again.
+	clientIn := openTTYPost(t, ts, "ctok", "/v1/jobs/"+job+"/tty/in")
+	workerIn := openTTYGet(t, ts, "wtok", "/v1/jobs/"+job+"/tty/in")
+	writeTTY(t, clientIn.w, "after")
+	require.Equal(t, "after", readTTY(t, workerIn.r, len("after")))
+
+	// And the output direction was never disturbed by any of it.
+	writeTTY(t, s.workerOut.w, "still printing")
+	require.Equal(t, "still printing", readTTY(t, s.clientOut.r, len("still printing")))
+}
+
 // The worker halves are worker routes. A client token that could open them
 // would let any submitter write into somebody else's terminal — forged
 // output on the operator's screen — and read their keystrokes, passwords
 // included.
 func TestTTYRolesAreEnforced(t *testing.T) {
-	ts, _, _, _ := newServer(t)
+	ts, _, newJob := newTTYServer(t)
+	job := newJob()
 
 	for _, tc := range []struct {
 		name, method, path, token string
 		want                      int
 	}{
-		{"client token cannot write output", http.MethodPost, "/v1/jobs/job-r/tty/out", "ctok", http.StatusForbidden},
-		{"client token cannot read keystrokes", http.MethodGet, "/v1/jobs/job-r/tty/in", "ctok", http.StatusForbidden},
-		{"worker token cannot watch a terminal", http.MethodGet, "/v1/jobs/job-r/tty/out", "wtok", http.StatusForbidden},
-		{"worker token cannot type", http.MethodPost, "/v1/jobs/job-r/tty/in", "wtok", http.StatusForbidden},
-		{"an unknown token gets nothing", http.MethodGet, "/v1/jobs/job-r/tty/out", "nope", http.StatusUnauthorized},
+		{"client token cannot write output", http.MethodPost, "/tty/out", "ctok", http.StatusForbidden},
+		{"client token cannot read keystrokes", http.MethodGet, "/tty/in", "ctok", http.StatusForbidden},
+		{"worker token cannot watch a terminal", http.MethodGet, "/tty/out", "wtok", http.StatusForbidden},
+		{"worker token cannot type", http.MethodPost, "/tty/in", "wtok", http.StatusForbidden},
+		{"an unknown token gets nothing", http.MethodGet, "/tty/out", "nope", http.StatusUnauthorized},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			req, err := http.NewRequest(tc.method, ts.URL+tc.path, strings.NewReader(""))
+			req, err := http.NewRequest(tc.method, ts.URL+"/v1/jobs/"+job+tc.path, strings.NewReader(""))
 			require.NoError(t, err)
 			req.Header.Set("Authorization", "Bearer "+tc.token)
 			resp, err := ts.Client().Do(req)
@@ -313,9 +369,10 @@ func TestTTYRolesAreEnforced(t *testing.T) {
 	// The refusal has to be real, not just a status code: nothing the client
 	// token sent may show up on the terminal.
 	t.Run("the rejected write reaches nobody", func(t *testing.T) {
-		clientOut := openTTYGet(t, ts, "ctok", "/v1/jobs/job-r2/tty/out")
+		other := newJob()
+		clientOut := openTTYGet(t, ts, "ctok", "/v1/jobs/"+other+"/tty/out")
 
-		req, err := http.NewRequest(http.MethodPost, ts.URL+"/v1/jobs/job-r2/tty/out",
+		req, err := http.NewRequest(http.MethodPost, ts.URL+"/v1/jobs/"+other+"/tty/out",
 			strings.NewReader("INJECTED"))
 		require.NoError(t, err)
 		req.Header.Set("Authorization", "Bearer ctok")
@@ -324,29 +381,53 @@ func TestTTYRolesAreEnforced(t *testing.T) {
 		resp.Body.Close()
 		require.Equal(t, http.StatusForbidden, resp.StatusCode)
 
-		workerOut := openTTYPost(t, ts, "wtok", "/v1/jobs/job-r2/tty/out")
+		workerOut := openTTYPost(t, ts, "wtok", "/v1/jobs/"+other+"/tty/out")
 		writeTTY(t, workerOut.w, "REAL")
 		require.Equal(t, "REAL", readTTY(t, clientOut.r, 4))
 	})
 }
 
+// A session is opened against a job that exists, checked once at connect —
+// the same guard handleStreamLogs has, and for the same reason: without it
+// any token can pin a goroutine, an fd and a registry entry per request
+// against an ID that was never allocated.
+func TestTTYSessionForAnUnknownJobIsRefused(t *testing.T) {
+	ts, _, _ := newTTYServer(t)
+
+	for _, tc := range []struct{ method, path, token string }{
+		{http.MethodGet, "/tty/out", "ctok"},
+		{http.MethodPost, "/tty/in", "ctok"},
+		{http.MethodPost, "/tty/out", "wtok"},
+		{http.MethodGet, "/tty/in", "wtok"},
+	} {
+		req, err := http.NewRequest(tc.method, ts.URL+"/v1/jobs/no-such-job"+tc.path, strings.NewReader(""))
+		require.NoError(t, err)
+		req.Header.Set("Authorization", "Bearer "+tc.token)
+		resp, err := ts.Client().Do(req)
+		require.NoError(t, err)
+		resp.Body.Close()
+		require.Equal(t, http.StatusNotFound, resp.StatusCode, "%s %s", tc.method, tc.path)
+	}
+}
+
 // Nothing on the relay path may touch the store. SQLite runs at
 // MaxOpenConns(1) and the scheduler holds that connection while it allocates;
 // a keystroke that had to queue behind it would make typing stutter every
-// time somebody submitted a job. Proven by taking the database away
-// entirely — the terminal must not notice.
+// time somebody submitted a job. Proven by taking the database away from a
+// session that is already up — the terminal must not notice.
 func TestTTYRelayNeverTouchesTheStore(t *testing.T) {
-	ts, st, _, _ := newServer(t)
+	ts, st, newJob := newTTYServer(t)
+	s := openTTYSession(t, ts, newJob())
+
 	require.NoError(t, st.Close())
 
 	// First prove the database really is gone, so the rest of this test
 	// cannot pass by accident on a store that still works.
-	dead := get(t, ts, "ctok", "/v1/jobs/job-nostore")
+	dead := get(t, ts, "ctok", "/v1/jobs/whatever")
 	defer dead.Body.Close()
 	require.Equal(t, http.StatusInternalServerError, dead.StatusCode,
 		"the store still answers, so this test would prove nothing")
 
-	s := openTTYSession(t, ts, "job-nostore")
 	writeTTY(t, s.workerOut.w, "output with no database")
 	require.Equal(t, "output with no database", readTTY(t, s.clientOut.r, len("output with no database")))
 	writeTTY(t, s.clientIn.w, "keys with no database")
@@ -357,10 +438,11 @@ func TestTTYRelayNeverTouchesTheStore(t *testing.T) {
 // hand each a corrupt terminal, so the second is refused rather than
 // silently interleaved.
 func TestTTYSecondConnectionOnAHalfIsRefused(t *testing.T) {
-	ts, _, _, _ := newServer(t)
-	first := openTTYGet(t, ts, "ctok", "/v1/jobs/job-dup/tty/out")
+	ts, _, newJob := newTTYServer(t)
+	job := newJob()
+	first := openTTYGet(t, ts, "ctok", "/v1/jobs/"+job+"/tty/out")
 
-	req, err := http.NewRequest(http.MethodGet, ts.URL+"/v1/jobs/job-dup/tty/out", nil)
+	req, err := http.NewRequest(http.MethodGet, ts.URL+"/v1/jobs/"+job+"/tty/out", nil)
 	require.NoError(t, err)
 	req.Header.Set("Authorization", "Bearer ctok")
 	resp, err := ts.Client().Do(req)
@@ -369,21 +451,21 @@ func TestTTYSecondConnectionOnAHalfIsRefused(t *testing.T) {
 	require.Equal(t, http.StatusConflict, resp.StatusCode)
 
 	// The intruder must not have disturbed the session that was already up.
-	workerOut := openTTYPost(t, ts, "wtok", "/v1/jobs/job-dup/tty/out")
+	workerOut := openTTYPost(t, ts, "wtok", "/v1/jobs/"+job+"/tty/out")
 	writeTTY(t, workerOut.w, "still here")
 	require.Equal(t, "still here", readTTY(t, first.r, len("still here")))
 }
 
 // Four streams per session means four handler goroutines, four watchers and
 // two connections a side. A leak here is invisible until the controller has
-// been up for a week, so the cycles below include the ugly case: a client
-// that vanishes mid-stream while the worker is still writing, which leaves a
-// handler blocked in a pipe write that no request context can preempt.
+// been up for a week, so the cycles below include the ugly cases: a client
+// that vanishes mid-stream while the worker is still writing, and halves left
+// attached to a session nothing will ever arrive on.
 func TestTTYStreamsDoNotLeakGoroutines(t *testing.T) {
-	ts, _, _, _ := newServer(t)
+	ts, _, newJob := newTTYServer(t)
 
-	cycle := func(jobID string) {
-		s := openTTYSession(t, ts, jobID)
+	cycle := func() {
+		s := openTTYSession(t, ts, newJob())
 		writeTTY(t, s.workerOut.w, "hello")
 		require.Equal(t, "hello", readTTY(t, s.clientOut.r, 5))
 		writeTTY(t, s.clientIn.w, "keys!")
@@ -393,14 +475,14 @@ func TestTTYStreamsDoNotLeakGoroutines(t *testing.T) {
 
 	// A client that dies mid-stream while the worker is still printing into
 	// the terminal that just disappeared.
-	abruptCycle := func(jobID string) {
-		s := openTTYSession(t, ts, jobID)
+	abruptCycle := func() {
+		s := openTTYSession(t, ts, newJob())
 		writeTTY(t, s.workerOut.w, "hello")
 		require.Equal(t, "hello", readTTY(t, s.clientOut.r, 5))
 		s.clientOut.abort()
 		// Writes fail once the relay tears the session down, which is the
 		// point; until then they are absorbed.
-		for i := 0; i < 64; i++ {
+		for range 64 {
 			if _, err := io.WriteString(s.workerOut.w, strings.Repeat("x", 1024)); err != nil {
 				break
 			}
@@ -411,10 +493,11 @@ func TestTTYStreamsDoNotLeakGoroutines(t *testing.T) {
 	// An operator who gives up before the job ever starts: two halves
 	// attached, both idle, both dropped. Nothing will ever arrive on them to
 	// fail on, so these only unwind if the relay watches the request context.
-	lonelyCycle := func(jobID string) {
-		clientOut := openTTYGet(t, ts, "ctok", "/v1/jobs/"+jobID+"/tty/out")
-		clientIn := openTTYPost(t, ts, "ctok", "/v1/jobs/"+jobID+"/tty/in")
-		workerIn := openTTYGet(t, ts, "wtok", "/v1/jobs/"+jobID+"-w/tty/in")
+	lonelyCycle := func() {
+		job, otherJob := newJob(), newJob()
+		clientOut := openTTYGet(t, ts, "ctok", "/v1/jobs/"+job+"/tty/out")
+		clientIn := openTTYPost(t, ts, "ctok", "/v1/jobs/"+job+"/tty/in")
+		workerIn := openTTYGet(t, ts, "wtok", "/v1/jobs/"+otherJob+"/tty/in")
 		clientOut.abort()
 		clientIn.abort()
 		workerIn.abort()
@@ -423,18 +506,18 @@ func TestTTYStreamsDoNotLeakGoroutines(t *testing.T) {
 	// Warm up first: the first request builds transports, connections and
 	// their goroutines, and counting those as a leak would make this test
 	// noise.
-	cycle("warmup-1")
-	abruptCycle("warmup-2")
-	lonelyCycle("warmup-3")
+	cycle()
+	abruptCycle()
+	lonelyCycle()
 	ts.Client().CloseIdleConnections()
 	settleGoroutines(t)
 	before := runtime.NumGoroutine()
 
 	const cycles = 25
-	for i := range cycles {
-		cycle(fmt.Sprintf("clean-%d", i))
-		abruptCycle(fmt.Sprintf("abrupt-%d", i))
-		lonelyCycle(fmt.Sprintf("lonely-%d", i))
+	for range cycles {
+		cycle()
+		abruptCycle()
+		lonelyCycle()
 	}
 
 	ts.Client().CloseIdleConnections()
