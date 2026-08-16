@@ -224,6 +224,21 @@ func LoadConfig(path string) (Config, error) {
 	if err := yaml.Unmarshal(b, &c); err != nil {
 		return Config{}, fmt.Errorf("parse worker config: %w", err)
 	}
+	// A worker in a container gets its token from a Secret, and the only sane
+	// way to hand a Secret to a process is the environment: writing it into
+	// this file would mean templating a ConfigMap at deploy time, or baking a
+	// credential into an image. RC_TOKEN is already what the client reads
+	// (cli.controllerToken), so this is one env var for the whole tool rather
+	// than a second convention.
+	//
+	// An explicit token in the file wins, so a stray RC_TOKEN in a shell can
+	// never silently redirect a worker that was configured on disk. Blank or
+	// whitespace-only is treated as unset — that is the shape of
+	// `RC_TOKEN=$SOMETHING_UNSET`, a mistake rather than a request to
+	// register unauthenticated.
+	if c.Token == "" {
+		c.Token = strings.TrimSpace(os.Getenv("RC_TOKEN"))
+	}
 	if c.Host == "" {
 		h, err := os.Hostname()
 		if err != nil {
