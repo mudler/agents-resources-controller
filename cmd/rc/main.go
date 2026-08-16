@@ -21,7 +21,8 @@ func main() {
 	}
 	root.AddCommand(cli.NewRunCmd(), cli.NewPsCmd(), cli.NewDevicesCmd(),
 		cli.NewServeCmd(), cli.NewWorkerCmd(), cli.NewKillCmd(), cli.NewAttachCmd(),
-		cli.NewDescribeCmd(), cli.NewHoldCmd(), cli.NewReleaseCmd())
+		cli.NewDescribeCmd(), cli.NewHoldCmd(), cli.NewReleaseCmd(),
+		cli.NewRetireCmd())
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

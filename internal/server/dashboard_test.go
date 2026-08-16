@@ -93,9 +93,22 @@ func TestDashboardPromptsForTheAdminTokenAndKeepsNothing(t *testing.T) {
 	// this trip.
 	require.Regexp(t, `(?m)^\s*admin = null;`, body,
 		"the prompted admin token must be dropped before any callback can capture it")
-	require.Equal(t, 1, strings.Count(body, "window.prompt("),
-		"only the admin-token prompt should exist")
+	// There is a prompt per admin action (clear, retire) rather than exactly
+	// one, so counting them would only track how many admin actions exist.
+	// What must stay true is that EVERY prompt on this page asks for an admin
+	// token: a prompt for anything else — a name, a reason, a command — would
+	// be a new way to put user input into a request, which is the thing this
+	// assertion is really guarding.
+	prompts := promptCall.FindAllStringSubmatch(body, -1)
+	require.NotEmpty(t, prompts, "clearing a device must prompt for an admin token")
+	for _, m := range prompts {
+		require.Contains(t, strings.ToLower(m[1]), "admin token",
+			"every prompt on this page must be an admin-token prompt; found: %s", m[1])
+	}
 }
+
+// promptCall captures the message a window.prompt() call shows.
+var promptCall = regexp.MustCompile(`window\.prompt\(\s*"([^"]*)"`)
 
 // assignment matches `target = value` (not ==, ===, !=, <=, >= or =>) and
 // captures the assignment target and everything up to the statement's

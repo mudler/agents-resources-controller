@@ -331,6 +331,25 @@ func (c *Client) Kill(ctx context.Context, id, submitter string) error {
 	return apiError(resp)
 }
 
+// Retire removes a device from the fleet for good. Admin-only. The note the
+// controller returns is passed back so the caller can repeat it: a worker
+// that still declares this device will recreate it on its next registration.
+func (c *Client) Retire(ctx context.Context, deviceID string) (string, error) {
+	resp, err := c.do(ctx, http.MethodDelete, "/v1/devices/"+url.PathEscape(deviceID), nil)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", apiError(resp)
+	}
+	var body struct {
+		Note string `json:"note"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&body)
+	return body.Note, nil
+}
+
 // StreamLogs copies the job's output to out until the job finishes.
 func (c *Client) StreamLogs(ctx context.Context, id string, out io.Writer) error {
 	resp, err := c.do(ctx, http.MethodGet, "/v1/jobs/"+id+"/logs", nil)

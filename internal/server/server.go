@@ -65,7 +65,15 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /v1/state", s.require("client", s.handleState))
 	mux.Handle("GET /v1/events", s.require("client", s.handleEvents))
 
+	// whoami lets a caller find out what its own token can do. The dashboard
+	// uses it to tell an admin session from a client one, so it can enable
+	// admin controls for a token that has them instead of prompting for a
+	// second token on every click. It reports the role and nothing else —
+	// never the token, and it grants nothing.
+	mux.Handle("GET /v1/whoami", s.require("client", s.handleWhoami))
+
 	mux.Handle("POST /v1/devices/{id}/clear", s.require("admin", s.handleClearDevice))
+	mux.Handle("DELETE /v1/devices/{id}", s.require("admin", s.handleRetireDevice))
 
 	// Registered last so it cannot shadow any API route: ServeMux prefers
 	// the most specific pattern regardless of registration order, but "/"

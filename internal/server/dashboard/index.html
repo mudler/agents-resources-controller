@@ -135,6 +135,15 @@
   .sheet .hd { display:block; font-size:11px; color:var(--muted); text-transform:uppercase;
                letter-spacing:.06em; margin-bottom:5px; font-weight:600; }
   .agewarn { color:var(--warn); font-size:12px; margin-top:7px; }
+  .hist { margin-top:10px; }
+  .hist .hd { display:block; font-size:11px; color:var(--muted); text-transform:uppercase;
+              letter-spacing:.06em; margin-bottom:5px; font-weight:600; }
+  .hist .j { display:flex; gap:9px; align-items:baseline; font-size:12.5px; padding:2px 0; }
+  .jst { font-size:11px; font-weight:600; flex:none; width:74px; }
+  .jst.ok { color:var(--ready); } .jst.bad { color:var(--bad); }
+  .jwho { color:var(--ink-2); flex:none; }
+  .jcmd { color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .jwhy { color:var(--bad); font-size:11.5px; flex:none; }
 
   button.act { border:1px solid var(--line-2); background:var(--panel); color:var(--ink-2);
                border-radius:7px; padding:5px 11px; font:inherit; font-size:12.5px; cursor:pointer; }
@@ -168,6 +177,12 @@
   #gate button { background:var(--ink); color:var(--bg); border:0; border-radius:7px;
                  padding:8px 15px; font:inherit; font-weight:600; cursor:pointer; }
 
+  /* An admin session can clear and retire devices without a second token, so
+     the page says so plainly rather than letting the extra power be
+     invisible. */
+  .badge { font-size:11px; font-weight:600; letter-spacing:.06em; text-transform:uppercase;
+           color:var(--accent); border:1px solid var(--accent); border-radius:100px;
+           padding:1px 8px; }
   #act { font-size:13px; color:var(--muted); }
   #act.bad { color:var(--bad); font-weight:600; }
   #err { font-size:13px; color:var(--bad); }
@@ -186,6 +201,7 @@
     </svg>
     <h1>resource controller</h1>
   </span>
+  <span id="role" class="hide"></span>
   <span id="act"></span>
   <span id="err"></span>
   <span class="live" id="live"><span class="dot"></span><span id="liveText"></span></span>
@@ -233,6 +249,12 @@
   // guards against killing the wrong job by accident — it does not
   // authenticate who is asking.
   var token = sessionStorage.getItem("rc_token") || "";
+  // role is what THIS token can do, straight from /v1/whoami. It decides
+  // whether the admin actions are offered directly or ask for a second
+  // token at the moment of the click. It is not itself a permission: every
+  // route still checks the role server-side, so a tampered value here buys
+  // nothing but a button that gets refused.
+  var role = "";
   var identity = "";
   var open = {};           // device id -> details expanded
   var sheets = {};         // device id -> usage sheet, fetched on demand
@@ -385,6 +407,19 @@
     if (why) msg += "\n\nIt was taken out because:\n" + why;
     msg += "\n\nThis needs an admin token, and only works if nothing holds the device.";
     if (!window.confirm(msg)) return;
+
+    // An admin session already holds a token that can do this, so asking for
+    // a second one would be ceremony without a security gain — the stronger
+    // credential is already resident either way. A client session still
+    // prompts, so the token in storage stays the weaker one for anyone who
+    // connected with a client token.
+    if (role === "admin") {
+      actOK("clearing " + id + "…");
+      adminFetch("/v1/devices/" + encodeURIComponent(id) + "/clear", "POST", token,
+        "cleared " + id);
+      return;
+    }
+
     var admin = window.prompt("Admin token to clear " + id + " (used once, never stored)");
     if (admin === null) return;
     admin = admin.trim();
@@ -403,6 +438,45 @@
     }).catch(function (e) { actFail(e.message); });
   }
 
+  // adminFetch is the admin-session path: one request with the token already
+  // in hand, and the controller's own words on failure.
+  function adminFetch(path, method, bearer, okMessage) {
+    fetch(path, { method: method, headers: { Authorization: "Bearer " + bearer } })
+      .then(function (r) {
+        if (r.ok) { actOK(okMessage); refresh(); return; }
+        return serverError(r).then(actFail);
+      }).catch(function (e) { actFail(e.message); });
+  }
+
+  // retireDevice removes a device from the fleet for good. Admin-only, and
+  // the confirmation spells out what survives (job history) and what does
+  // not, because unlike a kill there is nothing to undo it from.
+  function retireDevice(id) {
+    var msg = "Retire " + id + "?\n\n" +
+      "It is removed from the fleet. Job history is kept.\n\n" +
+      "If a worker still declares this device, it will come back on that " +
+      "worker's next registration — remove it from the worker's config first.";
+    if (!window.confirm(msg)) return;
+    if (role === "admin") {
+      actOK("retiring " + id + "…");
+      adminFetch("/v1/devices/" + encodeURIComponent(id), "DELETE", token, "retired " + id);
+      return;
+    }
+    var admin = window.prompt("Admin token to retire " + id + " (used once, never stored)");
+    if (admin === null) return;
+    admin = admin.trim();
+    if (!admin) { actFail("no admin token given; nothing was sent"); return; }
+    actOK("retiring " + id + "…");
+    var pending = fetch("/v1/devices/" + encodeURIComponent(id), {
+      method: "DELETE", headers: { Authorization: "Bearer " + admin }
+    });
+    admin = null;
+    pending.then(function (r) {
+      if (r.ok) { actOK("retired " + id); refresh(); return; }
+      return serverError(r).then(actFail);
+    }).catch(function (e) { actFail(e.message); });
+  }
+
   // The usage sheet is how a host explains itself — how to reach it, what is
   // already on it, what not to run at once. It is per-device and can be long,
   // so it is fetched only when someone opens the details rather than riding
@@ -414,7 +488,7 @@
       .then(function (r) { return r.ok ? r.json() : null; })
       .then(function (d) {
         sheets[id] = d ? { text: d.sheet || "", hostWide: !!d.sheet_is_host_wide,
-                           age: d.sheet_age_seconds } : null;
+                           age: d.sheet_age_seconds, jobs: d.recent_jobs || [] } : null;
         paintSheet(into, sheets[id]);
       })
       .catch(function () { sheets[id] = null; paintSheet(into, null); });
@@ -422,7 +496,30 @@
 
   function paintSheet(into, s) {
     into.textContent = "";
-    if (!s || !s.text) return;
+    if (!s) return;
+
+    // Recent history answers the question a single state cannot: "has this
+    // box been failing?" A device that is ready right now and failed its
+    // last three jobs is not the same device as one that is simply ready.
+    // rc describe has always shown this; the page was throwing it away.
+    if (s.jobs && s.jobs.length) {
+      var hist = el("div", "hist");
+      hist.appendChild(el("span", "hd", "recent jobs"));
+      s.jobs.forEach(function (j) {
+        var line = el("div", "j");
+        var st = el("span", "jst " + (j.state === "succeeded" ? "ok" : "bad"), j.state);
+        line.appendChild(st);
+        line.appendChild(el("span", "jwho", j.submitter || "—"));
+        var cmd = (j.command || []).join(" ");
+        if (j.kind === "hold") cmd = "hold" + (j.reason ? " — " + j.reason : "");
+        line.appendChild(el("span", "jcmd mono", cmd));
+        if (j.kill_reason) line.appendChild(el("span", "jwhy", j.kill_reason));
+        hist.appendChild(line);
+      });
+      into.appendChild(hist);
+    }
+
+    if (!s.text) return;
     var box = el("div", "sheet");
     var hd = el("span", "hd", (s.hostWide ? "host note" : "device note") +
       (typeof s.age === "number" ? " · updated " + ago(s.age) + " ago" : ""));
@@ -516,6 +613,16 @@
       clear.type = "button";
       clear.addEventListener("click", function () { clearDevice(d.id, v.quarantine_reason); });
       right.appendChild(clear);
+    }
+    // Retiring is offered on anything nothing is holding: a dead card is the
+    // common case, but dropping a device you removed from a worker's config
+    // is just as ordinary and that device is perfectly healthy.
+    if (!v.holder) {
+      var retire = el("button", "act", "Retire");
+      retire.type = "button";
+      retire.title = "remove " + d.id + " from the fleet (admin)";
+      retire.addEventListener("click", function () { retireDevice(d.id); });
+      right.appendChild(retire);
     }
     if (v.job_id && identity) {
       var job = { id: v.job_id, device_id: d.id, submitter: v.holder };
@@ -695,6 +802,21 @@
     } catch (e) { /* polling remains the fallback */ }
   }
 
+  // Ask the controller what this token can do, so the page offers the actions
+  // it actually has rather than finding out from a 403.
+  function loadRole() {
+    return fetch("/v1/whoami", { headers: { Authorization: "Bearer " + token } })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (d) { role = (d && d.role) || ""; renderRole(); })
+      .catch(function () { role = ""; renderRole(); });
+  }
+
+  function renderRole() {
+    var badge = document.getElementById("role");
+    badge.textContent = role === "admin" ? "admin" : "";
+    badge.className = role === "admin" ? "badge" : "hide";
+  }
+
   function start() {
     stopLive();
     gate.classList.add("hide");
@@ -703,6 +825,7 @@
     renderWho();
     lastFetchAt = null;
     updateFreshness();
+    loadRole();
     refresh();
     pollTimer = setInterval(refresh, 5000);
     freshTimer = setInterval(updateFreshness, 1000);
