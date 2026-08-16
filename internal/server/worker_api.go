@@ -563,7 +563,7 @@ func (s *Server) handleDeviceFault(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "bad_request", "reason required")
 		return
 	}
-	if err := s.cfg.Store.SetDeviceState(id, model.DeviceUnhealthy, s.cfg.Clock.Now()); err != nil {
+	if err := s.cfg.Store.SetDeviceState(id, model.DeviceUnhealthy, s.cfg.Clock.Now(), req.Reason); err != nil {
 		// A device ID this controller has never heard of must not answer 200:
 		// the worker would log a successful quarantine having changed nothing,
 		// and the device (whatever its real ID is) stays schedulable while

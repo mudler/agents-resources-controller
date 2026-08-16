@@ -210,7 +210,7 @@ func (s *Store) reapInFlightJobsLocked(tx *sql.Tx, workerID string, at time.Time
 			// clean by the reboot here; an unhealthy one is decided by its
 			// recorded quarantine reason, in restoreRebootedDevicesLocked.
 			if _, err := tx.Exec(
-				`UPDATE devices SET state = ?, quarantine_reason = '' WHERE id = ? AND state IN (?, ?)`,
+				`UPDATE devices SET state = ?, quarantine_reason = '', quarantine_detail = '' WHERE id = ? AND state IN (?, ?)`,
 				string(model.DeviceReady), j.deviceID,
 				string(model.DeviceBusy), string(model.DeviceUnknown),
 			); err != nil {
@@ -258,7 +258,7 @@ func (s *Store) restoreRebootedDevicesLocked(tx *sql.Tx, workerID string) error 
 	placeholders := strings.TrimSuffix(strings.Repeat("?, ", len(rebootClearableReasons)), ", ")
 
 	_, err := tx.Exec(fmt.Sprintf(
-		`UPDATE devices SET state = ?, quarantine_reason = ''
+		`UPDATE devices SET state = ?, quarantine_reason = '', quarantine_detail = ''
 		 WHERE worker_id = ? AND state = ?
 		   AND quarantine_reason IN (%s)
 		   AND id NOT IN (SELECT device_id FROM leases WHERE released_at IS NULL)`,
@@ -279,14 +279,25 @@ func (s *Store) restoreRebootedDevicesLocked(tx *sql.Tx, workerID string) error 
 // a device, and a worker that logs a successful fault report having changed
 // nothing is the worst possible outcome — the device stays schedulable and
 // nobody is looking for it.
-func (s *Store) SetDeviceState(id string, state model.DeviceState, at time.Time) error {
+// SetDeviceState moves a device and, when that move is a quarantine, records
+// both WHY in the machine sense (quarantine_reason, a category the reaper
+// matches on to decide what a reboot may clear) and why in the operator's
+// sense (detail — a verify probe's stderr, a failed hook's message). The
+// detail is free text from a worker and is never matched on; it exists to be
+// read by whoever decides whether to clear the device.
+func (s *Store) SetDeviceState(id string, state model.DeviceState, at time.Time, detail string) error {
 	reason := ""
 	if state == model.DeviceUnhealthy {
 		reason = quarantineFault
+	} else {
+		// Leaving quarantine drops the detail with the category: a stale
+		// explanation on a healthy device is worse than none, because it
+		// reads as current.
+		detail = ""
 	}
 	res, err := s.db.Exec(
-		`UPDATE devices SET state = ?, quarantine_reason = ?, last_heartbeat_at = ? WHERE id = ?`,
-		string(state), reason, at.Unix(), id,
+		`UPDATE devices SET state = ?, quarantine_reason = ?, quarantine_detail = ?, last_heartbeat_at = ? WHERE id = ?`,
+		string(state), reason, detail, at.Unix(), id,
 	)
 	if err != nil {
 		return err

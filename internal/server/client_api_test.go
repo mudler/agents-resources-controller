@@ -307,7 +307,7 @@ func TestClearDeviceWithLiveLeaseReturns409(t *testing.T) {
 
 	// The device now has both a live lease and (forced) unhealthy state, the
 	// exact scenario an operator would try to clear.
-	require.NoError(t, st.SetDeviceState("gpubox:gpu0", model.DeviceUnhealthy, time.Now()))
+	require.NoError(t, st.SetDeviceState("gpubox:gpu0", model.DeviceUnhealthy, time.Now(), ""))
 
 	clr := post(t, ts, "atok", "/v1/devices/gpubox:gpu0/clear", nil)
 	defer clr.Body.Close()

@@ -121,7 +121,7 @@ func TestClearDeviceRefusesWhileLeaseIsLive(t *testing.T) {
 
 	_, err := s.Allocate(req("agent-a"))
 	require.NoError(t, err)
-	require.NoError(t, s.SetDeviceState("gpubox:gpu0", model.DeviceUnhealthy, time.Now()))
+	require.NoError(t, s.SetDeviceState("gpubox:gpu0", model.DeviceUnhealthy, time.Now(), ""))
 
 	cleared, err := s.ClearDevice("gpubox:gpu0")
 	require.NoError(t, err)
@@ -189,7 +189,7 @@ func TestSweepReapsJobsOnAlreadyUnhealthyDevice(t *testing.T) {
 
 	job, err := s.Allocate(req("agent-a"))
 	require.NoError(t, err)
-	require.NoError(t, s.SetDeviceState("gpubox:gpu0", model.DeviceUnhealthy, c.Now()))
+	require.NoError(t, s.SetDeviceState("gpubox:gpu0", model.DeviceUnhealthy, c.Now(), ""))
 
 	c.Advance(10 * time.Minute)
 	_, err = s.Sweep(30*time.Second, 5*time.Minute)

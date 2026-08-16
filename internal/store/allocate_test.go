@@ -127,7 +127,7 @@ func TestConcurrentAllocateYieldsExactlyOneWinner(t *testing.T) {
 func TestAllocateSkipsUnhealthyDevice(t *testing.T) {
 	s, c := newStore(t)
 
-	require.NoError(t, s.SetDeviceState("gpubox:gpu0", model.DeviceUnhealthy, c.Now()))
+	require.NoError(t, s.SetDeviceState("gpubox:gpu0", model.DeviceUnhealthy, c.Now(), ""))
 
 	_, err := s.Allocate(req("agent-a"))
 	require.ErrorIs(t, err, store.ErrNoDevice)

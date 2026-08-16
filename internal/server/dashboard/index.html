@@ -5,192 +5,242 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>resource controller</title>
 <style>
+  /* A calm status board. It should be nearly quiet when the fleet is fine,
+     and unmistakable when it is not — so exactly one thing on this page is
+     allowed to be loud, and that is a device that has left the pool.
+
+     Neutrals are tinted toward the mark's slate rather than pure grey, and
+     nothing is pure black or pure white. */
   :root {
-    --bg:#fbfbfd; --panel:#fff; --ink:#16181d; --muted:#6b7280; --line:#e5e7eb;
-    --ready:#15803d; --busy:#b45309; --unknown:#7c3aed; --unhealthy:#b91c1c;
-    --unhealthy-bg:#fef2f2; --stale:#c2410c; --stale-bg:#fff7ed; --warn:#b45309;
+    --bg:#fbfbfd; --panel:#fff; --sunk:#f4f5f8;
+    --ink:#16181d; --ink-2:#3f4653; --muted:#6b7280; --faint:#9aa1ab;
+    --line:#e4e6ec; --line-2:#d3d7e0;
+    --ready:#15803d; --busy:#b45309; --unknown:#6d28d9; --bad:#b91c1c;
+    --bad-bg:#fdf3f3; --bad-line:#f0c9c9;
+    --warn:#a15c07; --warn-bg:#fdf8ef;
+    --accent:#c86c08;
+    --shadow:0 1px 2px rgba(20,22,28,.05);
   }
-  @media (prefers-color-scheme: dark) {
-    :root {
-      --bg:#0f1115; --panel:#171a21; --ink:#e8eaed; --muted:#9aa1ab; --line:#262b34;
-      --ready:#4ade80; --busy:#fbbf24; --unknown:#c4b5fd; --unhealthy:#f87171;
-      --unhealthy-bg:#2a1010; --stale:#fb923c; --stale-bg:#2a1608; --warn:#fbbf24;
+  :root:not([data-theme="light"]) {
+    @media (prefers-color-scheme: dark) {
+      --bg:#16181d; --panel:#1c1f26; --sunk:#232732;
+      --ink:#e8eaed; --ink-2:#c3c8d2; --muted:#949bA7; --faint:#767d8a;
+      --line:#2b303b; --line-2:#3a4150;
+      --ready:#4ade80; --busy:#fbbf24; --unknown:#c4b5fd; --bad:#fca5a5;
+      --bad-bg:#2b1618; --bad-line:#5c2a2c;
+      --warn:#fbbf24; --warn-bg:#2a2113;
+      --accent:#f0913a;
+      --shadow:none;
     }
   }
   * { box-sizing:border-box; }
-  body { margin:0; background:var(--bg); color:var(--ink);
-         font:14px/1.5 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
-  header { display:flex; gap:12px; align-items:center; justify-content:space-between;
-           padding:14px 20px; border-bottom:1px solid var(--line); }
-  h1 { font-size:15px; margin:0; font-weight:600; letter-spacing:.01em; }
-  .hstat { display:flex; gap:14px; align-items:center; font-size:12px; }
-  main { padding:20px; max-width:1200px; margin:0 auto; }
-  h2 { font-size:12px; text-transform:uppercase; letter-spacing:.08em;
-       color:var(--muted); margin:24px 0 10px; font-weight:600; }
-  .grid { display:grid; gap:12px; grid-template-columns:repeat(auto-fill,minmax(280px,1fr)); }
-  .card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px; }
-  /* .stale (a busy device whose worker has gone quiet past the 30s grace) is
-     a middle alarm tier: louder than a healthy card — thicker border, tinted
-     background, bold text — so an operator scanning many cards cannot
-     mistake a ghost lease for a live one, but visually weaker than .alert
-     (device confirmed unhealthy) so the strongest signal stays reserved for
-     the worst state. */
-  .card.stale { border:2px solid var(--stale); background:var(--stale-bg); }
-  .card.stale .state { color:var(--stale); }
-  .card.stale .meta { color:var(--stale); font-weight:700; }
-  .card.alert { border:2px solid var(--unhealthy); background:var(--unhealthy-bg);
-                box-shadow:0 0 0 1px var(--unhealthy); }
-  .card.alert .meta { color:var(--unhealthy); font-weight:700; }
-  .dev { display:flex; justify-content:space-between; align-items:baseline; gap:8px; }
-  .name { font-weight:600; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
-  .state { font-size:12px; font-weight:600; }
-  .ready{color:var(--ready)} .busy{color:var(--busy)}
-  .unknown{color:var(--unknown)} .unhealthy{color:var(--unhealthy)}
-  .meta { color:var(--muted); font-size:12px; margin-top:6px; }
-  #updated { color:var(--muted); }
-  #updated.warn { color:var(--warn); font-weight:600; }
-  #updated.stale { color:var(--unhealthy); font-weight:700; }
-  .cmd { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px;
-         margin-top:6px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  /* Label chips: detected (a probe confirmed it) gets the solid, filled
-     treatment since it is what the scheduler actually trusts (see
-     store.LabelSnapshot — detected wins a same-key conflict); declared (an
-     operator wrote it in worker.yaml) gets an outlined, lighter treatment so
-     the two are told apart at a glance without reading either's text, the
-     same distinction `rc describe` draws with its "detected"/"declared"
-     column. */
-  .labels { display:flex; flex-wrap:wrap; gap:5px; margin-top:8px; }
-  .chip { font-size:11px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
-          padding:2px 7px; border-radius:100px; line-height:1.6; }
-  .chip-detected { background:var(--ink); color:var(--bg); }
-  .chip-declared { background:transparent; color:var(--ink); border:1px solid var(--line); }
-  .no-labels { color:var(--muted); font-size:12px; font-style:italic; margin-top:8px; }
-  .labels-stale { color:var(--warn); font-size:11px; margin-top:6px; font-weight:600; }
-  table { width:100%; border-collapse:collapse; }
-  th,td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); font-size:13px; }
-  th { color:var(--muted); font-weight:600; font-size:11px; text-transform:uppercase; letter-spacing:.06em; }
-  td.mono { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px; }
-  .wrap { overflow-x:auto; }
-  input { background:var(--panel); color:var(--ink); border:1px solid var(--line);
-          border-radius:7px; padding:7px 10px; font:inherit; min-width:260px; }
-  button { background:var(--ink); color:var(--bg); border:0; border-radius:7px;
-           padding:7px 13px; font:inherit; font-weight:600; cursor:pointer; }
-  .empty { color:var(--muted); padding:14px 0; }
-  #err { color:var(--unhealthy); font-size:12px; }
-  #gate { padding:40px 20px; max-width:460px; margin:0 auto; }
+  body {
+    margin:0; background:var(--bg); color:var(--ink);
+    font:15px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  .mono { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+
+  header {
+    display:flex; align-items:center; gap:14px;
+    padding:16px 24px; border-bottom:1px solid var(--line);
+    background:var(--panel);
+  }
+  header .brand { display:flex; align-items:center; gap:10px; margin-right:auto; }
+  header svg { display:block; }
+  h1 { font-size:15px; margin:0; font-weight:600; letter-spacing:-.01em; }
+  .live { font-size:13px; color:var(--muted); display:flex; align-items:center; gap:7px; }
+  .dot { width:7px; height:7px; border-radius:50%; background:var(--ready); flex:none; }
+  .live.warn .dot { background:var(--warn); }
+  .live.stale .dot { background:var(--bad); }
+  .live.stale { color:var(--bad); font-weight:600; }
+
+  main { padding:24px; max-width:1060px; margin:0 auto; }
+
+  /* Summary line: the whole fleet in one sentence, so a glance needs no
+     counting. It is the first thing read and usually the only thing. */
+  .summary { font-size:17px; color:var(--ink-2); margin:0 0 4px; letter-spacing:-.01em; }
+  .summary b { color:var(--ink); font-weight:600; }
+  .summary .bad { color:var(--bad); font-weight:600; }
+  .sub { font-size:13px; color:var(--muted); margin:0 0 26px; }
+
+  .host { margin-bottom:26px; }
+  .host-name {
+    font-size:12px; font-weight:600; color:var(--muted);
+    letter-spacing:.06em; text-transform:uppercase;
+    display:flex; align-items:baseline; gap:9px; margin-bottom:8px;
+  }
+  .host-note {
+    font-size:12px; letter-spacing:0; text-transform:none;
+    font-weight:400; color:var(--faint); cursor:pointer;
+    background:none; border:0; padding:0; font-family:inherit;
+  }
+  .host-note:hover { color:var(--accent); text-decoration:underline; }
+
+  .rows { border:1px solid var(--line); border-radius:10px; overflow:hidden; background:var(--panel); box-shadow:var(--shadow); }
+  .row { display:flex; align-items:flex-start; gap:14px; padding:13px 16px; border-top:1px solid var(--line); }
+  .row:first-child { border-top:0; }
+  .row.down { background:var(--bad-bg); }
+
+  /* The state pip carries the state at a glance; the word beside it carries
+     it for anyone who cannot separate these hues. Never colour alone. */
+  .pip { width:9px; height:9px; border-radius:50%; margin-top:7px; flex:none; background:var(--faint); }
+  .pip.ready { background:var(--ready); }
+  .pip.busy { background:var(--busy); }
+  .pip.unknown { background:var(--unknown); }
+  .pip.unhealthy { background:var(--bad); }
+
+  .body { flex:1; min-width:0; }
+  .line1 { display:flex; align-items:baseline; gap:10px; flex-wrap:wrap; }
+  .dev { font-size:14px; font-weight:600; letter-spacing:-.01em; }
+  .state { font-size:12px; font-weight:600; letter-spacing:.02em; }
+  .state.ready { color:var(--ready); } .state.busy { color:var(--busy); }
+  .state.unknown { color:var(--unknown); } .state.unhealthy { color:var(--bad); }
+  .spec { font-size:12px; color:var(--faint); }
+
+  .line2 { font-size:13px; color:var(--ink-2); margin-top:3px; }
+  .line2 .who { font-weight:500; }
+  .line2 .dur { color:var(--muted); }
+
+  /* The explanation for a device that has left the pool. This is the single
+     most important string on the page: it is why the device is gone and it
+     decides whether clearing it is safe. It gets prose treatment, room, and
+     no truncation. */
+  .why { margin-top:7px; padding:9px 11px; background:var(--panel); border:1px solid var(--bad-line);
+         border-radius:7px; font-size:13px; color:var(--ink); }
+  .why b { color:var(--bad); font-weight:600; }
+  .why .txt { display:block; margin-top:2px; word-break:break-word; }
+
+  .cmd { margin-top:5px; font-size:12px; color:var(--muted);
+         overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+
+  .waits { margin-top:7px; font-size:12.5px; color:var(--muted); }
+  .waits .w { display:block; }
+  .waits .long { color:var(--warn); font-weight:600; }
+
+  .right { display:flex; align-items:center; gap:8px; flex:none; }
+
+  /* Progressive disclosure: the facts an operator scans past 95% of the time
+     live behind this, so the resting page stays quiet. */
+  .more { border:0; background:none; padding:2px 4px; cursor:pointer; color:var(--faint);
+          font:inherit; font-size:12px; border-radius:5px; }
+  .more:hover { color:var(--accent); }
+  .detail { margin-top:10px; padding-top:10px; border-top:1px dashed var(--line-2); font-size:13px; }
+  .facts { display:grid; grid-template-columns:auto 1fr; gap:3px 14px; }
+  .facts dt { color:var(--muted); font-size:12px; }
+  .facts dd { margin:0; font-size:12.5px; word-break:break-word; }
+  .facts dd .src { color:var(--faint); font-size:11px; margin-left:6px; }
+  .sheet { margin-top:10px; padding:11px 13px; background:var(--sunk); border-radius:7px;
+           font-size:13px; white-space:pre-wrap; word-break:break-word; color:var(--ink-2); }
+  .sheet .hd { display:block; font-size:11px; color:var(--muted); text-transform:uppercase;
+               letter-spacing:.06em; margin-bottom:5px; font-weight:600; }
+  .agewarn { color:var(--warn); font-size:12px; margin-top:7px; }
+
+  button.act { border:1px solid var(--line-2); background:var(--panel); color:var(--ink-2);
+               border-radius:7px; padding:5px 11px; font:inherit; font-size:12.5px; cursor:pointer; }
+  button.act:hover { border-color:var(--accent); color:var(--accent); }
+  button.act.danger { border-color:var(--bad-line); color:var(--bad); }
+  button.act.foreign { color:var(--faint); }
+
+  .empty { color:var(--muted); padding:28px 0; text-align:center; }
+  .empty .hint { font-size:13px; color:var(--faint); margin-top:6px; }
+
+  /* The identity control is a footnote, not a headline: it is set once and
+     never touched again, so it must not compete with the fleet. */
+  .who-bar { margin-top:28px; padding-top:16px; border-top:1px solid var(--line);
+             display:flex; gap:9px; align-items:center; flex-wrap:wrap;
+             font-size:13px; color:var(--muted); }
+  .who-bar input { flex:0 1 240px; }
+  .who-bar button { border:1px solid var(--line-2); background:var(--panel); color:var(--ink-2);
+                    border-radius:7px; padding:6px 12px; font:inherit; font-size:13px; cursor:pointer; }
+
+  input { background:var(--panel); color:var(--ink); border:1px solid var(--line-2);
+          border-radius:7px; padding:8px 11px; font:inherit; }
+  input:focus-visible, button:focus-visible, .more:focus-visible {
+    outline:2px solid var(--accent); outline-offset:2px;
+  }
+
+  #gate { padding:64px 24px; max-width:400px; margin:0 auto; }
+  #gate h2 { font-size:16px; margin:0 0 6px; font-weight:600; }
+  #gate p { color:var(--muted); font-size:13px; margin:0 0 18px; }
+  #gate form { display:flex; gap:8px; }
+  #gate input { flex:1; }
+  #gate button { background:var(--ink); color:var(--bg); border:0; border-radius:7px;
+                 padding:8px 15px; font:inherit; font-weight:600; cursor:pointer; }
+
+  #act { font-size:13px; color:var(--muted); }
+  #act.bad { color:var(--bad); font-weight:600; }
+  #err { font-size:13px; color:var(--bad); }
   .hide { display:none; }
-  /* Action controls. A kill or a clear is the only thing on this page that
-     changes anything, so both are drawn small and out of the reading path —
-     an operator scanning "who has gpu0" should never hit one by accident —
-     while staying legible in either palette, since every colour here is a
-     token defined in both. */
-  button.mini { padding:4px 10px; font-size:12px; border-radius:6px; }
-  /* A kill aimed at a job this identity did not submit is drawn as an
-     outline, not a solid button: the controller will refuse it
-     (not_job_owner), and the weaker treatment says so before the click
-     rather than after it. The button still exists, because "someone else's
-     job is stuck on the GPU I need" is exactly when an operator goes
-     looking for the kill control, and a refusal that names the submitter is
-     more useful than a control that silently isn't there. */
-  button.foreign { background:transparent; color:var(--muted); border:1px solid var(--line); }
-  .acts { margin-top:10px; }
-  /* #act carries the outcome of the last kill or clear and is deliberately
-     NOT cleared by render(): a 5s poll landing right after a refusal would
-     otherwise wipe "not_job_owner: ..." off the screen before it was read.
-     #err keeps its old meaning — the live connection's own health. */
-  #act { font-size:12px; color:var(--muted); }
-  #act.bad { color:var(--unhealthy); font-weight:600; }
-  #whoBar { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:6px; }
-  #who { min-width:220px; }
-  #whoHint { color:var(--muted); font-size:12px; }
 </style>
 </head>
 <body>
 <header>
-  <h1>resource controller</h1>
-  <div class="hstat">
-    <span id="updated"></span>
-    <span id="act"></span>
-    <span id="err"></span>
-  </div>
+  <span class="brand">
+    <!-- The mark, inlined: two jaws holding one token. currentColor so it
+         belongs to the text in either palette, and no external request. -->
+    <svg width="20" height="20" viewBox="0 0 64 64" role="img" aria-label="resource controller">
+      <path d="M24 4H4v56h20v-8H12V12h12Z" fill="currentColor" opacity=".55"/>
+      <path d="M40 4h20v56H40v-8h12V12H40Z" fill="currentColor" opacity=".55"/>
+      <circle cx="32" cy="32" r="13" fill="var(--accent)"/>
+    </svg>
+    <h1>resource controller</h1>
+  </span>
+  <span id="act"></span>
+  <span id="err"></span>
+  <span class="live" id="live"><span class="dot"></span><span id="liveText"></span></span>
 </header>
 
 <div id="gate">
-  <h2>client token</h2>
-  <p class="meta">Held for this tab only, never stored on disk.</p>
+  <h2>Connect</h2>
+  <p>Paste a client token. It stays in this tab and is never written to disk.</p>
   <form id="gateForm">
-    <input id="token" type="password" autocomplete="off" placeholder="paste a client token" required>
-    <button type="submit">connect</button>
+    <input id="token" type="password" autocomplete="off" placeholder="client token" required>
+    <button type="submit">Connect</button>
   </form>
 </div>
 
 <main id="app" class="hide">
-  <form id="whoBar">
-    <input id="who" type="text" autocomplete="off" placeholder="you are, e.g. alice@gpubox">
-    <button type="submit">set identity</button>
+  <p class="summary" id="summary"></p>
+  <p class="sub" id="sub"></p>
+  <div id="fleet"></div>
+  <form class="who-bar" id="whoBar">
+    <label for="who">You are</label>
+    <input id="who" type="text" autocomplete="off" placeholder="alice@lab">
+    <button type="submit">Set</button>
     <span id="whoHint"></span>
   </form>
-
-  <h2>devices</h2>
-  <div class="grid" id="devices"></div>
-
-  <h2>queue</h2>
-  <div class="wrap"><table id="queue">
-    <thead><tr><th>#</th><th>job</th><th>device</th><th>submitter</th><th>command</th></tr></thead>
-    <tbody></tbody>
-  </table></div>
-  <div class="empty hide" id="queueEmpty">nothing waiting</div>
-
-  <h2>running</h2>
-  <div class="wrap"><table id="jobs">
-    <thead><tr><th>job</th><th>device</th><th>state</th><th>submitter</th><th>command</th><th></th></tr></thead>
-    <tbody></tbody>
-  </table></div>
-  <div class="empty hide" id="jobsEmpty">nothing running</div>
 </main>
 
 <script>
 (function () {
-  // The whole credential story of this page, in one place.
+  // Credentials, in one place.
   //
-  // token is the CLIENT token: it reads state and kills the operator's own
-  // jobs, and it is the only thing that survives a reload, in sessionStorage
-  // (tab-scoped, gone when the tab closes). Nothing stronger is ever kept.
+  // token is the CLIENT token: it reads state and kills this operator's own
+  // jobs. It is the only thing that survives a reload, in sessionStorage
+  // (tab-scoped, gone with the tab). Nothing stronger is ever kept.
   //
-  // The admin token — which clears a device fleet-wide — is never held here
-  // at all: clearDevice() asks for it at the moment of the click, hands it
-  // to exactly one request, and drops it before any callback could capture
-  // it. So the credential resident in this browser is always the weaker of
-  // the two.
+  // The admin token — which returns a device to the pool fleet-wide — is
+  // never held here: clearDevice() asks for it at the moment of the click,
+  // hands it to exactly one request, and drops it before any callback could
+  // capture it. The credential resident in this browser is always the weaker
+  // of the two.
   //
-  // identity is not a credential at all: it is the submitter name a kill is
-  // sent as, the same string `rc kill --as` sends and the same one shown in
-  // the submitter column. It is held in memory only and deliberately NOT
-  // stored beside the token, because the one stored key on this page is the
-  // client token and nothing else (see the dashboard tests). A reload
-  // therefore keeps the connection but forgets who you are, and the kill
-  // controls stay hidden until the identity box is filled in again — a
-  // small price for a page whose storage can be read off its source in one
-  // line. Note what this does and does not buy: the controller checks the
-  // submitter the client claims, so this box is a guard against killing the
-  // wrong job by accident, not an authentication of who is asking.
+  // identity is not a credential. It is the submitter name a kill is sent
+  // as, the same string `rc kill --as` sends. Held in memory only, so a
+  // reload keeps the connection and forgets who you are. Note what the
+  // server's check is: it compares the submitter the client claims, so this
+  // guards against killing the wrong job by accident — it does not
+  // authenticate who is asking.
   var token = sessionStorage.getItem("rc_token") || "";
   var identity = "";
+  var open = {};           // device id -> details expanded
+  var sheets = {};         // device id -> usage sheet, fetched on demand
   var gate = document.getElementById("gate");
   var app = document.getElementById("app");
   var err = document.getElementById("err");
   var act = document.getElementById("act");
-  var updated = document.getElementById("updated");
-
-  // pollTimer and es are the two "keep this page live" handles. Both must be
-  // torn down whenever the page returns to the gate (rejected token) and
-  // whenever start() runs again (a corrected token after a typo): without
-  // that, each failed attempt leaves its own interval running forever,
-  // hammering /v1/state with 401s that update nothing on screen.
-  var pollTimer = null;
-  var es = null;
-  var lastFetchAt = null;
-  var freshnessTimer = null;
+  var pollTimer = null, freshTimer = null, es = null, lastFetchAt = null;
 
   document.getElementById("gateForm").addEventListener("submit", function (e) {
     e.preventDefault();
@@ -203,30 +253,96 @@
     e.preventDefault();
     identity = document.getElementById("who").value.trim();
     renderWho();
-    refresh(); // redraw the running table so its kill controls follow the
-               // identity that was just set (or cleared)
+    refresh();
   });
 
   function renderWho() {
-    document.getElementById("whoHint").textContent = identity
-      ? "kill acts as " + identity
-      : "say who you are to enable kill controls";
+    document.getElementById("whoHint").textContent =
+      identity ? "— kill controls act as " + identity : "— set this to enable kill controls";
   }
 
-  function fail(message) { err.textContent = message; }
+  function fail(m) { err.textContent = m; }
+  function actOK(m) { act.textContent = m; act.className = ""; }
+  function actFail(m) { act.textContent = m; act.className = "bad"; }
 
-  // actOK/actFail report the outcome of a kill or a clear. They write to
-  // their own element rather than #err so a poll landing a moment later
-  // cannot wipe the answer off the screen — see the #act CSS comment.
-  function actOK(message) { act.textContent = message; act.className = ""; }
-  function actFail(message) { act.textContent = message; act.className = "bad"; }
+  function el(tag, cls, text) {
+    var n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text !== undefined && text !== null) n.textContent = text;
+    return n;
+  }
 
-  // serverError turns a failed API response into the controller's own
-  // words. "not_job_owner: only the submitter or an admin may kill this
-  // job" and "device_not_cleared: device has a live lease and was not
-  // cleared" each tell an operator what to do next; "kill failed" tells
-  // them nothing. Both strings are server-supplied, so they reach the page
-  // through textContent (actFail) and never as HTML.
+  // ---- formatting ------------------------------------------------------
+  //
+  // Every one of these takes a number the SERVER computed. This page never
+  // measures an age against its own clock: a browser with a skewed clock
+  // must not be able to make a month-old label read as fresh, or a stuck
+  // queue read as new. The one exception is "updated Ns ago" in the header,
+  // which is the delta between two readings of this browser's own clock and
+  // so is immune by construction.
+
+  function ago(s) {
+    if (s < 0) return "in the future?";
+    if (s < 60) return s + "s";
+    if (s < 3600) return Math.floor(s / 60) + "m";
+    if (s < 86400) return Math.floor(s / 3600) + "h " + Math.floor((s % 3600) / 60) + "m";
+    return Math.floor(s / 86400) + "d " + Math.floor((s % 86400) / 3600) + "h";
+  }
+
+  // Raw byte counts are the single least readable thing the probes produce:
+  // disk_free_bytes=59138863104 tells nobody anything at a glance.
+  function bytes(n) {
+    var u = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"], i = 0, v = Number(n);
+    if (!isFinite(v)) return String(n);
+    while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+    return (v >= 100 || i === 0 ? Math.round(v) : v.toFixed(1)) + " " + u[i];
+  }
+
+  function prettyValue(key, value) {
+    if (/_bytes$/.test(key)) return bytes(value);
+    return value;
+  }
+
+  function prettyKey(key) { return key.replace(/_bytes$/, "").replace(/_/g, " "); }
+
+  function labelMap(v) {
+    var m = {};
+    (v.device.labels || []).forEach(function (l) {
+      if (!(l.key in m) || l.source === "detected") m[l.key] = l.value;
+    });
+    return m;
+  }
+
+  // The one-line "what is this box" summary. Two or three facts that bear on
+  // a scheduling decision, not the nine chips that used to dominate the card.
+  function specLine(v) {
+    var m = labelMap(v), bits = [];
+    if (m.gpu_model) bits.push(m.gpu_model);
+    else if (m.vendor) bits.push(m.vendor);
+    if (m.vram) bits.push(m.vram);
+    // Deliberately NOT disk_free_bytes: it is a HOST fact, so repeating it on
+    // every device of that host is the same number four times. It rides the
+    // host heading instead.
+    return bits.join(" · ");
+  }
+
+  // Facts that belong to the machine rather than to one of its devices, so
+  // they are stated once per host instead of once per row.
+  function hostSummary(views) {
+    var bits = [views.length + (views.length === 1 ? " device" : " devices")];
+    var m = labelMap(views[0]);
+    if (m.disk_free_bytes) bits.push(bytes(m.disk_free_bytes) + " free");
+    if (m.cpus) bits.push(m.cpus + " CPUs");
+    return bits.join(" · ");
+  }
+
+  function shortCmd(cmd) {
+    var s = (cmd || []).join(" ");
+    return s.length > 96 ? s.slice(0, 96) + "…" : s;
+  }
+
+  // ---- server calls ----------------------------------------------------
+
   function serverError(r) {
     return r.text().then(function (body) {
       var message = "";
@@ -235,14 +351,14 @@
         if (parsed && parsed.error) {
           message = parsed.message ? parsed.error + ": " + parsed.message : parsed.error;
         }
-      } catch (e) { /* not JSON (a proxy's error page, say): fall through */ }
+      } catch (e) { /* not JSON: fall through to the status */ }
       return message || ("HTTP " + r.status);
     }, function () { return "HTTP " + r.status; });
   }
 
   function killJob(job) {
     var short = job.id.slice(0, 8);
-    var what = "kill job " + short + " on " + job.device_id + "?";
+    var what = "Kill job " + short + " on " + job.device_id + "?";
     if (job.submitter !== identity) {
       what += "\n\nIt was submitted by " + job.submitter + ", not by " + identity +
         " — the controller will refuse this unless you hold an admin token.";
@@ -254,31 +370,23 @@
       headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" },
       body: JSON.stringify({ submitter: identity })
     }).then(function (r) {
-      if (r.ok) {
-        actOK("kill requested for " + short);
-        refresh();
-        return;
-      }
+      if (r.ok) { actOK("kill requested for " + short); refresh(); return; }
       return serverError(r).then(actFail);
     }).catch(function (e) { actFail(e.message); });
   }
 
-  // clearDevice is the only admin-authenticated call this page makes, and
-  // the only place an admin token ever exists in this tab.
-  //
-  // The token is read from a prompt at the moment of the click, used for one
-  // request, and dropped on the next line — before the response arrives, so
-  // none of the callbacks below can close over a live value. It is never
-  // written to storage of any kind, never returned, and never held on a
-  // variable outside this call. Reloading, or clearing a second device,
-  // asks again; that is the intended cost.
-  function clearDevice(id) {
-    if (!window.confirm("clear " + id + "?\n\nThis returns it to the pool. " +
-        "It only works on an unhealthy device with no live lease, and it needs an admin token.")) {
-      return;
-    }
-    var admin = window.prompt("admin token to clear " + id + " (used for this one request, never stored)");
-    if (admin === null) return; // cancelled at the prompt: nothing sent
+  // The only admin-authenticated call this page makes, and the only place an
+  // admin token ever exists in this tab. Read at the click, used for one
+  // request, dropped on the next line — before the response arrives, so none
+  // of the callbacks below can close over a live value. Never stored, never
+  // returned, never held anywhere that outlives this call.
+  function clearDevice(id, why) {
+    var msg = "Return " + id + " to the pool?";
+    if (why) msg += "\n\nIt was taken out because:\n" + why;
+    msg += "\n\nThis needs an admin token, and only works if nothing holds the device.";
+    if (!window.confirm(msg)) return;
+    var admin = window.prompt("Admin token to clear " + id + " (used once, never stored)");
+    if (admin === null) return;
     admin = admin.trim();
     if (!admin) { actFail("no admin token given; nothing was sent"); return; }
 
@@ -287,35 +395,261 @@
       method: "POST",
       headers: { Authorization: "Bearer " + admin }
     });
-    admin = null; // dropped here, synchronously, while the request is still
-                  // in flight: the callbacks below see null, not a token
+    admin = null; // dropped synchronously, while the request is still in
+                  // flight: the callbacks below see null, never a token
     pending.then(function (r) {
-      if (r.ok) {
-        actOK("cleared " + id);
-        refresh();
-        return;
-      }
+      if (r.ok) { actOK("cleared " + id); refresh(); return; }
       return serverError(r).then(actFail);
     }).catch(function (e) { actFail(e.message); });
   }
 
-  // stopLive tears down every timer and connection that keeps the page
-  // updating on its own. Called before (re)starting and whenever the token
-  // is rejected, so nothing outlives the session that opened it.
+  // The usage sheet is how a host explains itself — how to reach it, what is
+  // already on it, what not to run at once. It is per-device and can be long,
+  // so it is fetched only when someone opens the details rather than riding
+  // on every 5s poll of the whole fleet.
+  function loadSheet(id, into) {
+    if (sheets[id] !== undefined) { paintSheet(into, sheets[id]); return; }
+    fetch("/v1/devices/" + encodeURIComponent(id) + "/describe",
+          { headers: { Authorization: "Bearer " + token } })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (d) {
+        sheets[id] = d ? { text: d.sheet || "", hostWide: !!d.sheet_is_host_wide,
+                           age: d.sheet_age_seconds } : null;
+        paintSheet(into, sheets[id]);
+      })
+      .catch(function () { sheets[id] = null; paintSheet(into, null); });
+  }
+
+  function paintSheet(into, s) {
+    into.textContent = "";
+    if (!s || !s.text) return;
+    var box = el("div", "sheet");
+    var hd = el("span", "hd", (s.hostWide ? "host note" : "device note") +
+      (typeof s.age === "number" ? " · updated " + ago(s.age) + " ago" : ""));
+    box.appendChild(hd);
+    box.appendChild(document.createTextNode(s.text));
+    into.appendChild(box);
+  }
+
+  // ---- rendering -------------------------------------------------------
+
+  function stateWord(v) {
+    var s = v.device.state;
+    if (s === "unhealthy") return "out of the pool";
+    if (s === "unknown") return "not reporting";
+    if (s === "busy") return "in use";
+    return "free";
+  }
+
+  function renderRow(v, queuedFor) {
+    var d = v.device;
+    var down = d.state === "unhealthy";
+    var row = el("div", "row" + (down ? " down" : ""));
+    row.appendChild(el("span", "pip " + d.state));
+
+    var body = el("div", "body");
+    var l1 = el("div", "line1");
+    // The short name reads better in a list already grouped by host, but the
+    // full ID is what an operator types into `rc run -d`, so keep it one
+    // hover away rather than gone.
+    var devName = el("span", "dev mono", d.name || d.id);
+    devName.title = d.id;
+    l1.appendChild(devName);
+    l1.appendChild(el("span", "state " + d.state, stateWord(v)));
+    var spec = specLine(v);
+    if (spec) l1.appendChild(el("span", "spec", spec));
+    body.appendChild(l1);
+
+    // Who has it and for how long — the question this page exists to answer.
+    if (v.holder) {
+      var l2 = el("div", "line2");
+      l2.appendChild(el("span", "who", v.holder));
+      if (v.kind === "hold" && v.reason) l2.appendChild(document.createTextNode(" — " + v.reason));
+      l2.appendChild(el("span", "dur", " · " + ago(v.elapsed_seconds)));
+      body.appendChild(l2);
+    }
+
+    // A worker that has gone quiet while still holding a lease is a ghost
+    // lease: the row says "in use" but nobody is confirming it.
+    if (v.heartbeat_age_seconds > 30) {
+      var q = el("div", "line2");
+      q.appendChild(el("span", "dur", "no contact for " + ago(v.heartbeat_age_seconds)));
+      body.appendChild(q);
+    }
+
+    // The explanation. Promoted above everything else on a device that is
+    // out of the pool, because it is what decides whether clearing is safe.
+    if (down) {
+      var why = el("div", "why");
+      why.appendChild(el("b", null, "Why: "));
+      why.appendChild(el("span", "txt mono", v.quarantine_reason || "no reason was recorded"));
+      body.appendChild(why);
+    }
+
+    if (v.kind !== "hold" && v.command && v.command.length) {
+      body.appendChild(el("div", "cmd mono", shortCmd(v.command)));
+    }
+
+    // Anything queued for this device, with how long it has waited. A wait
+    // over ten minutes is called out: that is the case the old page could
+    // not show at all.
+    if (queuedFor.length) {
+      var w = el("div", "waits");
+      queuedFor.forEach(function (j) {
+        var secs = j.waited;
+        var line = el("span", "w" + (secs >= 600 ? " long" : ""));
+        line.textContent = "waiting " + ago(secs) + " · " + j.submitter;
+        w.appendChild(line);
+      });
+      body.appendChild(w);
+    }
+
+    var detail = el("div", "detail hide");
+    body.appendChild(detail);
+    if (open[d.id]) { detail.classList.remove("hide"); fillDetail(detail, v); }
+
+    row.appendChild(body);
+
+    var right = el("div", "right");
+    if (down) {
+      var clear = el("button", "act danger", "Return to pool");
+      clear.type = "button";
+      clear.addEventListener("click", function () { clearDevice(d.id, v.quarantine_reason); });
+      right.appendChild(clear);
+    }
+    if (v.job_id && identity) {
+      var job = { id: v.job_id, device_id: d.id, submitter: v.holder };
+      var kill = el("button", "act" + (v.holder === identity ? "" : " foreign"), "Kill");
+      kill.type = "button";
+      if (v.holder !== identity) kill.title = "submitted by " + v.holder +
+        ": the controller refuses a kill from anyone else";
+      kill.addEventListener("click", function () { killJob(job); });
+      right.appendChild(kill);
+    }
+    var more = el("button", "more", open[d.id] ? "less ▴" : "details ▾");
+    more.type = "button";
+    more.addEventListener("click", function () {
+      open[d.id] = !open[d.id];
+      more.textContent = open[d.id] ? "less ▴" : "details ▾";
+      detail.classList.toggle("hide", !open[d.id]);
+      if (open[d.id]) fillDetail(detail, v);
+    });
+    right.appendChild(more);
+    row.appendChild(right);
+    return row;
+  }
+
+  // Everything an operator scans past most of the time: every label with its
+  // provenance, and the host's own usage sheet.
+  function fillDetail(box, v) {
+    box.textContent = "";
+    var labels = (v.device.labels || []).slice().sort(function (a, b) {
+      return a.key < b.key ? -1 : a.key > b.key ? 1 : 0;
+    });
+    if (!labels.length) {
+      box.appendChild(el("div", "spec", "no labels reported"));
+    } else {
+      var dl = el("dl", "facts");
+      labels.forEach(function (l) {
+        dl.appendChild(el("dt", null, prettyKey(l.key)));
+        var dd = el("dd", null, prettyValue(l.key, l.value));
+        dd.appendChild(el("span", "src", l.source));
+        dl.appendChild(dd);
+      });
+      box.appendChild(dl);
+    }
+    // Server-computed, like every age here.
+    if (typeof v.oldest_label_age_seconds === "number" && v.oldest_label_age_seconds > 3600) {
+      box.appendChild(el("div", "agewarn",
+        "⚠ nothing has confirmed these facts for " + ago(v.oldest_label_age_seconds)));
+    }
+    var sheetBox = el("div");
+    box.appendChild(sheetBox);
+    loadSheet(v.device.id, sheetBox);
+  }
+
+  function render(state) {
+    err.textContent = "";
+    connectEvents();
+
+    var views = state.devices || [];
+    var waitingBy = {};
+    (state.queued || []).forEach(function (j) {
+      var secs = (state.queued_waiting_seconds || {})[j.id];
+      var entry = { submitter: j.submitter, waited: typeof secs === "number" ? secs : 0 };
+      (waitingBy[j.device_id] = waitingBy[j.device_id] || []).push(entry);
+    });
+
+    // The fleet in one sentence. Counting cards is work; this is not.
+    var free = 0, busy = 0, down = 0;
+    views.forEach(function (v) {
+      if (v.device.state === "unhealthy") down++;
+      else if (v.device.state === "busy") busy++;
+      else if (v.device.state === "ready") free++;
+    });
+    var sum = document.getElementById("summary");
+    sum.textContent = "";
+    if (!views.length) {
+      sum.textContent = "No devices yet.";
+    } else {
+      sum.appendChild(el("b", null, String(free)));
+      sum.appendChild(document.createTextNode(free === 1 ? " device free, " : " devices free, "));
+      sum.appendChild(el("b", null, String(busy)));
+      sum.appendChild(document.createTextNode(busy === 1 ? " in use" : " in use"));
+      if (down) {
+        sum.appendChild(document.createTextNode(", "));
+        sum.appendChild(el("span", "bad", down + " out of the pool"));
+      }
+      sum.appendChild(document.createTextNode("."));
+    }
+    var queuedCount = (state.queued || []).length;
+    document.getElementById("sub").textContent = queuedCount
+      ? queuedCount + (queuedCount === 1 ? " job waiting for a device." : " jobs waiting for a device.")
+      : "Nothing waiting.";
+
+    var byHost = {};
+    views.forEach(function (v) {
+      var h = v.device.host || "—";
+      (byHost[h] = byHost[h] || []).push(v);
+    });
+
+    var fleet = document.getElementById("fleet");
+    fleet.textContent = "";
+    if (!views.length) {
+      var e = el("div", "empty", "No devices are registered.");
+      e.appendChild(el("div", "hint", "Start a worker on a device host and it will appear here."));
+      fleet.appendChild(e);
+      return;
+    }
+    Object.keys(byHost).sort().forEach(function (h) {
+      var sec = el("div", "host");
+      var hd = el("div", "host-name");
+      hd.appendChild(el("span", null, h));
+      var hostFacts = hostSummary(byHost[h]);
+      if (hostFacts) hd.appendChild(el("span", "host-note", hostFacts));
+      sec.appendChild(hd);
+      var rows = el("div", "rows");
+      byHost[h].sort(function (a, b) {
+        return a.device.id < b.device.id ? -1 : 1;
+      }).forEach(function (v) {
+        rows.appendChild(renderRow(v, waitingBy[v.device.id] || []));
+      });
+      sec.appendChild(rows);
+      fleet.appendChild(sec);
+    });
+  }
+
+  // ---- liveness --------------------------------------------------------
+
   function stopLive() {
     if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
-    if (freshnessTimer) { clearInterval(freshnessTimer); freshnessTimer = null; }
+    if (freshTimer) { clearInterval(freshTimer); freshTimer = null; }
     if (es) { es.close(); es = null; }
   }
 
   function returnToGate() {
     stopLive();
     sessionStorage.removeItem("rc_token");
-    // The last action's outcome belongs to the session that caused it: a
-    // "cleared gpubox:gpu0" left in the header above a token prompt reads
-    // as the state of a page the operator is no longer connected to. This
-    // is the ONLY place #act is cleared — deliberately not on every poll,
-    // for the reason its CSS comment gives.
     actOK("");
     gate.classList.remove("hide");
     app.classList.add("hide");
@@ -333,302 +667,45 @@
       });
   }
 
-  function ago(seconds) {
-    if (seconds < 60) return seconds + "s";
-    if (seconds < 3600) return Math.floor(seconds / 60) + "m" + (seconds % 60) + "s";
-    return Math.floor(seconds / 3600) + "h" + Math.floor((seconds % 3600) / 60) + "m";
-  }
-
-  // labelSourceRank orders chips detected-before-declared, matching
-  // internal/cli/describe.go's sourceRank: detected is what the scheduler
-  // actually trusts (store.LabelSnapshot), so it reads first, with declared
-  // right beside it — close enough that a conflicting hand-entered value is
-  // never hidden behind the one that "won".
-  //
-  // isDetectedSource is the one place that decides "detected" vs
-  // everything else, used by BOTH the sort order above and the chip's CSS
-  // class below, so the two can never disagree about a label whose source
-  // is neither "detected" nor "declared" (which should not happen, but a
-  // label that reaches this page with a source this page has never heard
-  // of must still sort and render as the SAME thing, not sort like a
-  // detected label while rendering with the declared chip's outline).
-  function isDetectedSource(source) { return source === "detected"; }
-
-  // oldestLabelAgeSeconds used to find how long ago the least-recently-
-  // confirmed label on a device was last seen by parsing every label's
-  // updated_at with Date.parse and measuring against Date.now() — the ONE
-  // age on this whole page that was not immune to this browser's own
-  // clock, unlike heartbeat_age_seconds and elapsed_seconds, which the
-  // server already reduces to a seconds count before either ever reaches
-  // this page. A browser clock skewed by more than an hour could show a
-  // false staleness warning here, or hide a real one.
-  //
-  // It now just reads oldest_label_age_seconds straight off the DeviceView
-  // (v) the server already computed it on — against ITS OWN clock, the
-  // same way heartbeat_age_seconds always has been — so this page carries
-  // no age of its own computation anymore. null when the device has no
-  // labels (the server's own nil for that case, via a JSON field that is
-  // simply absent).
-  function oldestLabelAgeSeconds(v) {
-    return (typeof v.oldest_label_age_seconds === "number") ? v.oldest_label_age_seconds : null;
-  }
-
-  // renderLabelChips shows every label as a "key=value" chip, detected and
-  // declared visually distinguished (see the .chip-detected/.chip-declared
-  // CSS), so a conflicting declared value stays visible next to the
-  // detected one that actually wins rather than being overwritten away.
-  // Every value comes from a probe script or an operator's worker.yaml —
-  // both untrusted as far as this page is concerned — so each chip's text
-  // is set via textContent, never innerHTML. Takes the whole DeviceView (v)
-  // rather than a bare labels array so it can also read v's own
-  // oldest_label_age_seconds for the staleness warning below.
-  function renderLabelChips(box, v) {
-    var labels = v.device.labels;
-    box.textContent = "";
-    if (!labels || !labels.length) {
-      var none = document.createElement("div");
-      none.className = "no-labels";
-      none.textContent = "no labels";
-      box.appendChild(none);
-      return;
-    }
-    var sorted = labels.slice().sort(function (a, b) {
-      if (a.key !== b.key) return a.key < b.key ? -1 : 1;
-      return (isDetectedSource(a.source) ? 0 : 1) - (isDetectedSource(b.source) ? 0 : 1);
-    });
-    var chips = document.createElement("div");
-    chips.className = "labels";
-    sorted.forEach(function (l) {
-      var chip = document.createElement("span");
-      chip.className = "chip " + (isDetectedSource(l.source) ? "chip-detected" : "chip-declared");
-      chip.textContent = l.key + "=" + l.value;
-      chips.appendChild(chip);
-    });
-    box.appendChild(chips);
-
-    var age = oldestLabelAgeSeconds(v);
-    if (age !== null && age > 3600) {
-      var stale = document.createElement("div");
-      stale.className = "labels-stale";
-      stale.textContent = "⚠ oldest label " + ago(age) + " ago";
-      box.appendChild(stale);
-    }
-  }
-
-  function renderDevices(views) {
-    var box = document.getElementById("devices");
-    box.textContent = "";
-    (views || []).forEach(function (v) {
-      var d = v.device;
-      var stale = v.heartbeat_age_seconds > 30;
-      // A stale heartbeat on a device nobody holds is quiet-worrying; a
-      // stale heartbeat on a device that still lists a holder is a ghost
-      // lease — the exact "who has gpu0 right now, and has it gone quiet"
-      // question this page exists to answer. That case gets the loud
-      // .stale tier; unhealthy (worker confirmed gone, see Sweep) stays the
-      // loudest tier of all.
-      var staleHeld = stale && !!v.holder;
-      var card = document.createElement("div");
-      card.className = "card" + (d.state === "unhealthy" ? " alert" : staleHeld ? " stale" : "");
-
-      var head = document.createElement("div");
-      head.className = "dev";
-      var name = document.createElement("span");
-      name.className = "name";
-      name.textContent = d.id;
-      var state = document.createElement("span");
-      state.className = "state " + d.state;
-      state.textContent = d.state;
-      head.appendChild(name); head.appendChild(state);
-      card.appendChild(head);
-
-      var meta = document.createElement("div");
-      meta.className = "meta";
-      var bits = [];
-      if (v.holder) {
-        var held = "held by " + v.holder;
-        // A hold's reason rides the lease row precisely so it can stand in
-        // for its meaningless placeholder command — see
-        // internal/cli/ps.go's RenderDevices, which draws the same
-        // "holder (reason)" distinction for `rc devices`.
-        if (v.kind === "hold" && v.reason) held += " (" + v.reason + ")";
-        held += " for " + ago(v.elapsed_seconds);
-        bits.push(held);
-      }
-      if (stale) bits.push((staleHeld ? "⚠ no contact " : "no contact ") + ago(v.heartbeat_age_seconds));
-      meta.textContent = bits.join(" · ") || "idle";
-      card.appendChild(meta);
-
-      // A hold's command is a fixed, meaningless placeholder the worker
-      // never actually runs (see server.holdCommand) — showing it would
-      // tell an operator nothing. Its reason is the whole point of a hold,
-      // so that's what renders here instead, and it stays out of this line
-      // entirely for a hold with no reason given.
-      if (v.kind === "hold") {
-        if (v.reason) {
-          var holdReason = document.createElement("div");
-          holdReason.className = "cmd";
-          holdReason.textContent = "hold: " + v.reason;
-          card.appendChild(holdReason);
-        }
-      } else if (v.command && v.command.length) {
-        var cmd = document.createElement("div");
-        cmd.className = "cmd";
-        cmd.textContent = v.command.join(" ");
-        card.appendChild(cmd);
-      }
-
-      var labelsBox = document.createElement("div");
-      renderLabelChips(labelsBox, v);
-      card.appendChild(labelsBox);
-
-      // Only an unhealthy device can be cleared — ClearDevice refuses
-      // anything else — so the control appears on exactly those cards. It
-      // is still offered on an unhealthy device that lists a holder, which
-      // is the ghost-lease case an operator most wants to act on: the
-      // controller answers device_not_cleared there, and that refusal
-      // (surfaced verbatim) tells them the lease is the thing to deal with
-      // first.
-      if (d.state === "unhealthy") {
-        var acts = document.createElement("div");
-        acts.className = "acts";
-        var clear = document.createElement("button");
-        clear.className = "mini";
-        clear.type = "button";
-        clear.textContent = "clear";
-        clear.title = "admin only: returns " + d.id + " to the pool";
-        clear.addEventListener("click", function () { clearDevice(d.id); });
-        acts.appendChild(clear);
-        card.appendChild(acts);
-      }
-
-      box.appendChild(card);
-    });
-  }
-
-  // fillTable's optional `action` builds a trailing cell's control for a
-  // row (or returns null for none). It is a node factory rather than a
-  // string on purpose: every other cell here goes in through textContent,
-  // and an action column built from markup would be the one place on this
-  // page where a submitter name or a command could arrive as HTML.
-  function fillTable(id, emptyId, rows, cells, action) {
-    var body = document.querySelector("#" + id + " tbody");
-    body.textContent = "";
-    (rows || []).forEach(function (row, i) {
-      var tr = document.createElement("tr");
-      cells(row, i).forEach(function (text, idx) {
-        var td = document.createElement("td");
-        if (idx === 0 || idx === 1) td.className = "mono";
-        td.textContent = text;
-        tr.appendChild(td);
-      });
-      if (action) {
-        var td = document.createElement("td");
-        var control = action(row);
-        if (control) td.appendChild(control);
-        tr.appendChild(td);
-      }
-      body.appendChild(tr);
-    });
-    var empty = document.getElementById(emptyId);
-    var none = !rows || rows.length === 0;
-    empty.classList.toggle("hide", !none);
-    document.getElementById(id).classList.toggle("hide", none);
-  }
-
-  function render(state) {
-    err.textContent = "";
-    // Only reachable after fetchState() has already succeeded, so this is
-    // also the point at which we know the token is good enough to open the
-    // event stream — see connectEvents's own comment for why that ordering
-    // matters.
-    connectEvents();
-    renderDevices(state.devices);
-    fillTable("queue", "queueEmpty", state.queued, function (j, i) {
-      return [String(i + 1), j.id.slice(0, 8), j.device_id, j.submitter, (j.command || []).join(" ")];
-    });
-    fillTable("jobs", "jobsEmpty", state.jobs, function (j) {
-      return [j.id.slice(0, 8), j.device_id, j.state, j.submitter, (j.command || []).join(" ")];
-    }, killControl);
-  }
-
-  // killControl draws the kill button for one running job. Nothing is
-  // offered until an identity is set, because a kill is sent AS somebody and
-  // there is no honest value to send otherwise: the controller compares it
-  // to the job's submitter. A job this identity did not submit still gets a
-  // button, drawn as .foreign — see that rule's CSS comment.
-  function killControl(job) {
-    if (!identity) return null;
-    var b = document.createElement("button");
-    b.type = "button";
-    b.className = "mini" + (job.submitter === identity ? "" : " foreign");
-    b.textContent = "kill";
-    if (job.submitter !== identity) {
-      b.title = "submitted by " + job.submitter + ": the controller refuses a kill from anyone else";
-    }
-    b.addEventListener("click", function () { killJob(job); });
-    return b;
-  }
-
-  // updateFreshness renders "updated Ns ago" from the last successful
-  // fetch, independent of whether the most recent poll succeeded — a
-  // controller that has gone unreachable must not leave the page looking
-  // current. It ticks on its own timer (see start()) so the age keeps
-  // climbing even between 5s polls, and degrades visually the longer the
-  // snapshot has sat unrefreshed: this is the other half of "who has gpu0
-  // right now" — the page must admit when "right now" isn't recent.
+  // The delta between two readings of THIS browser's clock, so it is immune
+  // to skew by construction — unlike every age on the wire, which the server
+  // computes for exactly that reason. A controller that has gone unreachable
+  // must not leave the page looking current.
   function updateFreshness() {
-    if (!lastFetchAt) { updated.textContent = ""; updated.className = ""; return; }
+    var live = document.getElementById("live");
+    var text = document.getElementById("liveText");
+    if (!lastFetchAt) { text.textContent = "connecting…"; live.className = "live"; return; }
     var age = Math.floor((Date.now() - lastFetchAt) / 1000);
-    updated.textContent = "updated " + ago(age) + " ago";
-    updated.className = age > 30 ? "stale" : (age > 10 ? "warn" : "");
+    text.textContent = age < 10 ? "live" : "updated " + ago(age) + " ago";
+    live.className = "live" + (age > 30 ? " stale" : age > 10 ? " warn" : "");
   }
 
   function refresh() {
     return fetchState()
-      .then(function (state) {
-        lastFetchAt = Date.now();
-        updateFreshness();
-        render(state);
-      })
+      .then(function (state) { lastFetchAt = Date.now(); updateFreshness(); render(state); })
       .catch(function (e) { fail(e.message); });
   }
 
-  // connectEvents opens the SSE nudge only after a fetchState() call has
-  // already proven the token works: opening it eagerly (as part of start(),
-  // before the first response lands) raced the stream's own auth failure
-  // against fetchState's, and whichever settled last clobbered the other's
-  // error message on screen. Deferring it to render() — which only ever
-  // runs after a successful fetch — removes the race outright rather than
-  // papering over it with a message priority check.
   function connectEvents() {
-    if (es) return; // already connected
+    if (es) return;
     try {
       es = new EventSource("/v1/events?token=" + encodeURIComponent(token));
       es.onmessage = refresh;
-      // A rejected token already produced a more specific "token rejected"
-      // message via fetchState's catch and returned to the gate (which
-      // closes this stream). If err is still empty, nothing more specific
-      // has explained the drop, so this generic message is the right one.
-      es.onerror = function () {
-        if (!err.textContent) fail("event stream dropped; polling");
-      };
+      es.onerror = function () { if (!err.textContent) fail("event stream dropped; polling"); };
     } catch (e) { /* polling remains the fallback */ }
   }
 
   function start() {
-    stopLive(); // re-entrant: a corrected token after a rejected one must
-                // not stack a second poller/stream on top of a leftover one
+    stopLive();
     gate.classList.add("hide");
     app.classList.remove("hide");
     document.getElementById("who").value = identity;
     renderWho();
     lastFetchAt = null;
     updateFreshness();
-    refresh(); // connectEvents() runs from inside render(), i.e. only once
-               // this first call actually succeeds — see its comment
+    refresh();
     pollTimer = setInterval(refresh, 5000);
-    freshnessTimer = setInterval(updateFreshness, 1000);
+    freshTimer = setInterval(updateFreshness, 1000);
   }
 
   if (token) start();

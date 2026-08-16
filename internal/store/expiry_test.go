@@ -269,7 +269,7 @@ func TestRebootDoesNotResurrectHardwareFault(t *testing.T) {
 
 	// The worker self-reports a hardware fault while the job is still
 	// running on the device.
-	require.NoError(t, s.SetDeviceState("gpubox:gpu0", model.DeviceUnhealthy, c.Now()))
+	require.NoError(t, s.SetDeviceState("gpubox:gpu0", model.DeviceUnhealthy, c.Now(), ""))
 
 	// The host reboots.
 	require.NoError(t, s.UpsertWorker(
@@ -439,7 +439,7 @@ func TestRebootAfterProlongedDowntimeKeepsFaultQuarantine(t *testing.T) {
 	registerTwoDeviceHost(t, s, c.Now(), "boot-1")
 
 	// gpu1 is reported faulty by the host itself; gpu0 is fine.
-	require.NoError(t, s.SetDeviceState("gpubox:gpu1", model.DeviceUnhealthy, c.Now()))
+	require.NoError(t, s.SetDeviceState("gpubox:gpu1", model.DeviceUnhealthy, c.Now(), ""))
 
 	c.Advance(10 * time.Minute)
 	_, err := s.Sweep(30*time.Second, 5*time.Minute)
@@ -529,7 +529,7 @@ func TestRecoveredDeviceQuarantinesFreshlyAfterwards(t *testing.T) {
 	require.Equal(t, model.DeviceReady, devicesByID(t, s)["gpubox:gpu0"].State)
 
 	// Now the host reports a real fault on it, and reboots again.
-	require.NoError(t, s.SetDeviceState("gpubox:gpu0", model.DeviceUnhealthy, c.Now()))
+	require.NoError(t, s.SetDeviceState("gpubox:gpu0", model.DeviceUnhealthy, c.Now(), ""))
 	registerTwoDeviceHost(t, s, c.Now(), "boot-3")
 
 	require.Equal(t, model.DeviceUnhealthy, devicesByID(t, s)["gpubox:gpu0"].State,

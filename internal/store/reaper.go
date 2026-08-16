@@ -286,6 +286,44 @@ func (s *Store) QuarantineReasons(ids []string) (map[string]string, error) {
 	return out, rows.Err()
 }
 
+// QuarantineDetails maps each id to the operator-facing explanation recorded
+// when it was quarantined — a verify probe's stderr, a failed acquire hook's
+// message — as opposed to QuarantineReasons' machine-readable category. A
+// device with no explanation on file (quarantined before this column
+// existed, or by a path that records none, such as a sweep) maps to "".
+//
+// Same discipline as QuarantineReasons: one query for all the ids, drained
+// to exhaustion before anything else runs, because MaxOpenConns(1) turns an
+// overlapping query into a deadlock rather than a slowdown.
+func (s *Store) QuarantineDetails(ids []string) (map[string]string, error) {
+	out := make(map[string]string, len(ids))
+	if len(ids) == 0 {
+		return out, nil
+	}
+	placeholders := make([]string, len(ids))
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	rows, err := s.db.Query(fmt.Sprintf(
+		`SELECT id, quarantine_detail FROM devices WHERE id IN (%s)`,
+		strings.Join(placeholders, ", ")), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var id, detail string
+		if err := rows.Scan(&id, &detail); err != nil {
+			return nil, err
+		}
+		out[id] = detail
+	}
+	return out, rows.Err()
+}
+
 // LeaseDevices maps each id in ids to the device its lease was on. The ids
 // are the ones SweepResult.LeasesExpired reports, which is a job ID when the
 // expired lease had a job and the lease's own ID when it did not (a hold
@@ -436,7 +474,7 @@ func (s *Store) RecordHeartbeat(workerID string, at time.Time, runningJobIDs []s
 // refusal is never reported as success.
 func (s *Store) ClearDevice(id string) (bool, error) {
 	res, err := s.db.Exec(
-		`UPDATE devices SET state = ?, quarantine_reason = '' WHERE id = ? AND state = ?
+		`UPDATE devices SET state = ?, quarantine_reason = '', quarantine_detail = '' WHERE id = ? AND state = ?
 		   AND id NOT IN (SELECT device_id FROM leases WHERE released_at IS NULL)`,
 		string(model.DeviceReady), id, string(model.DeviceUnhealthy))
 	if err != nil {

@@ -111,6 +111,24 @@ var migrations = []struct {
 			`ALTER TABLE jobs ADD COLUMN reason TEXT NOT NULL DEFAULT ''`,
 		},
 	},
+	{
+		name: "stage4 quarantine detail",
+		stmts: []string{
+			// quarantine_reason is a CATEGORY — 'fault', 'worker_lost',
+			// 'registration', 'lease_expired' — and it is load-bearing:
+			// clearQuarantineOnReboot matches on it to decide which
+			// quarantines a proven reboot may lift. So the operator-facing
+			// text needs a column of its own rather than overwriting it.
+			//
+			// Without this the text was logged and thrown away: a verify
+			// probe would report "72G still pinned on gpubox:gpu0", the
+			// controller would write the word "fault", and the one piece of
+			// information an operator actually needs to decide whether to
+			// clear the device existed only in a log line nobody was
+			// reading.
+			`ALTER TABLE devices ADD COLUMN quarantine_detail TEXT NOT NULL DEFAULT ''`,
+		},
+	},
 }
 
 // migrate brings the database up to len(migrations). It runs each pending

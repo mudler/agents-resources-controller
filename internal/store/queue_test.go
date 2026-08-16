@@ -228,7 +228,7 @@ func TestQueuedJobOnUnhealthyDeviceIsNotAssigned(t *testing.T) {
 
 	_, err := s.Enqueue(enq("agent-a", 0))
 	require.NoError(t, err)
-	require.NoError(t, s.SetDeviceState("gpubox:gpu0", model.DeviceUnhealthy, c.Now()))
+	require.NoError(t, s.SetDeviceState("gpubox:gpu0", model.DeviceUnhealthy, c.Now(), ""))
 
 	assigned, err := s.ScheduleOnce()
 	require.NoError(t, err)

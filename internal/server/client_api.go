@@ -101,12 +101,38 @@ type DeviceView struct {
 	// rather than being laundered into looking like the freshest possible
 	// reading — matching formatAge's rule on the CLI side.
 	OldestLabelAgeSeconds *int `json:"oldest_label_age_seconds,omitempty"`
+	// QuarantineReason is why this device is out of the pool: the verify
+	// probe's stderr, a failed acquire hook, `worker_lost`, `registration`,
+	// or empty when a row was quarantined before reasons were recorded.
+	// Empty on every healthy device, so its presence alone answers "is
+	// something wrong here".
+	//
+	// It is on the fleet view rather than only on DescribeResponse because
+	// a page that announces `unhealthy` and offers a "clear" button without
+	// saying what happened is asking an operator to act on a problem it
+	// declined to describe — they would have to leave for `rc describe` to
+	// find out what they were about to return to the pool.
+	QuarantineReason string `json:"quarantine_reason,omitempty"`
 }
 
 type StateResponse struct {
 	Devices []DeviceView `json:"devices"`
 	Jobs    []model.Job  `json:"jobs"`
 	Queued  []model.Job  `json:"queued"`
+	// QueuedWaitingSeconds is how long each queued job has been waiting,
+	// keyed by job ID, measured by the controller against its own clock.
+	//
+	// A sibling map rather than a field on model.Job: Job is the stored
+	// shape and every other field on it is a stored value, while this is
+	// derived at read time. Keeping it beside the list also makes the
+	// addition purely additive for the existing consumers of `queued`
+	// (`rc ps` renders it via RenderJobs).
+	//
+	// Queued alone is not a useful thing to show — nine seconds is normal,
+	// forty minutes is a problem — and the wait is computed here for the
+	// same reason every other age is: a reader's clock must not be able to
+	// make a stuck queue look fresh.
+	QueuedWaitingSeconds map[string]int `json:"queued_waiting_seconds,omitempty"`
 }
 
 // describeRecentJobs bounds how much job history `rc describe` shows: five
@@ -119,12 +145,15 @@ const describeRecentJobs = 5
 // label with its provenance and age, the humans' own usage notes and how
 // stale THEY are, and its recent job history.
 type DescribeResponse struct {
-	Device              model.Device  `json:"device"`
-	Holder              string        `json:"holder,omitempty"`
-	JobID               string        `json:"job_id,omitempty"`
-	ElapsedSeconds      int           `json:"elapsed_seconds"`
-	HeartbeatAgeSeconds int           `json:"heartbeat_age_seconds"`
-	Labels              []model.Label `json:"labels,omitempty"`
+	Device              model.Device `json:"device"`
+	Holder              string       `json:"holder,omitempty"`
+	JobID               string       `json:"job_id,omitempty"`
+	ElapsedSeconds      int          `json:"elapsed_seconds"`
+	HeartbeatAgeSeconds int          `json:"heartbeat_age_seconds"`
+	// QuarantineReason says why this device is out of the pool — see
+	// DeviceView.QuarantineReason, which this mirrors. Empty when healthy.
+	QuarantineReason string        `json:"quarantine_reason,omitempty"`
+	Labels           []model.Label `json:"labels,omitempty"`
 	// LabelAgeSeconds is how long ago each label in Labels was last
 	// confirmed, computed by the controller against its own clock (see
 	// deviceViews' HeartbeatAgeSeconds, which does the same for the same
@@ -295,6 +324,7 @@ func (s *Server) handleDescribe(w http.ResponseWriter, r *http.Request) {
 		JobID:               view.JobID,
 		ElapsedSeconds:      view.ElapsedSeconds,
 		HeartbeatAgeSeconds: view.HeartbeatAgeSeconds,
+		QuarantineReason:    view.QuarantineReason,
 		Labels:              labels,
 		LabelAgeSeconds:     labelAges,
 		Sheet:               sheet,
@@ -717,7 +747,24 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, StateResponse{Devices: views, Jobs: jobs, Queued: queued})
+	// Measured here, on the controller's clock, for the reason given on
+	// QueuedWaitingSeconds itself. QueuedAt is when the job actually entered
+	// the queue; SubmittedAt is the fallback for a row written before that
+	// column existed, which is a shorter wait than the truth but never a
+	// longer one — this must not be able to invent a stuck queue.
+	waiting := make(map[string]int, len(queued))
+	now := s.cfg.Clock.Now()
+	for _, j := range queued {
+		since := j.SubmittedAt
+		if j.QueuedAt != nil {
+			since = *j.QueuedAt
+		}
+		waiting[j.ID] = int(now.Sub(since).Seconds())
+	}
+
+	writeJSON(w, http.StatusOK, StateResponse{
+		Devices: views, Jobs: jobs, Queued: queued, QueuedWaitingSeconds: waiting,
+	})
 }
 
 // oldestLabelAge returns how long ago the least-recently-confirmed label in
@@ -794,6 +841,41 @@ func (s *Server) deviceViews() ([]DeviceView, error) {
 			}
 		}
 		out = append(out, v)
+	}
+
+	// One query for every quarantined device, not one per device — the same
+	// N+1 rule AllLabels exists for. Only unhealthy devices are asked about,
+	// so a healthy fleet issues no query at all, and the reasons are read
+	// after every other statement above has closed its rows (MaxOpenConns(1)
+	// makes an overlapping query a deadlock, not a slowdown).
+	var quarantined []string
+	for _, v := range out {
+		if v.Device.State == model.DeviceUnhealthy {
+			quarantined = append(quarantined, v.Device.ID)
+		}
+	}
+	if len(quarantined) > 0 {
+		reasons, err := s.cfg.Store.QuarantineReasons(quarantined)
+		if err != nil {
+			return nil, err
+		}
+		details, err := s.cfg.Store.QuarantineDetails(quarantined)
+		if err != nil {
+			return nil, err
+		}
+		for i := range out {
+			id := out[i].Device.ID
+			// The operator-facing explanation when there is one, the
+			// category otherwise. A reader always gets a sentence rather
+			// than sometimes getting nothing: "worker_lost" is a poor
+			// explanation but it is a true one, and a device quarantined
+			// before this column existed still has its category.
+			if d := details[id]; d != "" {
+				out[i].QuarantineReason = d
+			} else {
+				out[i].QuarantineReason = reasons[id]
+			}
+		}
 	}
 	return out, nil
 }

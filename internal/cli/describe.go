@@ -67,6 +67,13 @@ func RenderDescribe(w io.Writer, out *server.DescribeResponse) error {
 		fmt.Fprintln(tw, "  free\t")
 	}
 	fmt.Fprintf(tw, "  heartbeat\t%s\n", formatAge(time.Duration(out.HeartbeatAgeSeconds)*time.Second))
+	// Why a device is out of the pool is the reason anyone runs describe on
+	// an unhealthy one, so it goes in the header block with the state rather
+	// than below the labels: an operator deciding whether to clear it should
+	// not have to scroll past a screen of facts to find out what happened.
+	if out.QuarantineReason != "" {
+		fmt.Fprintf(tw, "  out of the pool\t%s\n", out.QuarantineReason)
+	}
 
 	fmt.Fprintln(tw)
 	fmt.Fprintln(tw, "LABELS")
