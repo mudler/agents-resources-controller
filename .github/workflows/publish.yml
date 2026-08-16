@@ -1,14 +1,19 @@
 name: publish
 
-# Publishes the controller image to GitHub Container Registry.
+# Publishes two images to GitHub Container Registry.
 #
-# master  -> ghcr.io/<owner>/resource-controller:master (and :edge, a
-#            rename-proof alias for the same image)
+# ghcr.io/<owner>/resource-controller: the CONTROLLER. Device-attached workers
+# are not containerised: a worker has to see and signal the processes
+# touching the hardware, so it runs on the device host itself (see the
+# README).
+#
+# ghcr.io/<owner>/rc-worker: the rc binary plus kubectl, for the pod worker
+# that runs as a Kubernetes DaemonSet and drains/uncordons its own node via
+# lease hooks. It is FROM the controller image built earlier in this same
+# job, so it must be built after it.
+#
+# master  -> :master (and :edge, a rename-proof alias for the same image)
 # v1.2.3  -> :1.2.3, :1.2, :1, :latest
-#
-# The image is the CONTROLLER. Workers are not containerised: a worker has to
-# see and signal the processes touching the hardware, so it runs on the device
-# host itself (see the README).
 
 on:
   push:
@@ -90,6 +95,44 @@ jobs:
           subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: true
 
+      # The worker image is FROM ghcr.io/mudler/resource-controller:edge, so it
+      # must be built after the controller push above lands a fresh :edge.
+      - id: meta-worker
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/rc-worker
+          tags: |
+            type=ref,event=branch
+            type=raw,value=edge,enable=${{ github.ref == 'refs/heads/master' }}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha,format=long
+          labels: |
+            org.opencontainers.image.title=rc-worker
+            org.opencontainers.image.description=rc worker plus kubectl, for Kubernetes lease hooks
+
+      - id: build-worker
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: images/rc-worker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta-worker.outputs.tags }}
+          labels: ${{ steps.meta-worker.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true
+
+      - name: attest worker provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ghcr.io/${{ github.repository_owner }}/rc-worker
+          subject-digest: ${{ steps.build-worker.outputs.digest }}
+          push-to-registry: true
+
       - name: summary
         run: |
           {
@@ -97,7 +140,9 @@ jobs:
             echo
             echo '```'
             echo "${{ steps.meta.outputs.tags }}"
+            echo "${{ steps.meta-worker.outputs.tags }}"
             echo '```'
             echo
-            echo "digest: \`${{ steps.build.outputs.digest }}\`"
+            echo "controller digest: \`${{ steps.build.outputs.digest }}\`"
+            echo "worker digest: \`${{ steps.build-worker.outputs.digest }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
