@@ -38,10 +38,18 @@ type Server struct {
 	cfg    Config
 	notify *notifier
 	events *broadcaster
+	// tty holds the live interactive sessions. In memory and deliberately
+	// not persisted — see tty.go.
+	tty *ttyRegistry
 }
 
 func New(cfg Config) *Server {
-	return &Server{cfg: cfg, notify: newNotifier(), events: newBroadcaster()}
+	return &Server{
+		cfg:    cfg,
+		notify: newNotifier(),
+		events: newBroadcaster(),
+		tty:    newTTYRegistry(),
+	}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -55,10 +63,18 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /v1/jobs/{id}/status", s.require("worker", s.handleJobStatus))
 	mux.Handle("POST /v1/devices/{id}/fault", s.require("worker", s.handleDeviceFault))
 
+	// The two halves of an interactive session the worker dials out for. Both
+	// are worker routes: a client token that could open them would be able to
+	// inject output into somebody else's terminal and read their keystrokes.
+	mux.Handle("POST /v1/jobs/{id}/tty/out", s.require("worker", s.handleTTYWorkerOut))
+	mux.Handle("GET /v1/jobs/{id}/tty/in", s.require("worker", s.handleTTYWorkerIn))
+
 	mux.Handle("POST /v1/jobs", s.require("client", s.handleSubmit))
 	mux.Handle("GET /v1/jobs/{id}", s.require("client", s.handleGetJob))
 	mux.Handle("POST /v1/jobs/{id}/kill", s.require("client", s.handleKill))
 	mux.Handle("GET /v1/jobs/{id}/logs", s.require("client", s.handleStreamLogs))
+	mux.Handle("GET /v1/jobs/{id}/tty/out", s.require("client", s.handleTTYClientOut))
+	mux.Handle("POST /v1/jobs/{id}/tty/in", s.require("client", s.handleTTYClientIn))
 	mux.Handle("GET /v1/devices", s.require("client", s.handleDevices))
 	mux.Handle("GET /v1/devices/{id}/describe", s.require("client", s.handleDescribe))
 	mux.Handle("GET /v1/explain", s.require("client", s.handleExplain))
