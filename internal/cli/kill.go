@@ -3,7 +3,7 @@ package cli
 import (
 	"fmt"
 
-	"github.com/mudler/agents-resources-controller/internal/client"
+	"github.com/mudler/resource-controller/internal/client"
 	"github.com/spf13/cobra"
 )
 

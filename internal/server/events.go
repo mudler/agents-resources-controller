@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/mudler/agents-resources-controller/internal/model"
+	"github.com/mudler/resource-controller/internal/model"
 )
 
 // eventWriteTimeout bounds every write to an SSE connection. Without a

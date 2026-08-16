@@ -10,8 +10,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/mudler/agents-resources-controller/internal/model"
-	"github.com/mudler/agents-resources-controller/internal/selector"
+	"github.com/mudler/resource-controller/internal/model"
+	"github.com/mudler/resource-controller/internal/selector"
 )
 
 // ErrRuntimeAboveCeiling means the job asked for more wall clock than the

@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mudler/agents-resources-controller/internal/model"
+	"github.com/mudler/resource-controller/internal/model"
 	"github.com/stretchr/testify/require"
 )
 

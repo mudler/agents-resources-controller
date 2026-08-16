@@ -8,7 +8,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/mudler/agents-resources-controller/internal/cli"
+	"github.com/mudler/resource-controller/internal/cli"
 	"github.com/spf13/cobra"
 )
 

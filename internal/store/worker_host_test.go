@@ -4,7 +4,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/mudler/agents-resources-controller/internal/store"
+	"github.com/mudler/resource-controller/internal/store"
 	"github.com/stretchr/testify/require"
 )
 

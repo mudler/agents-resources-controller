@@ -49,7 +49,7 @@ design — see "Deliberately out of scope" in the [README](../README.md).
 ### Without Docker
 
 ```sh
-go install github.com/mudler/agents-resources-controller/cmd/rc@latest   # -> $GOPATH/bin/rc
+go install github.com/mudler/resource-controller/cmd/rc@latest   # -> $GOPATH/bin/rc
 ```
 
 or build from a checkout:
@@ -126,7 +126,7 @@ Put the binary on the host:
 
 ```sh
 # same binary as the controller
-go install github.com/mudler/agents-resources-controller/cmd/rc@latest
+go install github.com/mudler/resource-controller/cmd/rc@latest
 # or scp the static binary you built
 ```
 

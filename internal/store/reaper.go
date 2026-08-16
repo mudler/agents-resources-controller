@@ -5,7 +5,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mudler/agents-resources-controller/internal/model"
+	"github.com/mudler/resource-controller/internal/model"
 )
 
 // A quarantine reason records WHY a device was taken out of the pool, which

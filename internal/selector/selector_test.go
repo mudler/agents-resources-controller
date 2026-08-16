@@ -3,7 +3,7 @@ package selector_test
 import (
 	"testing"
 
-	"github.com/mudler/agents-resources-controller/internal/selector"
+	"github.com/mudler/resource-controller/internal/selector"
 	"github.com/stretchr/testify/require"
 )
 

@@ -13,9 +13,9 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/mudler/agents-resources-controller/internal/model"
-	"github.com/mudler/agents-resources-controller/internal/notify"
-	"github.com/mudler/agents-resources-controller/internal/store"
+	"github.com/mudler/resource-controller/internal/model"
+	"github.com/mudler/resource-controller/internal/notify"
+	"github.com/mudler/resource-controller/internal/store"
 )
 
 // maxLogChunk bounds a single log upload. A worker whose chunk exceeds this

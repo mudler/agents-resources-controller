@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mudler/agents-resources-controller/internal/logstore"
+	"github.com/mudler/resource-controller/internal/logstore"
 	"github.com/stretchr/testify/require"
 )
 

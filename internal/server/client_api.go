@@ -7,9 +7,9 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/mudler/agents-resources-controller/internal/model"
-	"github.com/mudler/agents-resources-controller/internal/selector"
-	"github.com/mudler/agents-resources-controller/internal/store"
+	"github.com/mudler/resource-controller/internal/model"
+	"github.com/mudler/resource-controller/internal/selector"
+	"github.com/mudler/resource-controller/internal/store"
 )
 
 // SubmitRequest deliberately has no lease-TTL field: stage 1 enforces no

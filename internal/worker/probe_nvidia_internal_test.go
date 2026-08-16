@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mudler/agents-resources-controller/internal/selector"
+	"github.com/mudler/resource-controller/internal/selector"
 )
 
 // TestNvidiaLabelsParsesPresentDriver exercises the path that only runs when

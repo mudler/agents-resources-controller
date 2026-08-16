@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/mudler/agents-resources-controller/internal/model"
+	"github.com/mudler/resource-controller/internal/model"
 )
 
 // ReplaceLabels makes the stored labels for one device and one source exactly

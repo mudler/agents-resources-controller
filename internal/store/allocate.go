@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/mudler/agents-resources-controller/internal/model"
+	"github.com/mudler/resource-controller/internal/model"
 )
 
 // ErrNoDevice means nothing matching the request was free. Stage 1 has no

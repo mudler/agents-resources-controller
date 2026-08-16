@@ -13,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/mudler/agents-resources-controller/internal/model"
+	"github.com/mudler/resource-controller/internal/model"
 )
 
 // holdSleeper is the command execute runs for a hold (kind == "hold"),

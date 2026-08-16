@@ -11,8 +11,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mudler/agents-resources-controller/internal/clock"
-	"github.com/mudler/agents-resources-controller/internal/model"
+	"github.com/mudler/resource-controller/internal/clock"
+	"github.com/mudler/resource-controller/internal/model"
 	_ "modernc.org/sqlite"
 )
 

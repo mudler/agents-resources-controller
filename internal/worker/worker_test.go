@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mudler/agents-resources-controller/internal/worker"
+	"github.com/mudler/resource-controller/internal/worker"
 	"github.com/stretchr/testify/require"
 )
 

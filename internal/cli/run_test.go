@@ -7,9 +7,9 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/mudler/agents-resources-controller/internal/cli"
-	"github.com/mudler/agents-resources-controller/internal/model"
-	"github.com/mudler/agents-resources-controller/internal/server"
+	"github.com/mudler/resource-controller/internal/cli"
+	"github.com/mudler/resource-controller/internal/model"
+	"github.com/mudler/resource-controller/internal/server"
 	"github.com/stretchr/testify/require"
 )
 

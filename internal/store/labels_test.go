@@ -3,7 +3,7 @@ package store_test
 import (
 	"testing"
 
-	"github.com/mudler/agents-resources-controller/internal/model"
+	"github.com/mudler/resource-controller/internal/model"
 	"github.com/stretchr/testify/require"
 )
 

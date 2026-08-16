@@ -14,9 +14,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mudler/agents-resources-controller/internal/client"
-	"github.com/mudler/agents-resources-controller/internal/model"
-	"github.com/mudler/agents-resources-controller/internal/notify"
+	"github.com/mudler/resource-controller/internal/client"
+	"github.com/mudler/resource-controller/internal/model"
+	"github.com/mudler/resource-controller/internal/notify"
 	"github.com/stretchr/testify/require"
 )
 
