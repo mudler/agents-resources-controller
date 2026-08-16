@@ -11,8 +11,16 @@
 
 services:
   controller:
+    # The published image, so this file works on its own — curl it into an
+    # empty directory next to a .env and `docker compose up -d` is the whole
+    # install. RC_VERSION pins a release; the default tracks master.
+    #
+    # To build from a checkout instead of pulling:
+    #   docker compose build && docker compose up -d
+    # (that overrides the tag above with your local build)
+    image: ghcr.io/mudler/agents-resources-controller:${RC_VERSION:-edge}
     build: .
-    image: agents-resources-controller:latest
+    pull_policy: ${RC_PULL_POLICY:-always}
     container_name: rc-controller
     restart: unless-stopped
     environment:

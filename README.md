@@ -1,3 +1,5 @@
+<img src="assets/logo.svg" alt="rc" height="52">
+
 # resource-controller
 
 Exclusive leases for shared hardware, across hosts, with the state visible.
@@ -5,6 +7,89 @@ Exclusive leases for shared hardware, across hosts, with the state visible.
 Replaces a `flock` file mutex: a central controller owns allocation in a
 single SQLite transaction, workers on device hosts supervise the jobs, and
 `rc ps` / `rc devices` show who holds what.
+
+```sh
+rc run --select 'vram>=40G' -- python train.py
+```
+
+That claims a matching GPU somewhere in the fleet, runs the command on the
+host that owns it, streams the output back, releases the device, and exits
+with the command's exit code.
+
+**New here?** [How it works](#how-it-works) · [Install](docs/install.md) ·
+[Guide for agents](docs/agents.md)
+
+## How it works
+
+Three pieces, and the direction of the arrows is the thing to understand:
+
+```
+    you / your agent                    ┌──────────────────────┐
+    ─────────────────                   │      CONTROLLER      │
+      rc run                            │                      │
+      rc devices        ── HTTP ───────▶│  owns allocation     │
+      rc describe                       │  SQLite, one txn     │
+      rc hold                           │  queue + scheduler   │
+                                        │  dashboard :8080     │
+    browser  ── HTTP ──────────────────▶│                      │
+                                        └──────────────────────┘
+                                              ▲          ▲
+                                              │          │
+                            long-poll for work│          │(same, from
+                            + heartbeats      │          │ every host)
+                                              │          │
+                            ┌─────────────────┴──┐  ┌────┴───────────────┐
+                            │  WORKER on gpubox-a│  │ WORKER on gpubox-b │
+                            │  runs your command │  │                    │
+                            │  as a process group│  │  gpu0  gpu1        │
+                            │  gpu0 … gpu3       │  │                    │
+                            └────────────────────┘  └────────────────────┘
+```
+
+**Workers dial out. The controller never connects to your machines.** A worker
+runs *on* the device host and long-polls the controller for assignments over
+plain HTTP. When one arrives it forks the command locally as a process group,
+streams the logs back, and reports the outcome.
+
+That has consequences worth knowing up front:
+
+- **There is no SSH anywhere in this system.** The controller holds no
+  credentials for your hosts and never opens a connection to them. Hosts
+  behind NAT or a firewall work fine as long as they can reach the
+  controller.
+- **The command runs on the device host**, not where you typed it. Paths must
+  exist there. Nothing is copied for you — this is not a deployment tool.
+- **The worker cannot be containerised.** It supervises the real processes
+  touching the hardware, so it has to see and signal them. Only the
+  *controller* ships as an image.
+- **A lost client is not a lost job.** If your `rc run` dies, the worker keeps
+  running the job and the lease stays valid. Re-attach with `rc attach`.
+
+The lease itself is one SQLite transaction — device `ready → busy`, job
+updated, lease row inserted, all or nothing — behind a partial unique index
+that permits exactly one live lease per device. That transaction is the whole
+guarantee.
+
+### How a machine describes itself
+
+A device is not just a name. Each carries **labels** — some declared by the
+operator in the worker's config, some detected at runtime by probes
+(`gpu_model`, `driver_version`, `cpus`, `disk_free_bytes`, …) — and each host
+can publish a **usage sheet**: free-form Markdown saying how that box is meant
+to be used. Reaching it, where the scratch space is, what not to run at the
+same time.
+
+So a client asks for what it needs rather than naming a box, and reads the
+sheet to learn the rest:
+
+```sh
+rc devices --select 'vram>=40G'   # what can do this work, and is it free?
+rc describe gpubox-a:gpu0          # labels, provenance, freshness, usage sheet
+```
+
+That is the self-discovery path, and it is why an agent needs no hardcoded
+inventory. See [Labels and probes](#labels-and-probes) and [Usage sheets and
+`rc describe`](#usage-sheets-and-rc-describe).
 
 ## Scope
 
@@ -49,6 +134,10 @@ and nothing below assumes them:
 | A controller-side operator annotation layered over a usage sheet | The spec allows one ("the host file wins on conflict"), but it was never built — a usage sheet is exactly what the host's `host.md`/`host.d/*.md` say, full stop; `host_docs` is keyed `(host, device_id)` with no annotation layer on top |
 
 ## Controller
+
+> Setting this up for the first time? [docs/install.md](docs/install.md) is
+> the step-by-step version — Docker image, systemd units, and a worker on
+> each host. This section is the reference.
 
 ```sh
 export RC_TOKENS='wtok:worker,ctok:client,atok:admin'
@@ -698,14 +787,26 @@ heal.
 
 ## Client
 
+> Pointing an AI agent at this fleet? Hand it
+> [docs/agents.md](docs/agents.md) — it is written to be read by an agent and
+> covers discovery, selectors, holds, and the rules that keep a shared fleet
+> working. This section is the reference.
+
 ```sh
 export RC_CONTROLLER=https://rc.internal.example
 export RC_TOKEN=ctok
+export RC_SUBMITTER=agent-a            # optional: who you are, in rc ps
 
 rc devices                              # who holds what, and what has gone quiet
 rc ps                                   # running/assigned jobs
 rc run -d gpubox:gpu0 --cwd /src -- ./bench --args
 ```
+
+`RC_SUBMITTER` sets the identity `--as` would otherwise carry, so a session
+says who it is once instead of repeating `--as` on every `run`, `hold`, `kill`
+and `release` — forgetting it on the kill is what leaves you unable to stop
+your own job. An explicit `--as` still wins. With no identity set at all, `rc`
+derives one from `$USER`, the hostname, and `$CLAUDE_SESSION_ID` when present.
 
 `rc run` claims the device, blocks, streams the job's combined stdout/stderr
 to your terminal, and exits with the job's own exit code — so it drops into

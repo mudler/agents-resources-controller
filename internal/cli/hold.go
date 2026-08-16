@@ -166,7 +166,7 @@ func NewHoldCmd() *cobra.Command {
 	cmd.Flags().StringVar(&selector, "select", "", "device selector, e.g. vram>=40G (mutually exclusive with a positional device ID)")
 	cmd.Flags().DurationVar(&ttl, "ttl", 0, "how long to hold the device — required, capped by the device's max_runtime")
 	cmd.Flags().StringVar(&reason, "reason", "", "why you're holding it, shown in rc devices and the dashboard")
-	cmd.Flags().StringVar(&as, "as", "", "identity shown in rc ps (defaults to user@host/session)")
+	cmd.Flags().StringVar(&as, "as", "", "identity shown in rc ps (defaults to $RC_SUBMITTER, else user@host/session)")
 	return cmd
 }
 
@@ -194,6 +194,6 @@ func NewReleaseCmd() *cobra.Command {
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&as, "as", "", "identity to authorise the release (defaults to user@host/session)")
+	cmd.Flags().StringVar(&as, "as", "", "identity to authorise the release (defaults to $RC_SUBMITTER, else user@host/session)")
 	return cmd
 }

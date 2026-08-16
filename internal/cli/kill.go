@@ -29,7 +29,7 @@ func NewKillCmd() *cobra.Command {
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&as, "as", "", "identity to authorise the kill (defaults to user@host/session)")
+	cmd.Flags().StringVar(&as, "as", "", "identity to authorise the kill (defaults to $RC_SUBMITTER, else user@host/session)")
 	return cmd
 }
 

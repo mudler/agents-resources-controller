@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -50,6 +51,18 @@ const waitTerminalTimeout = 5 * time.Minute
 const killTimeout = 10 * time.Second
 
 func defaultSubmitter() string {
+	// RC_SUBMITTER is for agents: a session says who it is once, in its
+	// environment, instead of repeating --as on every run, hold, kill and
+	// release. Forgetting it on the kill is the failure that matters —
+	// the run succeeds under one identity and the kill is then refused
+	// with not_job_owner. Whitespace-only is treated as unset: that is
+	// the shape of `export RC_SUBMITTER=$SOMETHING_UNSET`, a mistake
+	// rather than a request for a blank identity, and a blank submitter
+	// would make the ownership check vacuous for every job on the fleet.
+	// An explicit --as still wins over this; see the flag's callers.
+	if s := strings.TrimSpace(os.Getenv("RC_SUBMITTER")); s != "" {
+		return s
+	}
 	user := os.Getenv("USER")
 	host, _ := os.Hostname()
 	if session := os.Getenv("CLAUDE_SESSION_ID"); session != "" {
@@ -280,7 +293,7 @@ func NewRunCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&explain, "explain", false,
 		"with --select, report which devices match, how many are free, and the queue depth, then exit without submitting")
 	cmd.Flags().StringVar(&cwd, "cwd", "", "working directory on the device host")
-	cmd.Flags().StringVar(&as, "as", "", "identity shown in rc ps (defaults to user@host/session)")
+	cmd.Flags().StringVar(&as, "as", "", "identity shown in rc ps (defaults to $RC_SUBMITTER, else user@host/session)")
 	cmd.Flags().IntVar(&priority, "priority", 0, fmt.Sprintf(
 		"queue priority, %d..%d; higher runs sooner within a device's queue",
 		server.MinPriority, server.MaxPriority))
