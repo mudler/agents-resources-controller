@@ -20,7 +20,12 @@ services:
     # (that overrides the tag above with your local build)
     image: ghcr.io/mudler/resource-controller:${RC_VERSION:-edge}
     build: .
-    pull_policy: ${RC_PULL_POLICY:-always}
+    # "missing", not "always": with a build stanza present, `always` makes
+    # `docker compose up` pull the published image straight over a local
+    # `docker compose build`, silently discarding it. Pulls still happen on
+    # first run (nothing local yet); use `docker compose pull` to move an
+    # existing install forward.
+    pull_policy: ${RC_PULL_POLICY:-missing}
     container_name: rc-controller
     restart: unless-stopped
     environment:

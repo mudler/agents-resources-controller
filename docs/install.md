@@ -231,7 +231,7 @@ shared fleet working.
 
 ## Upgrading
 
-Controller: `docker compose pull && docker compose up -d`. Migrations run at
+Controller: `docker compose pull && docker compose up -d` (the pull is what moves you forward; `up` alone keeps the image you already have). Migrations run at
 startup and are append-only, so an older database is brought forward
 automatically. **Back up `--data` first anyway.**
 
