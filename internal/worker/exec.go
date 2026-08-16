@@ -51,10 +51,6 @@ func Run(ctx context.Context, spec JobSpec, sink io.Writer) Result {
 	if len(spec.Command) == 0 {
 		return Result{ExitCode: -1, Err: errors.New("empty command")}
 	}
-	grace := spec.GraceCeiling
-	if grace <= 0 {
-		grace = 10 * time.Second
-	}
 
 	// clock is shared between the stdout and stderr writers below (even when
 	// they end up wrapping different underlying sinks) so the idle watchdog
@@ -82,6 +78,46 @@ func Run(ctx context.Context, spec JobSpec, sink io.Writer) Result {
 		return Result{ExitCode: -1, Err: fmt.Errorf("start: %w", err)}
 	}
 	pgid := cmd.Process.Pid // Setpgid makes the child its own group leader.
+
+	return runSupervised(ctx, cmd, pgidTarget(pgid), spec, clock)
+}
+
+// processTarget abstracts "the thing SIGTERM/SIGKILL are aimed at" so
+// runSupervised below serves both Run's plain process group and startPTY's
+// whole terminal session through the SAME sequence, rather than forking into
+// two copies of it. A piped job with no controlling terminal is fully
+// described by one process group (pgidTarget, in this file). An
+// interactive shell attached to a PTY additionally does job control, which
+// moves each backgrounded command into its own process group within the
+// session — pty.go's sessionTarget reaches all of them.
+type processTarget interface {
+	// signal sends sig to the target and reports whether it reached
+	// anything, straight from the underlying kill(2) return value.
+	signal(sig syscall.Signal) (delivered bool)
+	// alive reports whether anything belonging to the target still exists.
+	alive() bool
+}
+
+// pgidTarget targets a single process group by id, exactly as Run has always
+// killed the jobs it spawns.
+type pgidTarget int
+
+func (t pgidTarget) signal(sig syscall.Signal) bool {
+	// Negative pid addresses the whole group.
+	return syscall.Kill(-int(t), sig) == nil
+}
+
+func (t pgidTarget) alive() bool { return groupAlive(int(t)) }
+
+// runSupervised is the single implementation of "kill the whole target on
+// cancellation, SIGTERM -> grace -> SIGKILL, then mop up stragglers" that
+// both Run (via pgidTarget) and startPTY (via sessionTarget) rely on. cmd
+// must already have been started; runSupervised owns waiting on it.
+func runSupervised(ctx context.Context, cmd *exec.Cmd, target processTarget, spec JobSpec, clock *idleClock) Result {
+	grace := spec.GraceCeiling
+	if grace <= 0 {
+		grace = 10 * time.Second
+	}
 
 	// runCtx is what actually drives cancellation below: ctx cancelling is one
 	// way to trip it, but the watchdogs below are a second, internal way to
@@ -127,11 +163,6 @@ func Run(ctx context.Context, spec JobSpec, sink io.Writer) Result {
 	waitErr := make(chan error, 1)
 	go func() { waitErr <- cmd.Wait() }()
 
-	killGroup := func(sig syscall.Signal) error {
-		// Negative pid addresses the whole group.
-		return syscall.Kill(-pgid, sig)
-	}
-
 	select {
 	case err := <-waitErr:
 		return finish(err)
@@ -173,33 +204,33 @@ func Run(ctx context.Context, spec JobSpec, sink io.Writer) Result {
 		// without). The mislabel always lands in the safe direction: a good
 		// result gets discarded as cancelled, but a cancelled run is never
 		// mistaken for a valid one.
-		delivered := killGroup(syscall.SIGTERM) == nil
+		delivered := target.signal(syscall.SIGTERM)
 
 		var err error
 		select {
 		case err = <-waitErr:
 		case <-time.After(grace):
-			_ = killGroup(syscall.SIGKILL)
+			target.signal(syscall.SIGKILL)
 			err = <-waitErr
 		}
 
 		res := finish(err)
 
-		// The group leader being reaped does not mean the group is empty: a
+		// The group leader being reaped does not mean the target is empty: a
 		// grandchild that detached from the inherited stdio and ignored
 		// SIGTERM (a CUDA worker, say) can outlive it. Don't declare victory
-		// over a group that still has members — finish it off, bounded, and
-		// say so honestly if something still won't die.
-		stragglers := groupAlive(pgid)
+		// while it still has members — finish it off, bounded, and say so
+		// honestly if something still won't die.
+		stragglers := target.alive()
 		if stragglers {
-			_ = killGroup(syscall.SIGKILL)
-			if !awaitGroupExit(pgid, stragglerWait) {
+			target.signal(syscall.SIGKILL)
+			if !awaitTargetExit(target, stragglerWait) {
 				cancelReason = "cancelled; survivors remained after SIGKILL"
 			}
 		}
 
 		if delivered || stragglers {
-			// SIGTERM reached at least one member of the group (or a
+			// SIGTERM reached at least one member of the target (or a
 			// straggler needed forcing out after the fact): this run was
 			// cancelled. Keep the real ExitCode from the wait status, but
 			// the label belongs to us, not to whatever exit path the
@@ -208,7 +239,7 @@ func Run(ctx context.Context, spec JobSpec, sink io.Writer) Result {
 			res.Reason = cancelReason
 		}
 		// Otherwise the process had already exited by the time the signal
-		// went out and nothing in the group was left to reach: report the
+		// went out and nothing in the target was left to reach: report the
 		// real outcome rather than a cancellation that never landed.
 
 		// A watchdog trip is a more specific — and more useful — label than
@@ -233,17 +264,17 @@ func groupAlive(pgid int) bool {
 	return syscall.Kill(-pgid, 0) == nil
 }
 
-// awaitGroupExit polls, bounded by timeout, until process group pgid has no
-// members left. It never blocks indefinitely.
-func awaitGroupExit(pgid int, timeout time.Duration) bool {
+// awaitTargetExit polls, bounded by timeout, until target has no members
+// left. It never blocks indefinitely.
+func awaitTargetExit(target processTarget, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if !groupAlive(pgid) {
+		if !target.alive() {
 			return true
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	return !groupAlive(pgid)
+	return !target.alive()
 }
 
 // finish translates the raw error from cmd.Wait() into a Result. Ground

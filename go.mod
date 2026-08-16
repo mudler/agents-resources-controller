@@ -3,6 +3,7 @@ module github.com/mudler/resource-controller
 go 1.26.1
 
 require (
+	github.com/creack/pty v1.1.24
 	github.com/google/uuid v1.6.0
 	github.com/spf13/cobra v1.10.2
 	github.com/stretchr/testify v1.11.1
