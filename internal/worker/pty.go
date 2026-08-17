@@ -273,8 +273,14 @@ func liveProcExists(want func(procStat) bool) (live, scanned bool) {
 	return false, true
 }
 
-// procStat is the three fields this worker reads out of /proc/<pid>/stat.
+// procStat is the four fields this worker reads out of /proc/<pid>/stat.
 type procStat struct {
+	// pid is the process's own id (field 1). It is here so a predicate
+	// handed to liveProcExists can exclude a specific process — the worker
+	// itself, when asking "is anything ELSE alive in my PID namespace" — and
+	// so a predicate can go on to read another file under /proc/<pid>/ for
+	// the same process without a second walk of /proc. See recovery.go.
+	pid int
 	// state is proc(5)'s single-character state. Only 'Z' (zombie: exited,
 	// unreaped) is interpreted here, and only to mean "not really there".
 	state byte
@@ -291,26 +297,31 @@ func readProcStat(pid int) (procStat, bool) {
 	return parseProcStat(data)
 }
 
-// parseProcStat extracts the state, process group and session ids (fields 3,
-// 5 and 6 in proc(5), 1-indexed) from the raw contents of a /proc/<pid>/stat
-// file. The comm field (field 2) is parenthesized and may itself contain
-// spaces or even parens (a process can name itself anything via prctl/argv[0]),
-// so fields are located from the LAST ')' rather than by naive whitespace
-// splitting, exactly as proc(5) documents.
+// parseProcStat extracts the pid, state, process group and session ids
+// (fields 1, 3, 5 and 6 in proc(5), 1-indexed) from the raw contents of a
+// /proc/<pid>/stat file. The comm field (field 2) is parenthesized and may
+// itself contain spaces or even parens (a process can name itself anything
+// via prctl/argv[0]), so the fields after it are located from the LAST ')'
+// rather than by naive whitespace splitting, exactly as proc(5) documents —
+// and the pid, which precedes comm, is read from the front for the same
+// reason.
 func parseProcStat(data []byte) (procStat, bool) {
-	i := strings.LastIndexByte(string(data), ')')
-	if i < 0 || i+2 >= len(data) {
+	s := string(data)
+	open := strings.IndexByte(s, '(')
+	i := strings.LastIndexByte(s, ')')
+	if open < 0 || i < open || i+2 >= len(data) {
 		return procStat{}, false
 	}
+	pid, err0 := strconv.Atoi(strings.TrimSpace(s[:open]))
 	// Fields after ") ": state(1) ppid(2) pgrp(3) session(4) ...
-	fields := strings.Fields(string(data[i+2:]))
+	fields := strings.Fields(s[i+2:])
 	if len(fields) < 4 {
 		return procStat{}, false
 	}
 	pgrp, err1 := strconv.Atoi(fields[2])
 	sess, err2 := strconv.Atoi(fields[3])
-	if err1 != nil || err2 != nil || fields[0] == "" {
+	if err0 != nil || err1 != nil || err2 != nil || fields[0] == "" {
 		return procStat{}, false
 	}
-	return procStat{state: fields[0][0], pgid: pgrp, sid: sess}, true
+	return procStat{pid: pid, state: fields[0][0], pgid: pgrp, sid: sess}, true
 }

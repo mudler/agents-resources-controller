@@ -2,7 +2,9 @@ package worker
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -98,6 +100,20 @@ type Config struct {
 	// <SheetDir>/host.md and <SheetDir>/host.d/<device>.md. Optional; falls
 	// back to defaultSheetDir.
 	SheetDir string `yaml:"sheet_dir"`
+	// RequireManualClear stops this worker from claiming anything at
+	// registration about processes left behind by an interrupted job (see
+	// recovery.go), so its quarantined devices keep the behaviour they have
+	// always had: they come back when an admin runs `rc clear`, or when a
+	// proven reboot answers them, and not otherwise.
+	//
+	// It only ever points one way. There is deliberately NO setting that
+	// forces auto-recovery, because that is the only direction in which a
+	// misconfigured switch hands out a device with a live process on it: a
+	// mistake here costs a manual clear, and nothing worse. That asymmetry is
+	// also why it is ORed rather than overridden by the environment (see
+	// LoadConfig) — every source can make this worker more cautious, and none
+	// can make it less.
+	RequireManualClear bool `yaml:"require_manual_clear"`
 }
 
 // HooksConfig is the host-level default for lease lifecycle hooks. A
@@ -214,6 +230,30 @@ func (c Config) withDefaults() Config {
 	return c
 }
 
+// envRequiresManualClear reads RC_REQUIRE_MANUAL_CLEAR. Unset or blank is
+// false — that is the shape of `RC_REQUIRE_MANUAL_CLEAR=$SOMETHING_UNSET`,
+// which is a mistake rather than a request.
+//
+// A value that is set but not recognisable as a boolean is treated as TRUE,
+// with a warning. That is the opposite of what a parser normally does, and
+// it is the whole point: somebody typed something into a switch whose only
+// job is to be more careful, and the two ways to be wrong here are not
+// symmetric. Reading "yes please" as "no" would silently hand devices back
+// to the pool on a host whose operator asked for the opposite.
+func envRequiresManualClear() bool {
+	raw := strings.TrimSpace(os.Getenv("RC_REQUIRE_MANUAL_CLEAR"))
+	if raw == "" {
+		return false
+	}
+	v, err := strconv.ParseBool(raw)
+	if err != nil {
+		slog.Warn("RC_REQUIRE_MANUAL_CLEAR is set to a value that is not a boolean; treating it as true, since this setting exists to be cautious",
+			"value", raw)
+		return true
+	}
+	return v
+}
+
 // LoadConfig reads /etc/rc/worker.yaml (or another path) and applies defaults.
 func LoadConfig(path string) (Config, error) {
 	b, err := os.ReadFile(path)
@@ -238,6 +278,19 @@ func LoadConfig(path string) (Config, error) {
 	// register unauthenticated.
 	if c.Token == "" {
 		c.Token = strings.TrimSpace(os.Getenv("RC_TOKEN"))
+	}
+	// RC_REQUIRE_MANUAL_CLEAR exists for the same reason RC_TOKEN does: a
+	// containerised worker is configured by a ConfigMap it does not template,
+	// so a per-host decision has to be expressible as an environment
+	// variable.
+	//
+	// It ORs with the file rather than overriding it, which is where it
+	// deliberately differs from RC_TOKEN. A token has one correct value and
+	// the file is the authority on it; this is a safety catch, and a safety
+	// catch that an environment variable can switch OFF is one that gets
+	// switched off by accident. Either source turning it on turns it on.
+	if envRequiresManualClear() {
+		c.RequireManualClear = true
 	}
 	if c.Host == "" {
 		h, err := os.Hostname()

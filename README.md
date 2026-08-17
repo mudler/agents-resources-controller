@@ -239,6 +239,12 @@ probe_interval: 5m               # optional; default shown
 verify_dir: /etc/rc/verify.d     # optional; default shown — see "Verify probes"
 verify_timeout: 30s              # optional; default shown — per verify script
 sheet_dir: /etc/rc               # optional; default shown — host.md lives here
+# require_manual_clear: true     # optional; off by default. Stops this worker
+#                                # claiming anything about processes left over
+#                                # from an interrupted job, so its quarantined
+#                                # devices come back only via `rc clear` or a
+#                                # proven reboot. RC_REQUIRE_MANUAL_CLEAR sets
+#                                # it too, and can only ever turn it ON.
 devices:
   # Object form: max_runtime is a per-device runtime ceiling the controller
   # enforces at submit time and the worker enforces as a wall-clock watchdog
@@ -361,6 +367,51 @@ worker can prove the host actually rebooted:
 A worker with no boot ID at all (the `/proc` file unreadable, e.g. inside
 some containers) is treated the same as an unchanged one: no proof, so it
 quarantines rather than guesses.
+
+**A reboot is not the only proof a worker can offer.** Registration also
+carries what the worker can establish about processes left over from an
+interrupted job, and the controller clears the same three causes
+(`worker_lost`, `lease_expired`, `registration`) on the strength of it:
+
+- **Isolation.** A worker that is PID 1 in a PID namespace containing
+  nothing but itself is in a container that was just recreated, so every
+  process from a previous job died with the namespace they lived in. This is
+  *derived*, never declared: there is deliberately no "I am containerised"
+  setting, because a flag that must match reality eventually will not, and
+  the dangerous direction fails silently.
+- **A survivor check.** On a host, a worker restart does not kill the jobs it
+  started — they are reparented to init and may still be running. The worker
+  looks for live processes carrying `RC_JOB_ID` (every process a job spawns
+  inherits it) and reports what it found. Finding none clears the
+  quarantine; finding one does not; and being unable to look — most
+  realistically a worker not running as root, which cannot read another
+  user's `/proc/<pid>/environ` — reports nothing at all, which leaves the
+  device exactly where it was.
+
+`fault` is never cleared this way, for the same reason a reboot does not
+clear it. Neither is a device with a live lease, nor one whose quarantine
+cause was never recorded.
+
+**Flap protection:** a device that recovers automatically three times inside
+an hour stops doing so and waits for a human. A card that quarantines,
+clears and quarantines again is describing a real problem, and a controller
+that silently keeps putting it back hides it.
+
+Every automatic recovery emits a `device_recovered` event (see
+[Event notifications](#event-notifications)) naming the device, what it
+was quarantined for, and which proof brought it back — so "why is this
+device back?" never requires reading the controller's logs.
+
+**`require_manual_clear`** (worker config, or `RC_REQUIRE_MANUAL_CLEAR` in
+the environment) turns this off for a host that wants the old behaviour: the
+worker then claims nothing and its devices come back only through `rc clear`
+or a proven reboot. The setting only ever points one way — there is no
+setting that *forces* automatic recovery, since that is the only direction
+in which a misconfiguration hands out a device with a live process on it.
+For the same reason the environment variable can only turn it on: an
+explicit `require_manual_clear: true` in the config file cannot be switched
+off by `RC_REQUIRE_MANUAL_CLEAR=false`, and a value that is set but not a
+boolean is read as `true`.
 
 The job's environment receives `RC_JOB_ID` and `RC_DEVICE` (the assigned
 device ID), plus `CUDA_VISIBLE_DEVICES` derived by convention: **device
@@ -1127,7 +1178,7 @@ strings when they do not apply (a `job_lost` from a sweep knows the job but
 not the device it was on). `at` is UTC, stamped when the event was raised,
 not when it was delivered.
 
-There are six kinds, and no others:
+There are seven kinds, and no others:
 
 | `event` | Raised when |
 |---|---|
@@ -1136,6 +1187,7 @@ There are six kinds, and no others:
 | `device_unhealthy` | A device left the pool for any other reason: a failed `on_acquire` hook, an expired lease, a quarantine a sweep could not attribute to a lost worker. A verify failure is reported as `verify_failed` only — never as both, so a consumer counting devices lost cannot double count |
 | `worker_lost` | A sweep wrote a worker off after `5m` of silence and quarantined its devices |
 | `job_lost` | That same sweep marked the jobs that worker was supervising `lost` |
+| `device_recovered` | A quarantined device came back to the pool on proof from its worker rather than an operator's clear: the worker restarted in an isolated PID namespace, or checked for processes left over from its previous run and found none. `reason` names both what the device was quarantined for and which proof answered it. Never emitted for a `fault`, which no proof clears, and at most three times per device per hour — after that the device waits for a human |
 | `lease_expired` | A lease lapsed with nobody renewing it. The job is named. Its device is quarantined too, and gets its own `device_unhealthy` — but only when that sweep has not already announced that device, and only while `lease_expired` is still the reason on it: a device already out of the pool for another cause keeps that cause and was announced when it happened |
 
 One receiver's log across an afternoon of things going wrong — a verify

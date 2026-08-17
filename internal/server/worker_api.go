@@ -49,6 +49,20 @@ type RegisterRequest struct {
 	BootID  string       `json:"boot_id,omitempty"`
 	Devices []DeviceSpec `json:"devices"`
 
+	// Recovery is what this worker can prove about processes left behind by
+	// a job its previous incarnation was running — the cheap sibling of
+	// BootID, which proves the same thing by having rebooted the machine.
+	// See model.RecoveryProof and store.AutoRecover.
+	//
+	// It is a plain value, not a pointer, and absent means the zero value:
+	// a worker predating this field, one that could not determine anything,
+	// and one configured to require a manual clear are indistinguishable
+	// here on purpose. All three mean "no proof", and no proof means the
+	// device stays quarantined exactly as it does today. There is no shape
+	// of this field, and no missing field, that can force a device back
+	// into the pool.
+	Recovery model.RecoveryProof `json:"recovery,omitzero"`
+
 	// Labels is this registration's freshly detected device facts: the
 	// empty key "" holds host-wide facts merged into every device (a
 	// device-scoped value wins any key collision), any other key names one
@@ -240,6 +254,36 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// Auto-recovery runs here, after UpsertWorker has finished reconciling
+	// whatever the previous process left in flight — which is what writes the
+	// "registration" quarantine this pass most often answers — and before the
+	// response goes back, so a worker that proved its device is clean sees it
+	// schedulable by the time it starts polling.
+	//
+	// A failure here never fails the registration. The worst outcome of
+	// skipping it is that the device stays quarantined, which is precisely
+	// today's behaviour and the safe direction; refusing the registration
+	// instead would take a worker that is otherwise perfectly healthy out of
+	// the fleet over a bookkeeping table.
+	recovered, err := s.cfg.Store.AutoRecover(workerID, req.Recovery)
+	if err != nil {
+		slog.Error("auto-recovery pass failed; the worker's quarantined devices stay out of the pool",
+			"worker", workerID, "host", req.Host, "err", err)
+	}
+	for _, r := range recovered {
+		// Both a log line and an event: the log is for whoever is already
+		// tailing the controller, the event is so nobody has to be. See the
+		// design's observability section — an operator must be able to answer
+		// "why is this device back?" without reading these logs.
+		slog.Info("device returned to the pool by proof from its worker",
+			"device", r.DeviceID, "quarantined_for", r.Reason, "proof", req.Recovery.Summary())
+		s.emit(notify.Event{
+			Kind:   notify.KindDeviceRecovered,
+			Device: r.DeviceID,
+			Reason: fmt.Sprintf("was quarantined for %s; %s", r.Reason, req.Recovery.Summary()),
+		})
+	}
+
 	deviceNames := make([]string, 0, len(req.Devices))
 	for _, dev := range req.Devices {
 		deviceNames = append(deviceNames, dev.Name)
