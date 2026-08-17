@@ -63,6 +63,9 @@ func defaultSubmitter() string {
 	if s := strings.TrimSpace(os.Getenv("RC_SUBMITTER")); s != "" {
 		return s
 	}
+	if s := userConfigValue(func(c userConfig) string { return c.Submitter }); s != "" {
+		return s
+	}
 	user := os.Getenv("USER")
 	host, _ := os.Hostname()
 	if session := os.Getenv("CLAUDE_SESSION_ID"); session != "" {
@@ -446,7 +449,15 @@ func controllerURL() string {
 	if v := os.Getenv("RC_CONTROLLER"); v != "" {
 		return v
 	}
+	if v := userConfigValue(func(c userConfig) string { return c.Controller }); v != "" {
+		return v
+	}
 	return "http://localhost:8080"
 }
 
-func controllerToken() string { return os.Getenv("RC_TOKEN") }
+func controllerToken() string {
+	if v := os.Getenv("RC_TOKEN"); v != "" {
+		return v
+	}
+	return userConfigValue(func(c userConfig) string { return c.Token })
+}
