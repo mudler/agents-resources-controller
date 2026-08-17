@@ -791,10 +791,23 @@ heal.
 
 ## Client
 
-> Pointing an AI agent at this fleet? Hand it
-> [docs/agents.md](docs/agents.md) — it is written to be read by an agent and
-> covers discovery, selectors, holds, and the rules that keep a shared fleet
-> working. This section is the reference.
+> Pointing an AI agent at this fleet? Two ways, same material:
+>
+> - **Install the skill.** [`skills/leasing-a-gpu/`](skills/leasing-a-gpu/SKILL.md)
+>   is a ready-made agent skill. Copy or symlink that directory into wherever
+>   your agent looks for skills (`~/.claude/skills/`, `~/.codex/skills/`, …) and
+>   the agent picks it up on its own whenever a task needs a GPU — no need to
+>   remember to paste anything.
+> - **Hand over the doc.** [docs/agents.md](docs/agents.md) is the same guidance
+>   as prose, for an agent that has no skill mechanism.
+>
+> Both are fleet-agnostic on purpose: they tell the agent to discover your boxes
+> with `rc devices` and `rc describe` rather than hardcoding names. Describe
+> what is peculiar about a box — where its shared storage is mounted, how to get
+> files onto it — in that host's [usage sheet](#usage-sheets-and-rc-describe),
+> and the agent reads it from `rc describe`.
+>
+> This section is the reference.
 
 ```sh
 export RC_CONTROLLER=https://rc.internal.example
