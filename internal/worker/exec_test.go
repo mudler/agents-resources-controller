@@ -222,6 +222,44 @@ func TestCancellationReportIsSelfConsistent(t *testing.T) {
 	}
 }
 
+// The round-2 PTY review found that spec.GraceCeiling's actual DURATION was
+// unguarded: every other test's target process dies to SIGTERM immediately
+// (default disposition), so the SIGTERM -> grace -> SIGKILL window's length
+// is never on the critical path and a bug that silently substituted the
+// hardcoded 10s default for spec.GraceCeiling would still leave the whole
+// suite green. This pins the duration itself: a leader that traps SIGTERM
+// (so the only way to end it is SIGKILL after grace elapses) with a short
+// GraceCeiling must be killed close to that ceiling, not anywhere near the
+// 10s default.
+func TestGraceCeilingDurationIsHonored(t *testing.T) {
+	var out syncBuf
+	ctx, cancel := context.WithCancel(context.Background())
+
+	done := make(chan worker.Result, 1)
+	start := time.Now()
+	go func() {
+		done <- worker.Run(ctx, worker.JobSpec{
+			Command:      []string{"sh", "-c", "trap '' TERM; while true; do sleep 0.05; done"},
+			GraceCeiling: 200 * time.Millisecond,
+		}, &out)
+	}()
+
+	// Give the shell a moment to install its trap before cancelling, so the
+	// SIGTERM the cancellation below sends is actually ignored by it (as
+	// intended) rather than killing an unstarted process by default
+	// disposition — the same justification exec_test.go already uses in
+	// TestCancelledJobTrappingSIGTERMIsNotReportedSuccessful.
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+
+	res := <-done
+	elapsed := time.Since(start)
+
+	require.True(t, res.Killed)
+	require.Less(t, elapsed, 3*time.Second,
+		"GraceCeiling=200ms does not appear to have been honored; a hardcoded 10s default would take far longer than this bound")
+}
+
 // waitForChildPID extracts a "child:<pid>" line the spawned shell printed
 // to out, once it appears.
 func waitForChildPID(t *testing.T, out *syncBuf) int {

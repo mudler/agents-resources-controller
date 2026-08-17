@@ -165,7 +165,7 @@ func runSupervised(ctx context.Context, cmd *exec.Cmd, target processTarget, spe
 
 	select {
 	case err := <-waitErr:
-		return finish(err)
+		return finishClean(err, target)
 	case <-runCtx.Done():
 		// select picks randomly when both cases are simultaneously ready, so
 		// a job that finished in the same instant we observed cancellation
@@ -180,7 +180,7 @@ func runSupervised(ctx context.Context, cmd *exec.Cmd, target processTarget, spe
 		for spins := 0; spins < 200; spins++ {
 			select {
 			case err := <-waitErr:
-				return finish(err)
+				return finishClean(err, target)
 			default:
 			}
 			runtime.Gosched()
@@ -221,12 +221,9 @@ func runSupervised(ctx context.Context, cmd *exec.Cmd, target processTarget, spe
 		// SIGTERM (a CUDA worker, say) can outlive it. Don't declare victory
 		// while it still has members — finish it off, bounded, and say so
 		// honestly if something still won't die.
-		stragglers := target.alive()
-		if stragglers {
-			target.signal(syscall.SIGKILL)
-			if !awaitTargetExit(target, stragglerWait) {
-				cancelReason = "cancelled; survivors remained after SIGKILL"
-			}
+		stragglers, allGone := reapStragglers(target)
+		if stragglers && !allGone {
+			cancelReason = "cancelled; survivors remained after SIGKILL"
 		}
 
 		if delivered || stragglers {
@@ -275,6 +272,48 @@ func awaitTargetExit(target processTarget, timeout time.Duration) bool {
 		time.Sleep(20 * time.Millisecond)
 	}
 	return !target.alive()
+}
+
+// reapStragglers checks whether anything is still alive under target and, if
+// so, force-kills it and waits (bounded by stragglerWait) for it to actually
+// go away. found reports whether anything was there to reap; allGone reports
+// whether it was successfully gone by the time this returned (only
+// meaningful when found is true — it is unconditionally true otherwise, so a
+// caller can test `found && !allGone` without a separate check).
+//
+// It is used both after the primary process has already been signalled (the
+// cancellation path) and after a completely ordinary, un-cancelled exit (see
+// finishClean) — a background job surviving its parent doesn't care which
+// path ended the parent.
+func reapStragglers(target processTarget) (found, allGone bool) {
+	if !target.alive() {
+		return false, true
+	}
+	target.signal(syscall.SIGKILL)
+	return true, awaitTargetExit(target, stragglerWait)
+}
+
+// finishClean turns a wait error into a Result the way finish does, but also
+// reaps anything still alive under target before returning. This closes the
+// gap a clean, un-cancelled exit used to leave open: under Run, cmd.Wait()
+// blocking on an inherited pipe until every process holding it closes tends
+// to mask a leaked grandchild by accident (the pipe just doesn't reach EOF
+// yet), but a PTY session has no such pipe to block on — Wait() returns the
+// instant the shell itself exits. The ordinary way an interactive session
+// ends is the operator typing `exit`, the leader exiting 0 immediately; that
+// must not report success while a background job it spawned (`sleep 300 &`)
+// keeps running and keeps holding the GPU.
+func finishClean(err error, target processTarget) Result {
+	res := finish(err)
+	if found, allGone := reapStragglers(target); found {
+		res.Killed = true
+		if allGone {
+			res.Reason = "stragglers reaped after exit"
+		} else {
+			res.Reason = "stragglers remained after exit"
+		}
+	}
+	return res
 }
 
 // finish translates the raw error from cmd.Wait() into a Result. Ground

@@ -8,10 +8,22 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/creack/pty"
+)
+
+// defaultRows and defaultCols are what a session starts at before any
+// caller has sent a real terminal size. Leaving a PTY at its zero value
+// (what pty.Start alone gives you — nothing calls TIOCSWINSZ before the
+// process starts) is a real 0x0 to any program that asks: vim, less, and
+// top all misbehave on it. 24x80 is the traditional terminal default and a
+// safe size for a client that never gets around to sending a resize.
+const (
+	defaultRows = 24
+	defaultCols = 80
 )
 
 // ptySession is a job whose stdio is a real pseudo-terminal instead of
@@ -26,10 +38,15 @@ type ptySession struct {
 	f    *os.File // the PTY master; doubles as the terminal's ReadWriteCloser.
 	cmd  *exec.Cmd
 	sid  int // session id; pty.Start makes the child lead a new session, so sid == the child's own pid.
-	ctx  context.Context
 	spec JobSpec
 
+	ctx    context.Context
+	cancel context.CancelFunc
+
 	clock *idleClock
+
+	waitOnce sync.Once
+	waitRes  Result
 }
 
 // startPTY spawns spec.Command attached to a new pseudo-terminal, in its own
@@ -57,18 +74,26 @@ func startPTY(ctx context.Context, spec JobSpec) (*ptySession, error) {
 	// (which lets Run split them for a sink that parses stdout on its own) has
 	// no meaning here and is intentionally not consulted.
 
-	f, err := pty.Start(cmd)
+	f, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: defaultRows, Cols: defaultCols})
 	if err != nil {
 		return nil, fmt.Errorf("start pty: %w", err)
 	}
 
+	// sessionCtx/cancel are internal to the session, derived from the
+	// caller's ctx: cancelling ctx cancels sessionCtx exactly as before, but
+	// Close (below) can now also trip it directly, without requiring the
+	// caller to hold onto and cancel its own context just to tear a session
+	// down.
+	sessionCtx, cancel := context.WithCancel(ctx)
+
 	return &ptySession{
-		f:     f,
-		cmd:   cmd,
-		sid:   cmd.Process.Pid,
-		ctx:   ctx,
-		spec:  spec,
-		clock: newIdleClock(time.Now()),
+		f:      f,
+		cmd:    cmd,
+		sid:    cmd.Process.Pid,
+		spec:   spec,
+		ctx:    sessionCtx,
+		cancel: cancel,
+		clock:  newIdleClock(time.Now()),
 	}, nil
 }
 
@@ -89,12 +114,30 @@ func (s *ptySession) Write(p []byte) (int, error) {
 	return s.f.Write(p)
 }
 
-// Close closes the PTY master. The process is not explicitly signalled here
-// — losing the master hangs up the terminal, which the kernel delivers to
-// the session's foreground process group as SIGHUP — but a caller that wants
-// the supervised kill sequence (and the guarantee that backgrounded children
-// die too) should cancel the context passed to startPTY and call Wait.
+// Close ends the session and reaps it: it cancels the session's internal
+// context — the same trigger cancelling the ctx passed to startPTY would
+// pull — which drives Wait's full supervised kill sequence (SIGTERM, grace,
+// SIGKILL, and the session-wide straggler sweep across every process group
+// job control created), then closes the PTY master once that has finished.
+//
+// This used to just close the master and rely on the kernel's SIGHUP, which
+// only reaches the foreground process group — a caller that called Close
+// without ever separately calling Wait (as the tests in this file's first
+// three cases do) leaked one unreaped zombie per session, permanently: the
+// process had exited, but nothing had called cmd.Wait() to collect it.
+// Making Close itself perform the full teardown, rather than documenting
+// that callers must remember to call Wait first, is deliberate: a future
+// caller — the streaming relay this task exists for — closing the terminal
+// on client disconnect is exactly the scenario that leaked, and that rule is
+// exactly the kind a refactor silently breaks if it's only written down.
+//
+// Calling Wait yourself first (the normal interactive-session shape: a
+// goroutine blocked in Wait while the caller relays I/O) is unaffected —
+// Close's internal call to Wait is idempotent and returns the same cached
+// Result.
 func (s *ptySession) Close() error {
+	s.cancel()
+	s.Wait()
 	return s.f.Close()
 }
 
@@ -104,13 +147,23 @@ func (s *ptySession) Resize(rows, cols uint16) error {
 	return pty.Setsize(s.f, &pty.Winsize{Rows: rows, Cols: cols})
 }
 
-// Wait blocks until the process exits or the context passed to startPTY is
-// cancelled, then applies the same supervised kill sequence Run uses —
-// escalated to the whole session (sessionTarget) rather than one process
-// group, for the job-control reason explained on startPTY. It returns a
-// Result compatible with Run's.
+// Wait blocks until the process exits or the context passed to startPTY (or
+// Close) is cancelled, then applies the same supervised kill sequence Run
+// uses — escalated to the whole session (sessionTarget) rather than one
+// process group, for the job-control reason explained on startPTY. It
+// returns a Result compatible with Run's.
+//
+// Wait runs the supervision sequence exactly once, however many times it or
+// Close are called (from however many goroutines): the first call does the
+// work, every other call blocks until that finishes and then returns the
+// same cached Result. That is what lets Close call Wait unconditionally
+// without either re-running the kill sequence on an already-finished
+// session or racing a caller who is already blocked in its own Wait call.
 func (s *ptySession) Wait() Result {
-	return runSupervised(s.ctx, s.cmd, sessionTarget(s.sid), s.spec, s.clock)
+	s.waitOnce.Do(func() {
+		s.waitRes = runSupervised(s.ctx, s.cmd, sessionTarget(s.sid), s.spec, s.clock)
+	})
+	return s.waitRes
 }
 
 // sessionTarget targets every process group that belongs to Linux session
@@ -120,6 +173,21 @@ func (s *ptySession) Wait() Result {
 // Ctrl-C hits only the foreground job); those groups all remain members of
 // the same session, but a plain kill(-pgid) aimed at just the shell's own
 // group never reaches them.
+//
+// Known residual, accepted rather than closed here: a process that calls
+// setsid(2) itself — most commonly a daemonizing tool like tmux or screen,
+// which is often the very first thing an operator runs in a session they
+// might get disconnected from — leaves the session it was started in
+// entirely and becomes invisible to this scan. It reports a normal
+// termination signal delivered to everything WE can still see, so Wait can
+// still return Killed: true while that detached process keeps running.
+// Double-fork and ordinary nested backgrounding do not escape this — only
+// an explicit new session does. Closing that fully needs
+// PR_SET_CHILD_SUBREAPER plus a descendant walk, or a cgroup v2 scope per
+// lease; neither is implemented here. The existing backstop is Stage 4's
+// post-job verify probes, which quarantine a device whose VRAM is still
+// pinned after the job the controller thinks ended — precisely this
+// failure — so it does not go undetected, just undetected by this function.
 type sessionTarget int
 
 func (t sessionTarget) signal(sig syscall.Signal) (delivered bool) {
@@ -166,15 +234,22 @@ func sessionProcessGroups(sid int) []int {
 }
 
 // procGroupAndSession reads /proc/<pid>/stat and extracts the process group
-// and session ids (fields 5 and 6 in proc(5), 1-indexed). The comm field
-// (field 2) is parenthesized and may itself contain spaces or parens, so
-// fields are located from the LAST ')' rather than by naive whitespace
-// splitting, exactly as proc(5) documents.
+// and session ids via parseStatGroupAndSession.
 func procGroupAndSession(pid int) (pgid, sid int, ok bool) {
 	data, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
 	if err != nil {
 		return 0, 0, false
 	}
+	return parseStatGroupAndSession(data)
+}
+
+// parseStatGroupAndSession extracts the process group and session ids
+// (fields 5 and 6 in proc(5), 1-indexed) from the raw contents of a
+// /proc/<pid>/stat file. The comm field (field 2) is parenthesized and may
+// itself contain spaces or even parens (a process can name itself anything
+// via prctl/argv[0]), so fields are located from the LAST ')' rather than by
+// naive whitespace splitting, exactly as proc(5) documents.
+func parseStatGroupAndSession(data []byte) (pgid, sid int, ok bool) {
 	i := strings.LastIndexByte(string(data), ')')
 	if i < 0 || i+2 >= len(data) {
 		return 0, 0, false
