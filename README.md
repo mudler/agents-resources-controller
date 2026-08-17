@@ -228,12 +228,6 @@ itself, not in a container.
 
 Write `/etc/rc/worker.yaml` (see `examples/worker.yaml`):
 
-> Running the worker on a real GPU box? `examples/cloud-init/` has two
-> drop-in configs from the reference fleet: shared storage for `/workspace`,
-> and a resilience config (default-route guard, zram, IPv6 RA) covering
-> failures that took a box off the network for an hour and quarantined devices
-> under memory pressure. Optional, and each says why it exists.
-
 ```yaml
 controller_url: https://rc.internal.example
 token: replace-with-worker-token
