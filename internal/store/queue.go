@@ -49,6 +49,9 @@ type EnqueueRequest struct {
 	// Reason is why a hold was taken; carried through to the job row and,
 	// at assignment, copied onto the lease row (see assignQueued).
 	Reason string
+	// Stdio is model.StdioLogs, StdioTTY or StdioPipe. Validating it is the
+	// submit handler's job, as with Kind: Enqueue only persists it.
+	Stdio string
 }
 
 // SetDeviceMaxRuntime records the ceiling a host declares for one of its
@@ -205,12 +208,12 @@ func (s *Store) Enqueue(req EnqueueRequest) (*model.Job, error) {
 	if _, err := tx.Exec(
 		`INSERT INTO jobs (id, selector, command, cwd, env, submitter, idempotency_key,
 		                   state, device_id, worker_id, submitted_at, queued_at,
-		                   priority, max_runtime, idle_timeout, kind, reason)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?)`,
+		                   priority, max_runtime, idle_timeout, kind, reason, stdio)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?)`,
 		id, req.Selector, string(cmdJSON), req.Cwd, string(envJSON), req.Submitter, key,
 		string(model.JobQueued), req.DeviceID, now.Unix(), now.Unix(),
 		req.Priority, int64(req.MaxRuntime.Seconds()), int64(req.IdleTimeout.Seconds()),
-		kind, req.Reason,
+		kind, req.Reason, req.Stdio,
 	); err != nil {
 		return nil, fmt.Errorf("insert queued job: %w", err)
 	}

@@ -129,6 +129,22 @@ var migrations = []struct {
 			`ALTER TABLE devices ADD COLUMN quarantine_detail TEXT NOT NULL DEFAULT ''`,
 		},
 	},
+	{
+		name: "interactive stdio mode",
+		stmts: []string{
+			// Where this job's standard streams are wired: '' (the log
+			// store, which is every job written before this column existed
+			// and every ordinary job since), 'tty' or 'pipe'. See
+			// model.StdioLogs for what the three mean.
+			//
+			// The default is load-bearing rather than incidental: an
+			// existing row read back as an attached mode would have the
+			// worker sit waiting for a relay half that nobody is ever going
+			// to open, so the empty string has to be what a pre-existing job
+			// says.
+			`ALTER TABLE jobs ADD COLUMN stdio TEXT NOT NULL DEFAULT ''`,
+		},
+	},
 }
 
 // migrate brings the database up to len(migrations). It runs each pending

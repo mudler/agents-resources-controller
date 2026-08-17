@@ -211,11 +211,11 @@ func (s *Store) Job(id string) (*model.Job, error) {
 	err := s.db.QueryRow(
 		`SELECT id, selector, command, cwd, env, submitter, idempotency_key, state,
 		        device_id, worker_id, exit_code, kill_reason, submitted_at, started_at, finished_at,
-		        priority, max_runtime, idle_timeout, queued_at, kind, reason
+		        priority, max_runtime, idle_timeout, queued_at, kind, reason, stdio
 		 FROM jobs WHERE id = ?`, id,
 	).Scan(&j.ID, &j.Selector, &cmdJSON, &j.Cwd, &envJSON, &j.Submitter, &idem, &j.State,
 		&j.DeviceID, &j.WorkerID, &exitCode, &j.KillReason, &submitted, &started, &finished,
-		&priority, &maxRuntime, &idleTimeout, &queuedAt, &j.Kind, &j.Reason)
+		&priority, &maxRuntime, &idleTimeout, &queuedAt, &j.Kind, &j.Reason, &j.Stdio)
 	if err != nil {
 		return nil, err
 	}

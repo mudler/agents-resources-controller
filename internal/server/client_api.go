@@ -56,6 +56,11 @@ type SubmitRequest struct {
 	// rc devices and the dashboard via the lease it is copied onto. Only
 	// meaningful for a hold.
 	Reason string `json:"reason,omitempty"`
+	// Stdio is model.StdioLogs (the default), StdioTTY or StdioPipe: where
+	// this job's standard streams are wired. The two attached modes put the
+	// process on the controller's in-memory relay instead of the log store —
+	// see model.StdioLogs and internal/server/tty.go.
+	Stdio string `json:"stdio,omitempty"`
 }
 
 // holdCommand is the fixed, meaningless-by-design command recorded on a
@@ -485,10 +490,31 @@ func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusBadRequest, "bad_request", "a hold requires --ttl")
 			return
 		}
+		// Same rule as the command, cwd and env above, for the same reason:
+		// what a hold runs is the worker's sleeper. Attaching a terminal to
+		// it would be attaching to a process the submitter never chose, and
+		// `rc run --tty` is the supported way to ask for a shell.
+		if req.Stdio != model.StdioLogs {
+			writeErr(w, http.StatusBadRequest, "bad_request",
+				"a hold may not ask for a terminal: it runs the worker's own sleeper — use `rc run --tty` for an interactive session")
+			return
+		}
 		req.Command = holdCommand
 	default:
 		writeErr(w, http.StatusBadRequest, "bad_request",
 			fmt.Sprintf("unknown kind %q: must be %q or %q", req.Kind, model.LeaseKindJob, model.LeaseKindHold))
+		return
+	}
+	// An unknown mode is refused rather than quietly treated as the default:
+	// a caller that asked for a terminal and silently got the log store
+	// instead would sit forever waiting to attach to a session no worker is
+	// ever going to open.
+	switch req.Stdio {
+	case model.StdioLogs, model.StdioTTY, model.StdioPipe:
+	default:
+		writeErr(w, http.StatusBadRequest, "bad_request",
+			fmt.Sprintf("unknown stdio %q: must be %q, %q or %q", req.Stdio,
+				model.StdioLogs, model.StdioTTY, model.StdioPipe))
 		return
 	}
 	switch {
@@ -535,6 +561,7 @@ func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 		IdleTimeout: time.Duration(req.IdleTimeoutSeconds) * time.Second,
 		Kind:        kind,
 		Reason:      req.Reason,
+		Stdio:       req.Stdio,
 	})
 	if errors.Is(err, store.ErrRuntimeAboveCeiling) {
 		writeErr(w, http.StatusBadRequest, "runtime_above_ceiling", err.Error())

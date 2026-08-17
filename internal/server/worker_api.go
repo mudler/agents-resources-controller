@@ -129,6 +129,11 @@ type Assignment struct {
 	// internal/worker's execute — rather than trusting what is stored
 	// here, which for a hold is a fixed, meaningless placeholder.
 	Kind string `json:"kind,omitempty"`
+	// Stdio is model.StdioLogs, StdioTTY or StdioPipe. The worker is the
+	// side that dials out, so this is the only way it ever learns that a job
+	// wants its stdio spliced onto the relay rather than batched into the
+	// log store.
+	Stdio string `json:"stdio,omitempty"`
 }
 
 // PollResponse is the envelope handleAssignments answers a long-poll with: it
@@ -523,7 +528,7 @@ func (s *Server) handleAssignments(w http.ResponseWriter, r *http.Request) {
 				out = append(out, Assignment{
 					JobID: j.ID, DeviceID: j.DeviceID, Command: j.Command, Cwd: j.Cwd, Env: j.Env,
 					MaxRuntimeSeconds: j.MaxRuntimeSeconds, IdleTimeoutSeconds: j.IdleTimeoutSeconds,
-					Submitter: j.Submitter, Kind: j.Kind,
+					Submitter: j.Submitter, Kind: j.Kind, Stdio: j.Stdio,
 				})
 			}
 			writeJSON(w, http.StatusOK, PollResponse{Assignments: out, Kills: kills})
