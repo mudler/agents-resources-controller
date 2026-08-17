@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -40,8 +41,17 @@ func TestDefaultSubmitterTrimsRCSubmitter(t *testing.T) {
 }
 
 // Unset RC_SUBMITTER keeps the previous behaviour exactly.
+//
+// RC_SUBMITTER is not the only source that outranks the derived identity: so
+// does ~/.config/rc/config.yaml, and without pointing RC_CONFIG somewhere
+// empty this test reads whatever the person running it happens to have in
+// their real home directory. It passed on a machine with no config and failed
+// on a machine with one, which is the worst way for a test to be wrong.
 func TestDefaultSubmitterFallsBackToUserHostSession(t *testing.T) {
 	t.Setenv("RC_SUBMITTER", "")
+	t.Setenv("RC_CONFIG", filepath.Join(t.TempDir(), "absent.yaml"))
+	resetUserConfig()
+	t.Cleanup(resetUserConfig)
 	t.Setenv("USER", "mudler")
 	t.Setenv("CLAUDE_SESSION_ID", "abc123")
 

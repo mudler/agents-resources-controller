@@ -44,6 +44,12 @@ type assignment struct {
 	// execute — because the sleeper a hold runs is this worker's choice,
 	// never the submitter's.
 	Kind string `json:"kind,omitempty"`
+	// Stdio is model.StdioLogs (empty — every job that exists today),
+	// StdioTTY or StdioPipe. This is the only way this worker ever learns
+	// that a job's stdio belongs on the controller's relay rather than in
+	// the log store: the worker is the side that dials out, so nothing can
+	// tell it after the fact. See relay.go.
+	Stdio string `json:"stdio,omitempty"`
 }
 
 // deviceSpec is what this worker declares about one of its devices at
@@ -107,8 +113,14 @@ type heartbeatRequest struct {
 }
 
 type Worker struct {
-	cfg      Config
-	http     *http.Client
+	cfg  Config
+	http *http.Client
+	// stream is for the relay's two halves and deliberately has NO timeout.
+	// http's two-minute bound is right for a request that is supposed to
+	// answer; it would cut an interactive session off mid-sentence exactly
+	// two minutes in, which is a bug that would have looked like a network
+	// problem for as long as it took someone to time it.
+	stream   *http.Client
 	workerID string
 
 	mu      sync.Mutex
@@ -193,6 +205,7 @@ func New(cfg Config) *Worker {
 	return &Worker{
 		cfg:             cfg,
 		http:            &http.Client{Timeout: 2 * time.Minute},
+		stream:          &http.Client{},
 		running:         map[string]context.CancelFunc{},
 		started:         map[string]struct{}{},
 		hooks:           hooks,
@@ -1087,13 +1100,26 @@ func (w *Worker) execute(ctx context.Context, a assignment) {
 	}
 
 	sink := &logSink{w: w, jobID: a.JobID, ctx: reportCtx}
-	res := Run(jobCtx, JobSpec{
+	jobSpec := JobSpec{
 		Command:     command,
 		Cwd:         a.Cwd,
 		Env:         env,
 		MaxRuntime:  time.Duration(a.MaxRuntimeSeconds) * time.Second,
 		IdleTimeout: time.Duration(a.IdleTimeoutSeconds) * time.Second,
-	}, sink)
+	}
+
+	// The one branch this whole feature adds to the job path. Everything
+	// above it (hooks, env, the hold substitution) and everything below it
+	// (the terminal report, verify, the release linger) is shared: an
+	// attached job is an ordinary job with different stdio, and treating it
+	// as a second kind of execution is how the supervision that makes
+	// `--tty` worth having over `ssh` would get lost.
+	var res Result
+	if model.StdioAttached(a.Stdio) {
+		res = w.runAttached(jobCtx, a, jobSpec, sink)
+	} else {
+		res = Run(jobCtx, jobSpec, sink)
+	}
 	sink.Flush()
 
 	state := model.JobSucceeded

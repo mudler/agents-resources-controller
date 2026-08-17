@@ -30,6 +30,14 @@ type JobSpec struct {
 	// would otherwise corrupt the parse — sets this to keep the streams
 	// apart.
 	Stderr io.Writer
+	// Stdin, if non-nil, is the process's standard input. Nil (the default)
+	// leaves it as /dev/null, which is what every unattended job has always
+	// had: a job nobody is watching that blocks reading a terminal nobody is
+	// typing at would sit there holding the GPU until a watchdog fired.
+	//
+	// It is wired through an os.Pipe this package creates rather than handed
+	// to os/exec directly, and that is not incidental — see Run.
+	Stdin io.Reader
 }
 
 type Result struct {
@@ -73,6 +81,32 @@ func Run(ctx context.Context, spec JobSpec, sink io.Writer) Result {
 		cmd.Stderr = stdoutW
 	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	// Standard input, when a caller supplies one, goes through an os.Pipe we
+	// own rather than being handed to os/exec as a plain io.Reader. That
+	// looks like extra work and is the difference between a job that ends
+	// and one that hangs: given a non-file Reader, os/exec makes its own pipe
+	// and copies in a goroutine that cmd.Wait() then WAITS FOR. The reader
+	// here is a relay stream that only ends when the operator's client
+	// disconnects, so `tar -cf -` — which never reads its stdin at all —
+	// would exit immediately and leave Wait() blocked on a copy goroutine
+	// parked in a Read that nothing is ever going to answer. With a real
+	// *os.File, Wait() waits for the process and nothing else; our own copy
+	// goroutine unwinds when the caller closes the stream.
+	if spec.Stdin != nil {
+		pr, pw, err := os.Pipe()
+		if err != nil {
+			return Result{ExitCode: -1, Err: fmt.Errorf("stdin pipe: %w", err)}
+		}
+		defer pr.Close()
+		cmd.Stdin = pr
+		go func() {
+			defer pw.Close()
+			// A write failing means the process closed its stdin or exited,
+			// which is ordinary and not this side's business to report.
+			_, _ = io.Copy(pw, spec.Stdin)
+		}()
+	}
 
 	if err := cmd.Start(); err != nil {
 		return Result{ExitCode: -1, Err: fmt.Errorf("start: %w", err)}
