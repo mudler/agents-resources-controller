@@ -125,6 +125,26 @@ func (t term) matches(have string) bool {
 		}
 		return false
 	}
+	// Ordered comparison where exactly ONE side is a quantity is not an
+	// ordering question at all — it is a question that cannot be answered, so
+	// it does not match. Lexicographic ordering of two non-quantities stays
+	// (see below): `model>=a100` matching `h100` is a documented, intended
+	// use.
+	//
+	// The asymmetric case is not hypothetical. nvidia-smi reports "[N/A]" for
+	// total memory on a GB10 (unified memory) and on a Thor, so both boxes
+	// carry vram=[N/A]M. Comparing that against the quantity 40G fell through
+	// to strings, where '[' (0x5B) sorts after '4' (0x34) — so `vram>=40G`
+	// matched BOTH, and an agent asking for 80G of VRAM was scheduled onto
+	// hardware whose VRAM is unknown. Same rule as the absent-key case above:
+	// a fact we do not have is not evidence the device qualifies.
+	if t.op == opGte || t.op == opLte {
+		_, haveQty := parseQuantity(have)
+		_, wantQty := parseQuantity(t.value)
+		if haveQty != wantQty {
+			return false
+		}
+	}
 	switch t.op {
 	case opEq:
 		return have == t.value

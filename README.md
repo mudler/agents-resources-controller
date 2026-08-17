@@ -607,8 +607,12 @@ comma-separated conjunction of terms, every term must hold. Supported
 operators are `=`, `!=`, `>=`, and `<=` (no bare `>`/`<`). When both sides
 of a comparison parse as a quantity — a plain number, or one suffixed
 `K`/`M`/`G`/`T` (case-insensitive, powers of 1024) — the comparison is
-numeric, so `vram>=40G` matches `80G` and `81920M` alike; otherwise it
-falls back to a lexicographic string comparison. A term whose key is
+numeric, so `vram>=40G` matches `80G` and `81920M` alike. When NEITHER side
+is a quantity it falls back to a lexicographic string comparison, so
+`model>=a100` matches `h100`. When exactly one side is a quantity the
+comparison is unanswerable and **never matches** — `nvidia-smi` reports
+`[N/A]` for total memory on unified-memory parts, and a lexicographic
+fallback there made `vram>=40G` match a device whose VRAM is unknown. A term whose key is
 absent from a device's labels never matches, `!=` included: an absent
 label is not proof the device differs.
 
