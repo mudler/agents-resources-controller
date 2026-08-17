@@ -105,10 +105,33 @@ the GPU and the mounted volumes; you do not get your local filesystem. Nothing
 is copied for you — read the box's usage sheet (`rc describe`) to learn where
 its shared storage is and how to put files there.
 
+**If a tool you need is missing, install it rather than giving up.** The stock
+worker image runs jobs as root with a normal toolchain (compiler, cmake,
+python, git, curl), and a job can `apt-get install` anything else:
+
+```sh
+rc run -d <host>:<device> -- bash -c 'apt-get update && apt-get install -y <pkg> && ./build.sh'
+```
+
+Put project dependencies in a virtualenv under the shared workspace instead of
+installing them globally — the container is long-lived, so a global install
+leaks into everyone else's jobs until it restarts. Confirm the specifics in
+`rc describe`; the operator may have changed the image.
+
+**Do not take a hold just to run a command.** A hold gives you the lease and
+nothing else — no execution, no output capture, no exit code (see below).
+
 ## 4. Interactive work
 
-If you need a shell rather than a single command, take an explicit hold, so the
-lease is real and everyone can see it:
+**`rc hold` reserves the device and gives you no way to run anything on it.**
+The worker ignores your command and runs its own sleeper; you then have to
+`ssh` to the box yourself, which lands you on the *host*, outside the
+container — so no `/workspace`, no captured output, no exit code, and no
+automatic release. Reach for it only when you genuinely need a shell on the
+host. For anything you can express as a command, `rc run` is strictly better.
+
+If you do need that shell, take an explicit hold, so the lease is real and
+everyone can see it:
 
 ```sh
 rc hold <host>:<device> --ttl 2h   # blocks, prints the device, holds until Ctrl-C or TTL
