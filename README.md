@@ -1193,12 +1193,61 @@ in the URL itself, and treat anything arriving there as unauthenticated.
 
 The controller serves a web dashboard at `/` — the same address
 `rc serve --addr` binds, no separate process or port. It shows the same
-picture as `rc devices` / `rc ps` in a browser: a card per device (state,
-current holder, elapsed time, and a `stale`/`alert` tint once a worker's
-heartbeat has gone quiet or a device has been quarantined `unhealthy`), the
-queue in priority order, and the currently running jobs. It refreshes on a
-poll plus a live SSE nudge, and shows how long ago its own snapshot was
-last refreshed so a disconnected browser tab does not quietly look current.
+picture as `rc devices` / `rc ps` in a browser, in the shape of a status
+board rather than a control panel: the fleet in one sentence at the top, a
+row per device grouped by host (state, who holds it, how long), then the
+work — what is running and what is waiting, with how long it has waited.
+It refreshes on a poll plus a live SSE nudge, and shows how long ago its own
+snapshot was last refreshed so a disconnected browser tab does not quietly
+look current.
+
+**It speaks plain language, deliberately.** Nothing on the page prints the
+controller's internal vocabulary: a device is *free*, *in use*, *not
+reporting* or *out of the pool*, never `ready`/`busy`/`unknown`/`unhealthy`,
+and a quarantine reason is translated into what happened and what to do
+about it — `worker_lost` reads "the host stopped reporting", with the note
+that whatever was running may still be running and that a reboot brings the
+device back on its own. Where a host wrote its own explanation (a failed
+verify probe's output, say), that text is quoted verbatim under the
+translation, because it is the part a human actually has to act on.
+
+**Activity.** Beside the board is a running list of what has happened —
+devices leaving and rejoining the pool, holds taken and released, jobs
+queued, started, finished, stopped or lost. It is built from the same
+`/v1/events` stream the page refreshes on, so it only covers the time the
+tab has been open: the controller keeps no event history to replay, and the
+page says so under the list rather than implying otherwise. It opens seeded
+with what is already happening (each running job and queued wait, backdated
+by the age the controller reported for it), so it is not an empty box on a
+fleet that has been busy for hours.
+
+**Click into anything.** A device row opens a panel with its full state and
+explanation, every label with where it came from and how long ago it was
+confirmed, the host's usage sheet rendered as Markdown, and its recent jobs.
+A job row opens a panel with its timings, its exit code or the reason it
+stopped, its full command line, and **its output, streamed live** from
+`GET /v1/jobs/{id}/logs` as the job produces it. Panels stack one level, so
+a device leads to the job holding it and back.
+
+**Long commands stay out of the way.** The command line is the one thing on
+this page that can be kilobytes long — some are base64 blobs — so on the
+board it is a single dimmed line that can never widen a column, and the
+whole of it lives in the job's panel, in a bounded scrolling box with a
+`copy` button.
+
+The usage sheet is rendered by a small Markdown renderer that builds DOM
+nodes and only DOM nodes: it supports headings, lists, quotes, rules, code
+and emphasis, shows anything else — including any HTML in the sheet — as the
+plain text it is, and flattens links to their text plus the URL rather than
+emitting an anchor whose `href` nobody here wrote. That is the same rule the
+rest of the page follows: every user-controlled string (a device ID, a
+command, a submitter, a server error) is inserted as a text node, never as
+markup.
+
+The whole page is one `go:embed`-ed file with inline CSS and JS, and it
+makes **no external request of any kind** — no CDN, no web font, no remote
+image, not even a favicon file. It follows the viewer's light/dark system
+preference.
 
 The page asks for a client token before showing anything, and that token is
 kept in the tab's `sessionStorage` only: it is never written to disk, never
@@ -1206,14 +1255,14 @@ sent to any other tab or a new browser session, and is gone the moment the
 tab is closed. Reloading the page (in the same tab) keeps it; opening the
 dashboard in a second tab asks for the token again.
 
-Two kinds of thing on the page change state, and nothing else does. There is
-no submit button and no way to *take* a hold from the browser — starting
-work still goes through `rc run` / `rc hold` from a terminal.
+Three things on the page change state, and nothing else does. There is no
+submit button and no way to *take* a hold from the browser — starting work
+still goes through `rc run` / `rc hold` from a terminal.
 
 **Kill a running job.** Fill in the identity box ("you are …") with the
 submitter name your jobs run under — the same string `rc run --as` sends and
-the `submitter` column shows — and a `kill` control appears on each running
-job. It sends that identity, and the controller checks it against the job's
+the `submitter` column shows — and a `kill` control appears on every row in
+the work list and in each job's own panel. It sends that identity, and the controller checks it against the job's
 submitter exactly as `rc kill` is checked, so killing someone else's job is
 refused with `not_job_owner` and the page shows that refusal in the
 controller's own words. The control is still offered on a job you did not
@@ -1234,15 +1283,15 @@ can kill any job on the fleet by claiming its submitter's name.
 
 **And that includes ending a hold, which is where "no hold button" stops
 being the whole story.** A hold is a job (`kind: hold`), so it appears in the
-running-jobs table like any other and gets the same `kill` control — and
+work list like any other and gets the same control, labelled `Release` — and
 killing a hold *is* `rc release`, the same call under a different name.
 You cannot take a hold from the page; you can absolutely end one, subject to
 the same submitter check (the person holding a box is usually the person
 looking at the page, so this is normally the useful direction).
 
-**Clear an unhealthy device.** An `unhealthy` card carries a `clear` control,
-which is the browser equivalent of `POST /v1/devices/{id}/clear` and needs an
-**admin** token. The page does not have one and never keeps one: it asks for
+**Return a device to the pool.** A device that is out of the pool carries a
+`Return to pool` control, on its row and in its panel. It is the browser
+equivalent of `POST /v1/devices/{id}/clear` and needs an **admin** token. The page does not have one and never keeps one: it asks for
 it in a prompt at the moment you click, uses it for that single request, and
 drops it before the response comes back — never in `sessionStorage`, never in
 `localStorage`, never on a variable that outlives the call. Clearing a second
@@ -1254,8 +1303,14 @@ usual cause is a device that is unhealthy but still holds a live lease, so
 deal with the lease first. (The same message covers a device that simply is
 not `unhealthy` — the wording names the lease either way.)
 
-Both actions confirm before firing, refresh the page's state on success, and
-report the controller's own error text on failure rather than a generic
+**Retire a device.** A device nothing is holding also carries a `Retire`
+control in its panel — `DELETE /v1/devices/{id}`, admin, with the same
+per-click token prompt. It removes the device from the fleet and keeps its
+job history; a worker that still declares that device will bring it back on
+its next registration, which the confirmation says.
+
+All three actions confirm before firing, refresh the page's state on success,
+and report the controller's own error text on failure rather than a generic
 "failed" — `not_job_owner` and `device_not_cleared` each tell you what to do
 next.
 
