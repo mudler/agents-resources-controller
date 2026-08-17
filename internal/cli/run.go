@@ -86,6 +86,7 @@ func NewRunCmd() *cobra.Command {
 		idleTimeout time.Duration
 		timeout     time.Duration
 		noWait      bool
+		tty         bool
 	)
 
 	cmd := &cobra.Command{
@@ -97,7 +98,9 @@ func NewRunCmd() *cobra.Command {
 		// below, so it reflects the flags cobra has already parsed by the
 		// time Args runs.
 		Args: func(cmd *cobra.Command, args []string) error {
-			if explain {
+			// --explain never submits, and --tty with no command means "a
+			// shell", which is the whole point of asking for one.
+			if explain || tty {
 				return nil
 			}
 			return cobra.MinimumNArgs(1)(cmd, args)
@@ -162,10 +165,23 @@ func NewRunCmd() *cobra.Command {
 			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
 
+			// A --tty run with no command asks for a shell. The command is
+			// still an ordinary job command recorded on the job row, so
+			// `rc ps` shows what is on the box rather than a blank.
+			command := args
+			stdio := model.StdioLogs
+			if tty {
+				stdio = model.StdioTTY
+				if len(command) == 0 {
+					command = defaultTTYCommand
+				}
+			}
+
 			job, err := c.Submit(ctx, client.SubmitOptions{
 				DeviceID:       device,
 				Selector:       selector,
-				Command:        args,
+				Command:        command,
+				Stdio:          stdio,
 				Cwd:            cwd,
 				Submitter:      submitter,
 				IdempotencyKey: uuid.NewString(),
@@ -254,7 +270,22 @@ func NewRunCmd() *cobra.Command {
 
 			fmt.Fprintf(stderr, "rc: job %s on %s\n", job.ID, job.DeviceID)
 
-			streamErr := c.StreamLogs(ctx, job.ID, os.Stdout)
+			// An interactive session replaces the log stream with the
+			// terminal: the job's bytes go through the relay and are never
+			// written to the log store, so there would be nothing to stream.
+			//
+			// Attaching here, after the queue wait, rather than the instant
+			// the job has an ID: the relay holds both connect orders and
+			// would carry type-ahead through a wait, but raw mode during a
+			// queue that prints its position on every change is a worse
+			// experience than waiting for the shell, and `rc cp` is the
+			// caller that genuinely needs the early attach.
+			streamErr := error(nil)
+			if tty {
+				streamErr = attachTerminal(ctx, c, job.ID, stderr)
+			} else {
+				streamErr = c.StreamLogs(ctx, job.ID, os.Stdout)
+			}
 			if derr := detachIfInterrupted(ctx, stop, stderr, job); derr != nil {
 				return derr
 			}
@@ -295,6 +326,8 @@ func NewRunCmd() *cobra.Command {
 	cmd.Flags().StringVar(&selector, "select", "", "device selector, e.g. vram>=40G (mutually exclusive with -d)")
 	cmd.Flags().BoolVar(&explain, "explain", false,
 		"with --select, report which devices match, how many are free, and the queue depth, then exit without submitting")
+	cmd.Flags().BoolVar(&tty, "tty", false,
+		"run the command under a real terminal and attach to it; with no command, gives you a shell on the device")
 	cmd.Flags().StringVar(&cwd, "cwd", "", "working directory on the device host")
 	cmd.Flags().StringVar(&as, "as", "", "identity shown in rc ps (defaults to $RC_SUBMITTER, else user@host/session)")
 	cmd.Flags().IntVar(&priority, "priority", 0, fmt.Sprintf(

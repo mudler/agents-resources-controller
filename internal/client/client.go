@@ -71,6 +71,11 @@ type SubmitOptions struct {
 	Kind string
 	// Reason is why a hold was taken; meaningless for an ordinary job.
 	Reason string
+	// Stdio is model.StdioLogs (the default), StdioTTY or StdioPipe: where
+	// the job's standard streams are wired. The two attached modes put the
+	// process on the controller's relay instead of the log store, which is
+	// what AttachTTY and CopyTo/CopyFrom then join.
+	Stdio string
 }
 
 func (c *Client) do(ctx context.Context, method, path string, body io.Reader) (*http.Response, error) {
@@ -108,6 +113,7 @@ func (c *Client) Submit(ctx context.Context, opts SubmitOptions) (*model.Job, er
 		NoWait:             opts.NoWait,
 		Kind:               opts.Kind,
 		Reason:             opts.Reason,
+		Stdio:              opts.Stdio,
 	})
 	if err != nil {
 		return nil, err
