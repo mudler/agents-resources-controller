@@ -193,6 +193,43 @@ func TestDashboardComputesLabelAgeServerSideNotViaDateParse(t *testing.T) {
 		"label staleness must come from the controller's oldest_label_age_seconds, not a browser-side Date.parse call on updated_at")
 }
 
+// markupSinks are the DOM APIs that turn a string into markup. The page
+// renders values nobody here controls — a job's command line is written by
+// whoever submitted it, a usage sheet by whoever administers the host, an
+// error string by the controller — and the only reason none of them can
+// become an element is that every one of them is inserted as a text node.
+// The usage-sheet renderer in particular is a Markdown renderer, which is
+// exactly the kind of code someone "simplifies" back into a string of HTML.
+var markupSinks = []string{
+	".innerHTML", ".outerHTML", "insertAdjacentHTML(", "document.write(",
+	"createContextualFragment(",
+}
+
+// TestDashboardNeverAssignsMarkup pins that boundary on the shipped asset.
+func TestDashboardNeverAssignsMarkup(t *testing.T) {
+	body := dashboardBody(t)
+	for _, sink := range markupSinks {
+		require.NotContains(t, body, sink,
+			"every user-controlled string on this page must be inserted as a text node")
+	}
+}
+
+// externalRef matches a src= or href= pointing at another host: an absolute
+// http(s) URL or a protocol-relative one.
+var externalRef = regexp.MustCompile(`(?i)(src|href)\s*=\s*["']?\s*(https?:)?//`)
+
+// TestDashboardMakesNoExternalRequests pins the security boundary the page
+// exists behind: it is served to anyone who can reach the controller's port,
+// on networks where the controller itself may be the only thing reachable,
+// and it must fetch nothing from anywhere. No CDN, no font, no image, no
+// analytics — everything inline. The favicon is a data: URI for this reason
+// and passes, since it names no host.
+func TestDashboardMakesNoExternalRequests(t *testing.T) {
+	body := dashboardBody(t)
+	require.NotRegexp(t, externalRef, body,
+		"the dashboard must reference no external asset of any kind")
+}
+
 func TestUnknownPathIs404NotTheDashboard(t *testing.T) {
 	ts, _, _, _ := newServer(t)
 

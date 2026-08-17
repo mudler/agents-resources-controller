@@ -4,33 +4,41 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>resource controller</title>
+<!-- The tab icon, inline as a data: URI. A file would be a second request
+     and a second embedded asset; a missing one is a 404 in every browser
+     console. This is neither. -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%2316181d'/%3E%3Ccircle cx='32' cy='32' r='15' fill='%23c86c08'/%3E%3C/svg%3E">
 <style>
   /* A calm status board. It should be nearly quiet when the fleet is fine,
      and unmistakable when it is not — so exactly one thing on this page is
      allowed to be loud, and that is a device that has left the pool.
 
      Neutrals are tinted toward the mark's slate rather than pure grey, and
-     nothing is pure black or pure white. */
+     nothing is pure black or pure white. Light and dark both come from the
+     viewer's system preference; there is no theme switch, because a switch
+     is one more control on a page whose whole point is having few. */
   :root {
-    --bg:#fbfbfd; --panel:#fff; --sunk:#f4f5f8;
+    --bg:#fbfbfd; --panel:#fff; --sunk:#f4f5f8; --hover:#f6f7fa;
     --ink:#16181d; --ink-2:#3f4653; --muted:#6b7280; --faint:#9aa1ab;
     --line:#e4e6ec; --line-2:#d3d7e0;
     --ready:#15803d; --busy:#b45309; --unknown:#6d28d9; --bad:#b91c1c;
     --bad-bg:#fdf3f3; --bad-line:#f0c9c9;
-    --warn:#a15c07; --warn-bg:#fdf8ef;
+    --warn:#a15c07; --warn-bg:#fdf8ef; --warn-line:#eddcc0;
     --accent:#c86c08;
     --shadow:0 1px 2px rgba(20,22,28,.05);
+    --scrim:rgba(22,24,29,.28);
   }
-  :root:not([data-theme="light"]) {
-    @media (prefers-color-scheme: dark) {
-      --bg:#16181d; --panel:#1c1f26; --sunk:#232732;
-      --ink:#e8eaed; --ink-2:#c3c8d2; --muted:#949bA7; --faint:#767d8a;
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg:#16181d; --panel:#1c1f26; --sunk:#232732; --hover:#232732;
+      --ink:#e8eaed; --ink-2:#c3c8d2; --muted:#949ba7; --faint:#767d8a;
       --line:#2b303b; --line-2:#3a4150;
       --ready:#4ade80; --busy:#fbbf24; --unknown:#c4b5fd; --bad:#fca5a5;
       --bad-bg:#2b1618; --bad-line:#5c2a2c;
-      --warn:#fbbf24; --warn-bg:#2a2113;
+      --warn:#fbbf24; --warn-bg:#2a2113; --warn-line:#4a3a18;
       --accent:#f0913a;
       --shadow:none;
+      --scrim:rgba(0,0,0,.5);
     }
   }
   * { box-sizing:border-box; }
@@ -40,11 +48,12 @@
     -webkit-font-smoothing:antialiased;
   }
   .mono { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+  .hide { display:none !important; }
 
   header {
-    display:flex; align-items:center; gap:14px;
-    padding:16px 24px; border-bottom:1px solid var(--line);
-    background:var(--panel);
+    display:flex; align-items:center; gap:14px; flex-wrap:wrap;
+    padding:14px 24px; border-bottom:1px solid var(--line);
+    background:var(--panel); position:sticky; top:0; z-index:5;
   }
   header .brand { display:flex; align-items:center; gap:10px; margin-right:auto; }
   header svg { display:block; }
@@ -54,118 +63,232 @@
   .live.warn .dot { background:var(--warn); }
   .live.stale .dot { background:var(--bad); }
   .live.stale { color:var(--bad); font-weight:600; }
+  #act { font-size:13px; color:var(--muted); }
+  #act.bad { color:var(--bad); font-weight:600; }
+  #err { font-size:13px; color:var(--bad); }
+  .badge { font-size:11px; font-weight:600; letter-spacing:.06em; text-transform:uppercase;
+           color:var(--accent); border:1px solid var(--accent); border-radius:100px;
+           padding:1px 8px; }
 
-  main { padding:24px; max-width:1060px; margin:0 auto; }
+  main { padding:26px 24px 40px; max-width:1240px; margin:0 auto; }
+
+  /* Two columns: the fleet is what the eye lands on, and the activity feed
+     sits beside it as peripheral vision rather than competing for the
+     centre. One column below 980px, feed last. */
+  .board { display:grid; grid-template-columns:minmax(0,1fr) 320px; gap:30px; align-items:start; }
+  @media (max-width:980px) { .board { grid-template-columns:minmax(0,1fr); } }
 
   /* Summary line: the whole fleet in one sentence, so a glance needs no
      counting. It is the first thing read and usually the only thing. */
-  .summary { font-size:17px; color:var(--ink-2); margin:0 0 4px; letter-spacing:-.01em; }
+  .summary { font-size:20px; color:var(--ink-2); margin:0 0 4px; letter-spacing:-.015em; }
   .summary b { color:var(--ink); font-weight:600; }
   .summary .bad { color:var(--bad); font-weight:600; }
   .sub { font-size:13px; color:var(--muted); margin:0 0 26px; }
+  .sub .long { color:var(--warn); font-weight:600; }
 
-  .host { margin-bottom:26px; }
+  .sec { font-size:11px; font-weight:600; color:var(--muted); letter-spacing:.08em;
+         text-transform:uppercase; margin:0 0 10px; }
+  .host { margin-bottom:22px; }
   .host-name {
     font-size:12px; font-weight:600; color:var(--muted);
     letter-spacing:.06em; text-transform:uppercase;
     display:flex; align-items:baseline; gap:9px; margin-bottom:8px;
   }
-  .host-note {
-    font-size:12px; letter-spacing:0; text-transform:none;
-    font-weight:400; color:var(--faint); cursor:pointer;
-    background:none; border:0; padding:0; font-family:inherit;
-  }
-  .host-note:hover { color:var(--accent); text-decoration:underline; }
+  .host-note { font-size:12px; letter-spacing:0; text-transform:none;
+               font-weight:400; color:var(--faint); }
 
-  .rows { border:1px solid var(--line); border-radius:10px; overflow:hidden; background:var(--panel); box-shadow:var(--shadow); }
-  .row { display:flex; align-items:flex-start; gap:14px; padding:13px 16px; border-top:1px solid var(--line); }
+  .rows { border:1px solid var(--line); border-radius:12px; overflow:hidden;
+          background:var(--panel); box-shadow:var(--shadow); }
+  .row { display:flex; align-items:stretch; border-top:1px solid var(--line); }
   .row:first-child { border-top:0; }
   .row.down { background:var(--bad-bg); }
 
+  /* The row body is one button: the whole line is the click target that
+     opens the detail, and it is reachable by keyboard for free. The
+     per-row actions live outside it, since a button may not nest. */
+  .open { flex:1; min-width:0; display:block; width:100%; text-align:left;
+          background:none; border:0; color:inherit; font:inherit;
+          padding:14px 8px 14px 16px; cursor:pointer; }
+  .open:hover { background:var(--hover); }
+  .row.down .open:hover { background:transparent; text-decoration:none; }
+  .row.down .open:hover .dev { text-decoration:underline; }
+  .actions { display:flex; align-items:center; gap:8px; padding:12px 14px 12px 0; flex:none; }
+
+  .line1 { display:flex; align-items:baseline; gap:10px; flex-wrap:wrap; }
   /* The state pip carries the state at a glance; the word beside it carries
      it for anyone who cannot separate these hues. Never colour alone. */
-  .pip { width:9px; height:9px; border-radius:50%; margin-top:7px; flex:none; background:var(--faint); }
+  .pip { width:9px; height:9px; border-radius:50%; align-self:center; flex:none; background:var(--faint); }
   .pip.ready { background:var(--ready); }
   .pip.busy { background:var(--busy); }
   .pip.unknown { background:var(--unknown); }
   .pip.unhealthy { background:var(--bad); }
-
-  .body { flex:1; min-width:0; }
-  .line1 { display:flex; align-items:baseline; gap:10px; flex-wrap:wrap; }
-  .dev { font-size:14px; font-weight:600; letter-spacing:-.01em; }
+  .dev { font-size:15px; font-weight:600; letter-spacing:-.01em; }
   .state { font-size:12px; font-weight:600; letter-spacing:.02em; }
   .state.ready { color:var(--ready); } .state.busy { color:var(--busy); }
   .state.unknown { color:var(--unknown); } .state.unhealthy { color:var(--bad); }
+  .state.waiting { color:var(--muted); }
   .spec { font-size:12px; color:var(--faint); }
 
-  .line2 { font-size:13px; color:var(--ink-2); margin-top:3px; }
+  .line2 { font-size:13.5px; color:var(--ink-2); margin-top:4px; }
   .line2 .who { font-weight:500; }
   .line2 .dur { color:var(--muted); }
+  .line2 .quiet { color:var(--warn); }
+
+  /* The command is the one thing on this page that can be kilobytes long,
+     and it is rarely what the reader came for — so on the board it is a
+     single dim line that can never widen a column, and the whole of it
+     lives one click away in the detail panel. */
+  .cmd { margin-top:4px; font-size:12px; color:var(--muted);
+         overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:100%; }
 
   /* The explanation for a device that has left the pool. This is the single
      most important string on the page: it is why the device is gone and it
-     decides whether clearing it is safe. It gets prose treatment, room, and
-     no truncation. */
-  .why { margin-top:7px; padding:9px 11px; background:var(--panel); border:1px solid var(--bad-line);
-         border-radius:7px; font-size:13px; color:var(--ink); }
-  .why b { color:var(--bad); font-weight:600; }
-  .why .txt { display:block; margin-top:2px; word-break:break-word; }
+     decides whether returning it is safe. */
+  .why { margin-top:8px; padding:9px 11px; background:var(--panel); border:1px solid var(--bad-line);
+         border-radius:8px; font-size:13px; color:var(--ink); }
+  .why b { color:var(--bad); font-weight:600; display:block; }
+  .why .txt { display:block; margin-top:3px; color:var(--ink-2); word-break:break-word; }
 
-  .cmd { margin-top:5px; font-size:12px; color:var(--muted);
-         overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-
-  .waits { margin-top:7px; font-size:12.5px; color:var(--muted); }
+  .waits { margin-top:6px; font-size:12.5px; color:var(--muted); }
   .waits .w { display:block; }
   .waits .long { color:var(--warn); font-weight:600; }
-
-  .right { display:flex; align-items:center; gap:8px; flex:none; }
-
-  /* Progressive disclosure: the facts an operator scans past 95% of the time
-     live behind this, so the resting page stays quiet. */
-  .more { border:0; background:none; padding:2px 4px; cursor:pointer; color:var(--faint);
-          font:inherit; font-size:12px; border-radius:5px; }
-  .more:hover { color:var(--accent); }
-  .detail { margin-top:10px; padding-top:10px; border-top:1px dashed var(--line-2); font-size:13px; }
-  .facts { display:grid; grid-template-columns:auto 1fr; gap:3px 14px; }
-  .facts dt { color:var(--muted); font-size:12px; }
-  .facts dd { margin:0; font-size:12.5px; word-break:break-word; }
-  .facts dd .src { color:var(--faint); font-size:11px; margin-left:6px; }
-  .sheet { margin-top:10px; padding:11px 13px; background:var(--sunk); border-radius:7px;
-           font-size:13px; white-space:pre-wrap; word-break:break-word; color:var(--ink-2); }
-  .sheet .hd { display:block; font-size:11px; color:var(--muted); text-transform:uppercase;
-               letter-spacing:.06em; margin-bottom:5px; font-weight:600; }
-  .agewarn { color:var(--warn); font-size:12px; margin-top:7px; }
-  .hist { margin-top:10px; }
-  .hist .hd { display:block; font-size:11px; color:var(--muted); text-transform:uppercase;
-              letter-spacing:.06em; margin-bottom:5px; font-weight:600; }
-  .hist .j { display:flex; gap:9px; align-items:baseline; font-size:12.5px; padding:2px 0; }
-  .jst { font-size:11px; font-weight:600; flex:none; width:74px; }
-  .jst.ok { color:var(--ready); } .jst.bad { color:var(--bad); }
-  .jwho { color:var(--ink-2); flex:none; }
-  .jcmd { color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .jwhy { color:var(--bad); font-size:11.5px; flex:none; }
+  .spec.long { color:var(--warn); font-weight:600; }
 
   button.act { border:1px solid var(--line-2); background:var(--panel); color:var(--ink-2);
-               border-radius:7px; padding:5px 11px; font:inherit; font-size:12.5px; cursor:pointer; }
+               border-radius:8px; padding:5px 11px; font:inherit; font-size:12.5px; cursor:pointer; }
   button.act:hover { border-color:var(--accent); color:var(--accent); }
   button.act.danger { border-color:var(--bad-line); color:var(--bad); }
   button.act.foreign { color:var(--faint); }
+  .chev { color:var(--faint); font-size:13px; padding:0 2px; }
 
-  .empty { color:var(--muted); padding:28px 0; text-align:center; }
+  .empty { color:var(--muted); padding:26px 16px; text-align:center; background:var(--panel);
+           border:1px solid var(--line); border-radius:12px; }
   .empty .hint { font-size:13px; color:var(--faint); margin-top:6px; }
+
+  /* ---- activity feed ------------------------------------------------- */
+  .feed { border:1px solid var(--line); border-radius:12px; background:var(--panel);
+          box-shadow:var(--shadow); overflow:hidden; }
+  .ev { display:flex; border-top:1px solid var(--line); }
+  .ev:first-child { border-top:0; }
+  .ev-open, .ev-static { flex:1; min-width:0; display:flex; gap:9px; align-items:baseline;
+                         text-align:left; background:none; border:0; color:inherit; font:inherit;
+                         padding:9px 12px; font-size:12.5px; }
+  .ev-open { cursor:pointer; }
+  .ev-open:hover { background:var(--hover); }
+  .ev-time { flex:none; width:46px; color:var(--faint); font-size:11.5px; }
+  .ev-text { color:var(--ink-2); min-width:0; word-break:break-word; }
+  .ev-text b { font-weight:600; color:var(--ink); }
+  .ev.bad .ev-text { color:var(--bad); }
+  .ev.good .ev-text b { color:var(--ink); }
+  .feed-note { font-size:11.5px; color:var(--faint); margin:8px 2px 0; }
+
+  /* ---- detail panel -------------------------------------------------- */
+  #scrim { position:fixed; inset:0; background:var(--scrim); z-index:10; }
+  #panel {
+    position:fixed; top:0; right:0; bottom:0; width:min(560px,100%);
+    background:var(--panel); border-left:1px solid var(--line); z-index:11;
+    display:flex; flex-direction:column; box-shadow:-8px 0 30px rgba(20,22,28,.10);
+  }
+  .panel-head { display:flex; align-items:center; gap:10px; padding:14px 18px;
+                border-bottom:1px solid var(--line); flex:none; }
+  .panel-head h2 { font-size:15px; margin:0; font-weight:600; flex:1; min-width:0;
+                   overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .panel-kind { font-size:11px; color:var(--muted); letter-spacing:.08em; text-transform:uppercase; }
+  .iconbtn { border:0; background:none; color:var(--muted); font:inherit; font-size:17px;
+             line-height:1; cursor:pointer; padding:4px 7px; border-radius:7px; }
+  .iconbtn:hover { color:var(--accent); background:var(--hover); }
+  .panel-body { padding:18px; overflow:auto; flex:1; }
+
+  .big { font-size:19px; font-weight:600; letter-spacing:-.015em; margin:0 0 2px; }
+  .big.ready { color:var(--ready); } .big.busy { color:var(--busy); }
+  .big.unknown { color:var(--unknown); } .big.unhealthy { color:var(--bad); }
+  .big.failed { color:var(--bad); } .big.done { color:var(--ready); }
+  .under { font-size:13px; color:var(--muted); margin:0 0 16px; }
+
+  .note { padding:12px 14px; border-radius:9px; font-size:13.5px; margin:0 0 16px;
+          background:var(--sunk); border:1px solid var(--line); }
+  .note.alarm { background:var(--bad-bg); border-color:var(--bad-line); }
+  .note.caution { background:var(--warn-bg); border-color:var(--warn-line); }
+  .note h3 { font-size:13.5px; margin:0 0 5px; font-weight:600; }
+  .note.alarm h3 { color:var(--bad); }
+  .note p { margin:0 0 6px; color:var(--ink-2); }
+  .note p:last-child { margin-bottom:0; }
+  .note .quote { display:block; margin:6px 0; padding:8px 10px; background:var(--panel);
+                 border:1px solid var(--line); border-radius:7px; font-size:12.5px;
+                 white-space:pre-wrap; word-break:break-word; color:var(--ink);
+                 max-height:180px; overflow:auto; }
+
+  .block { margin:0 0 20px; }
+  .block > .sec { margin-bottom:8px; }
+  .facts { display:grid; grid-template-columns:auto minmax(0,1fr); gap:4px 16px; margin:0; }
+  .facts dt { color:var(--muted); font-size:12.5px; }
+  .facts dd { margin:0; font-size:13px; word-break:break-word; }
+  .facts dd .src { color:var(--faint); font-size:11px; margin-left:6px; }
+
+  /* The full command, on demand. Wrapped and bounded: a multi-kilobyte
+     base64 blob scrolls inside this box and never stretches the panel. */
+  .full { background:var(--sunk); border:1px solid var(--line); border-radius:8px;
+          padding:10px 12px; font-size:12.5px; white-space:pre-wrap; word-break:break-all;
+          max-height:200px; overflow:auto; margin:0; color:var(--ink-2); }
+  .full-head { display:flex; align-items:baseline; gap:10px; margin-bottom:6px; }
+  .full-head .sec { margin:0; flex:1; }
+  .tiny { border:1px solid var(--line-2); background:var(--panel); color:var(--muted);
+          border-radius:7px; padding:2px 8px; font:inherit; font-size:11.5px; cursor:pointer; }
+  .tiny:hover { border-color:var(--accent); color:var(--accent); }
+
+  /* The live log. Fixed height so the panel's own layout never jumps as
+     output arrives, and it sticks to the bottom only while the reader is
+     already there — scrolling up to read something must not be undone by
+     the next chunk. */
+  .log { background:var(--sunk); border:1px solid var(--line); border-radius:8px;
+         padding:10px 12px; font-size:12px; line-height:1.5; height:260px; overflow:auto;
+         white-space:pre-wrap; word-break:break-word; color:var(--ink-2); margin:0; }
+  .log-status { font-size:11.5px; color:var(--faint); margin:6px 2px 0; display:flex; gap:8px; }
+  .log-status .streaming { color:var(--ready); }
+  .log-status .bad { color:var(--bad); }
+
+  .sheet { font-size:13.5px; color:var(--ink-2); }
+  .sheet h3 { font-size:14px; margin:14px 0 4px; color:var(--ink); font-weight:600; }
+  .sheet h3:first-child { margin-top:0; }
+  .sheet h4 { font-size:13px; margin:12px 0 4px; color:var(--ink); font-weight:600; }
+  .sheet p { margin:0 0 8px; }
+  .sheet ul, .sheet ol { margin:0 0 8px; padding-left:20px; }
+  .sheet li { margin:2px 0; }
+  .sheet code { background:var(--sunk); border-radius:4px; padding:1px 4px; font-size:12px;
+                font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; word-break:break-word; }
+  .sheet pre { background:var(--sunk); border:1px solid var(--line); border-radius:8px;
+               padding:9px 11px; overflow:auto; font-size:12px; margin:0 0 8px;
+               font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+  .sheet blockquote { margin:0 0 8px; padding-left:11px; border-left:2px solid var(--line-2);
+                      color:var(--muted); }
+  .sheet hr { border:0; border-top:1px solid var(--line); margin:12px 0; }
+
+  .jrow { display:flex; gap:9px; align-items:baseline; font-size:12.5px; width:100%;
+          text-align:left; background:none; border:0; color:inherit; font-family:inherit;
+          padding:5px 6px; border-radius:7px; cursor:pointer; }
+  .jrow:hover { background:var(--hover); }
+  .jst { font-size:11.5px; font-weight:600; flex:none; width:62px; }
+  .jst.ok { color:var(--ready); } .jst.bad { color:var(--bad); } .jst.warn { color:var(--warn); }
+  .jwho { color:var(--ink-2); flex:none; }
+  .jcmd { color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0; }
+
+  .agewarn { color:var(--warn); font-size:12.5px; margin-top:8px; }
+  .linkish { background:none; border:0; padding:0; font:inherit; color:var(--accent);
+             cursor:pointer; text-align:left; }
+  .linkish:hover { text-decoration:underline; }
 
   /* The identity control is a footnote, not a headline: it is set once and
      never touched again, so it must not compete with the fleet. */
-  .who-bar { margin-top:28px; padding-top:16px; border-top:1px solid var(--line);
+  .who-bar { margin-top:30px; padding-top:16px; border-top:1px solid var(--line);
              display:flex; gap:9px; align-items:center; flex-wrap:wrap;
              font-size:13px; color:var(--muted); }
   .who-bar input { flex:0 1 240px; }
   .who-bar button { border:1px solid var(--line-2); background:var(--panel); color:var(--ink-2);
-                    border-radius:7px; padding:6px 12px; font:inherit; font-size:13px; cursor:pointer; }
+                    border-radius:8px; padding:6px 12px; font:inherit; font-size:13px; cursor:pointer; }
 
   input { background:var(--panel); color:var(--ink); border:1px solid var(--line-2);
-          border-radius:7px; padding:8px 11px; font:inherit; }
-  input:focus-visible, button:focus-visible, .more:focus-visible {
+          border-radius:8px; padding:8px 11px; font:inherit; }
+  input:focus-visible, button:focus-visible {
     outline:2px solid var(--accent); outline-offset:2px;
   }
 
@@ -174,19 +297,8 @@
   #gate p { color:var(--muted); font-size:13px; margin:0 0 18px; }
   #gate form { display:flex; gap:8px; }
   #gate input { flex:1; }
-  #gate button { background:var(--ink); color:var(--bg); border:0; border-radius:7px;
+  #gate button { background:var(--ink); color:var(--bg); border:0; border-radius:8px;
                  padding:8px 15px; font:inherit; font-weight:600; cursor:pointer; }
-
-  /* An admin session can clear and retire devices without a second token, so
-     the page says so plainly rather than letting the extra power be
-     invisible. */
-  .badge { font-size:11px; font-weight:600; letter-spacing:.06em; text-transform:uppercase;
-           color:var(--accent); border:1px solid var(--accent); border-radius:100px;
-           padding:1px 8px; }
-  #act { font-size:13px; color:var(--muted); }
-  #act.bad { color:var(--bad); font-weight:600; }
-  #err { font-size:13px; color:var(--bad); }
-  .hide { display:none; }
 </style>
 </head>
 <body>
@@ -202,7 +314,7 @@
     <h1>resource controller</h1>
   </span>
   <span id="role" class="hide"></span>
-  <span id="act"></span>
+  <span id="act" aria-live="polite"></span>
   <span id="err"></span>
   <span class="live" id="live"><span class="dot"></span><span id="liveText"></span></span>
 </header>
@@ -217,9 +329,23 @@
 </div>
 
 <main id="app" class="hide">
-  <p class="summary" id="summary"></p>
-  <p class="sub" id="sub"></p>
-  <div id="fleet"></div>
+  <div class="board">
+    <div>
+      <p class="summary" id="summary"></p>
+      <p class="sub" id="sub"></p>
+      <div id="fleet"></div>
+      <section id="workSection" class="hide">
+        <h2 class="sec">Work</h2>
+        <div id="work"></div>
+      </section>
+    </div>
+    <aside>
+      <h2 class="sec">Activity</h2>
+      <div class="feed" id="feed"></div>
+      <p class="feed-note">Recorded while this page is open — the controller keeps no history to
+        replay, so this starts fresh on every reload.</p>
+    </aside>
+  </div>
   <form class="who-bar" id="whoBar">
     <label for="who">You are</label>
     <input id="who" type="text" autocomplete="off" placeholder="alice@lab">
@@ -227,6 +353,17 @@
     <span id="whoHint"></span>
   </form>
 </main>
+
+<div id="scrim" class="hide"></div>
+<aside id="panel" class="hide" role="dialog" aria-modal="true" aria-labelledby="panelTitle">
+  <div class="panel-head">
+    <button id="panelBack" class="iconbtn hide" type="button" title="back">&#8592;</button>
+    <h2 id="panelTitle"></h2>
+    <span id="panelKind" class="panel-kind"></span>
+    <button id="panelClose" class="iconbtn" type="button" title="close">&#215;</button>
+  </div>
+  <div class="panel-body" id="panelBody"></div>
+</aside>
 
 <script>
 (function () {
@@ -256,36 +393,26 @@
   // nothing but a button that gets refused.
   var role = "";
   var identity = "";
-  var open = {};           // device id -> details expanded
-  var sheets = {};         // device id -> usage sheet, fetched on demand
+
+  var latest = null;        // the last /v1/state response
+  var deviceIndex = {};     // device id -> DeviceView, from the last state
+  var jobIndex = {};        // job id -> job, from every state and every fetch
+  var prevDevices = null;   // device id -> {state, holder, kind}, for the feed diff
+  var describes = {};       // device id -> /v1/devices/{id}/describe response
+
   var gate = document.getElementById("gate");
   var app = document.getElementById("app");
   var err = document.getElementById("err");
   var act = document.getElementById("act");
-  var pollTimer = null, freshTimer = null, es = null, lastFetchAt = null;
+  var pollTimer = null, freshTimer = null, es = null, lastFetchAt = null, nudgePending = false;
 
-  document.getElementById("gateForm").addEventListener("submit", function (e) {
-    e.preventDefault();
-    token = document.getElementById("token").value.trim();
-    sessionStorage.setItem("rc_token", token);
-    start();
-  });
-
-  document.getElementById("whoBar").addEventListener("submit", function (e) {
-    e.preventDefault();
-    identity = document.getElementById("who").value.trim();
-    renderWho();
-    refresh();
-  });
-
-  function renderWho() {
-    document.getElementById("whoHint").textContent =
-      identity ? "— kill controls act as " + identity : "— set this to enable kill controls";
-  }
-
-  function fail(m) { err.textContent = m; }
-  function actOK(m) { act.textContent = m; act.className = ""; }
-  function actFail(m) { act.textContent = m; act.className = "bad"; }
+  // ---- small DOM helpers ------------------------------------------------
+  //
+  // Everything on this page is built with these. There is no innerHTML
+  // anywhere in this file and there must never be one: a device ID, a
+  // command line, a submitter, a usage sheet and a server error string are
+  // all chosen by somebody else, and the only way to be sure they are read
+  // as text is to make them text nodes.
 
   function el(tag, cls, text) {
     var n = document.createElement(tag);
@@ -294,14 +421,27 @@
     return n;
   }
 
-  // ---- formatting ------------------------------------------------------
+  function txt(s) { return document.createTextNode(s); }
+
+  function button(cls, text, onClick) {
+    var b = el("button", cls, text);
+    b.type = "button";
+    b.addEventListener("click", onClick);
+    return b;
+  }
+
+  function fail(m) { err.textContent = m; }
+  function actOK(m) { act.textContent = m; act.className = ""; }
+  function actFail(m) { act.textContent = m; act.className = "bad"; }
+
+  // ---- formatting -------------------------------------------------------
   //
-  // Every one of these takes a number the SERVER computed. This page never
+  // Every duration here takes a number the SERVER computed. This page never
   // measures an age against its own clock: a browser with a skewed clock
   // must not be able to make a month-old label read as fresh, or a stuck
-  // queue read as new. The one exception is "updated Ns ago" in the header,
-  // which is the delta between two readings of this browser's own clock and
-  // so is immune by construction.
+  // queue read as new. The two exceptions are the header's "updated Ns ago"
+  // and the activity feed's timestamps, which are both deltas between two
+  // readings of this browser's own clock and so are immune by construction.
 
   function ago(s) {
     if (s < 0) return "in the future?";
@@ -309,6 +449,17 @@
     if (s < 3600) return Math.floor(s / 60) + "m";
     if (s < 86400) return Math.floor(s / 3600) + "h " + Math.floor((s % 3600) / 60) + "m";
     return Math.floor(s / 86400) + "d " + Math.floor((s % 86400) / 3600) + "h";
+  }
+
+  // An absolute instant the server recorded, shown in the reader's own
+  // timezone. This is a rendering of a server value, not a comparison
+  // against the browser clock, so it carries none of the skew risk that
+  // computing an age here would.
+  function clockTime(iso) {
+    if (!iso) return "";
+    var d = new Date(iso);
+    if (isNaN(d.getTime())) return String(iso);
+    return d.toLocaleString();
   }
 
   // Raw byte counts are the single least readable thing the probes produce:
@@ -327,16 +478,25 @@
 
   function prettyKey(key) { return key.replace(/_bytes$/, "").replace(/_/g, " "); }
 
+  // clip bounds what we put in the DOM at all, rather than relying on CSS
+  // to hide the overflow. Some commands on this fleet are multi-kilobyte
+  // base64 blobs; a row must not carry one as a text node just to ellipsis
+  // it away, and no list on this page is a place to read one anyway.
+  function clip(s, n) {
+    s = String(s === undefined || s === null ? "" : s);
+    return s.length > n ? s.slice(0, n) + "…" : s;
+  }
+
   function labelMap(v) {
     var m = {};
-    (v.device.labels || []).forEach(function (l) {
+    ((v.device && v.device.labels) || []).forEach(function (l) {
       if (!(l.key in m) || l.source === "detected") m[l.key] = l.value;
     });
     return m;
   }
 
   // The one-line "what is this box" summary. Two or three facts that bear on
-  // a scheduling decision, not the nine chips that used to dominate the card.
+  // a scheduling decision, not the nine chips that would dominate the row.
   function specLine(v) {
     var m = labelMap(v), bits = [];
     if (m.gpu_model) bits.push(m.gpu_model);
@@ -358,12 +518,143 @@
     return bits.join(" · ");
   }
 
-  function shortCmd(cmd) {
-    var s = (cmd || []).join(" ");
-    return s.length > 96 ? s.slice(0, 96) + "…" : s;
+  // A job's command as one string, bounded. `hold` has no command a
+  // submitter chose — the worker runs its own sleeper — so it is described
+  // rather than quoted.
+  function commandText(job) {
+    if (!job) return "";
+    if (job.kind === "hold") return "hold" + (job.reason ? " — " + job.reason : "");
+    return (job.command || []).join(" ");
   }
 
-  // ---- server calls ----------------------------------------------------
+  // ---- plain language ---------------------------------------------------
+  //
+  // The controller's own vocabulary — unhealthy, quarantine_reason,
+  // lease, worker_lost — is precise and is the wrong thing to put in front
+  // of a reader who is trying to work out whether a GPU is usable. Every
+  // internal term is translated exactly once, here, and nowhere on this page
+  // is a raw state name or reason category printed.
+
+  function stateWord(state) {
+    if (state === "unhealthy") return "out of the pool";
+    if (state === "unknown") return "not reporting";
+    if (state === "busy") return "in use";
+    if (state === "ready") return "free";
+    return String(state || "unknown");
+  }
+
+  function jobStateWord(state) {
+    switch (state) {
+      case "queued": return "waiting for a device";
+      case "assigned": return "starting";
+      case "running": return "running";
+      case "succeeded": return "finished";
+      case "failed": return "failed";
+      case "killed": return "stopped";
+      case "lost": return "lost";
+    }
+    return String(state || "");
+  }
+
+  // The same states, short enough for a list column. "waiting for a device"
+  // is the right sentence at the top of a job's own panel and the wrong one
+  // wrapped over three lines in a history row.
+  function jobStateShort(state) {
+    if (state === "queued") return "queued";
+    return jobStateWord(state);
+  }
+
+  function jobStateClass(state) {
+    if (state === "succeeded") return "ok";
+    if (state === "failed" || state === "lost") return "bad";
+    if (state === "killed") return "warn";
+    return "";
+  }
+
+  // The four categories the controller records when it takes a device out
+  // of the pool (internal/store/reaper.go). The API hands the dashboard ONE
+  // string for both: the operator-facing detail when there is one, and the
+  // bare category when there is not — so a reason that is exactly one of
+  // these four words is a category, and anything else is free text a host
+  // wrote. That is the only signal available without a server change, and
+  // it is a safe one: no host writes a detail that is exactly "fault" and
+  // nothing else, and if one did, the sentence shown would still be true.
+  var CATEGORIES = {
+    fault: {
+      headline: "The host reported a problem with this device.",
+      body: "The worker took it out of the pool itself — a check failed, or something it " +
+            "runs before a job would not start.",
+      advice: "Nothing was recorded about what failed. The worker's log on this host will " +
+              "say. A reboot does not clear this one: someone has to look."
+    },
+    worker_lost: {
+      headline: "The host stopped reporting.",
+      body: "The controller lost contact with the worker while this device was claimed, so " +
+            "the device was held back rather than handed to somebody else — whatever was " +
+            "running on it may still be running.",
+      advice: "If the host has since rebooted, the device comes back on its own once the " +
+              "worker registers again. Otherwise check that the worker is up on this host."
+    },
+    lease_expired: {
+      headline: "The claim on this device ran out.",
+      body: "Whoever held it stopped renewing, and nothing confirmed the work had finished, " +
+            "so the device was held back in case a process is still using it.",
+      advice: "Check the host for a leftover process holding the device, then return it to " +
+              "the pool. A reboot of the host clears this on its own."
+    },
+    registration: {
+      headline: "The worker restarted with work still in flight.",
+      body: "It came back without the job it had been running, so the device was held back " +
+            "in case that work is still on the machine.",
+      advice: "Confirm nothing is left running on the host, then return the device to the " +
+              "pool. A reboot of the host clears this on its own."
+    }
+  };
+
+  // The prefix internal/worker/verify.go stamps on a fault it raised after
+  // a job — worth telling apart, because it means the last job finished
+  // fine and the device did not.
+  var VERIFY_PREFIX = "verify failed: ";
+
+  // explain turns whatever the API put in quarantine_reason into a headline,
+  // an optional verbatim quote of what the host said, and what to do next.
+  function explain(reason) {
+    reason = String(reason || "");
+    if (!reason) {
+      return {
+        headline: "No reason was recorded.",
+        body: "This device was taken out of the pool before the controller kept reasons, " +
+              "or by something that did not give one.",
+        advice: "Check the host, then return it to the pool if it looks healthy.",
+        quote: ""
+      };
+    }
+    if (CATEGORIES[reason]) {
+      var c = CATEGORIES[reason];
+      return { headline: c.headline, body: c.body, advice: c.advice, quote: "" };
+    }
+    if (reason.indexOf(VERIFY_PREFIX) === 0) {
+      return {
+        headline: "A check after the last job found this device was not clean.",
+        body: "The job itself finished; the device did not pass the check that runs " +
+              "afterwards, so it was held back instead of being handed on.",
+        advice: "Usually a leftover process still holding the card. Deal with it on the " +
+                "host, then return the device to the pool.",
+        quote: reason.slice(VERIFY_PREFIX.length)
+      };
+    }
+    return {
+      headline: "The host reported a problem with this device.",
+      body: "The worker took it out of the pool itself and said why:",
+      advice: "A reboot does not clear this one — deal with what the host reported, then " +
+              "return the device to the pool.",
+      quote: reason
+    };
+  }
+
+  // ---- server calls -----------------------------------------------------
+
+  function authHeaders() { return { Authorization: "Bearer " + token }; }
 
   function serverError(r) {
     return r.text().then(function (body) {
@@ -380,7 +671,7 @@
 
   function killJob(job) {
     var short = job.id.slice(0, 8);
-    var what = "Kill job " + short + " on " + job.device_id + "?";
+    var what = "Kill job " + short + " on " + (job.device_id || "its device") + "?";
     if (job.submitter !== identity) {
       what += "\n\nIt was submitted by " + job.submitter + ", not by " + identity +
         " — the controller will refuse this unless you hold an admin token.";
@@ -397,14 +688,14 @@
     }).catch(function (e) { actFail(e.message); });
   }
 
-  // The only admin-authenticated call this page makes, and the only place an
+  // The only admin-authenticated calls this page makes, and the only place an
   // admin token ever exists in this tab. Read at the click, used for one
   // request, dropped on the next line — before the response arrives, so none
   // of the callbacks below can close over a live value. Never stored, never
   // returned, never held anywhere that outlives this call.
-  function clearDevice(id, why) {
+  function clearDevice(id, reason) {
     var msg = "Return " + id + " to the pool?";
-    if (why) msg += "\n\nIt was taken out because:\n" + why;
+    if (reason) msg += "\n\nIt was taken out because:\n" + explain(reason).headline;
     msg += "\n\nThis needs an admin token, and only works if nothing holds the device.";
     if (!window.confirm(msg)) return;
 
@@ -434,6 +725,10 @@
                   // flight: the callbacks below see null, never a token
     pending.then(function (r) {
       if (r.ok) { actOK("cleared " + id); refresh(); return; }
+      // A refusal is reported in the controller's own words rather than as
+      // a success: device_not_cleared means something still holds the
+      // device, and telling an operator it worked would be a lie they act
+      // on.
       return serverError(r).then(actFail);
     }).catch(function (e) { actFail(e.message); });
   }
@@ -462,237 +757,257 @@
       adminFetch("/v1/devices/" + encodeURIComponent(id), "DELETE", token, "retired " + id);
       return;
     }
-    var admin = window.prompt("Admin token to retire " + id + " (used once, never stored)");
-    if (admin === null) return;
-    admin = admin.trim();
-    if (!admin) { actFail("no admin token given; nothing was sent"); return; }
+    var adminToken = window.prompt("Admin token to retire " + id + " (used once, never stored)");
+    if (adminToken === null) return;
+    adminToken = adminToken.trim();
+    if (!adminToken) { actFail("no admin token given; nothing was sent"); return; }
     actOK("retiring " + id + "…");
-    var pending = fetch("/v1/devices/" + encodeURIComponent(id), {
-      method: "DELETE", headers: { Authorization: "Bearer " + admin }
+    var retiring = fetch("/v1/devices/" + encodeURIComponent(id), {
+      method: "DELETE", headers: { Authorization: "Bearer " + adminToken }
     });
-    admin = null;
-    pending.then(function (r) {
-      if (r.ok) { actOK("retired " + id); refresh(); return; }
+    adminToken = null; // same discipline as the clear path above
+    retiring.then(function (r) {
+      if (r.ok) { actOK("retired " + id); closePanel(); refresh(); return; }
       return serverError(r).then(actFail);
     }).catch(function (e) { actFail(e.message); });
   }
 
-  // The usage sheet is how a host explains itself — how to reach it, what is
-  // already on it, what not to run at once. It is per-device and can be long,
-  // so it is fetched only when someone opens the details rather than riding
-  // on every 5s poll of the whole fleet.
-  function loadSheet(id, into) {
-    if (sheets[id] !== undefined) { paintSheet(into, sheets[id]); return; }
-    fetch("/v1/devices/" + encodeURIComponent(id) + "/describe",
-          { headers: { Authorization: "Bearer " + token } })
-      .then(function (r) { return r.ok ? r.json() : null; })
-      .then(function (d) {
-        sheets[id] = d ? { text: d.sheet || "", hostWide: !!d.sheet_is_host_wide,
-                           age: d.sheet_age_seconds, jobs: d.recent_jobs || [] } : null;
-        paintSheet(into, sheets[id]);
-      })
-      .catch(function () { sheets[id] = null; paintSheet(into, null); });
+  // ---- activity feed ----------------------------------------------------
+  //
+  // The controller has no event history to replay: /v1/events is a live
+  // stream of "something changed" nudges and nothing persists them, so this
+  // feed can only ever cover the time the page has been open. It says so
+  // under the list rather than pretending otherwise.
+  //
+  // Timestamps are this browser's own clock at the moment an event was
+  // observed, and are only ever rendered as a delta against that same clock
+  // — the one measurement a skewed clock cannot corrupt. Server-stamped
+  // instants are not mixed in.
+
+  var feed = [];
+  var FEED_MAX = 120;
+
+  function record(entry) {
+    entry.at = entry.at || Date.now();
+    feed.push(entry);
+    feed.sort(function (a, b) { return b.at - a.at; });
+    if (feed.length > FEED_MAX) feed.length = FEED_MAX;
+    renderFeed();
   }
 
-  function paintSheet(into, s) {
-    into.textContent = "";
-    if (!s) return;
-
-    // Recent history answers the question a single state cannot: "has this
-    // box been failing?" A device that is ready right now and failed its
-    // last three jobs is not the same device as one that is simply ready.
-    // rc describe has always shown this; the page was throwing it away.
-    if (s.jobs && s.jobs.length) {
-      var hist = el("div", "hist");
-      hist.appendChild(el("span", "hd", "recent jobs"));
-      s.jobs.forEach(function (j) {
-        var line = el("div", "j");
-        var st = el("span", "jst " + (j.state === "succeeded" ? "ok" : "bad"), j.state);
-        line.appendChild(st);
-        line.appendChild(el("span", "jwho", j.submitter || "—"));
-        var cmd = (j.command || []).join(" ");
-        if (j.kind === "hold") cmd = "hold" + (j.reason ? " — " + j.reason : "");
-        line.appendChild(el("span", "jcmd mono", cmd));
-        if (j.kill_reason) line.appendChild(el("span", "jwhy", j.kill_reason));
-        hist.appendChild(line);
-      });
-      into.appendChild(hist);
-    }
-
-    if (!s.text) return;
-    var box = el("div", "sheet");
-    var hd = el("span", "hd", (s.hostWide ? "host note" : "device note") +
-      (typeof s.age === "number" ? " · updated " + ago(s.age) + " ago" : ""));
-    box.appendChild(hd);
-    box.appendChild(document.createTextNode(s.text));
-    into.appendChild(box);
-  }
-
-  // ---- rendering -------------------------------------------------------
-
-  function stateWord(v) {
-    var s = v.device.state;
-    if (s === "unhealthy") return "out of the pool";
-    if (s === "unknown") return "not reporting";
-    if (s === "busy") return "in use";
-    return "free";
-  }
-
-  function renderRow(v, queuedFor) {
-    var d = v.device;
-    var down = d.state === "unhealthy";
-    var row = el("div", "row" + (down ? " down" : ""));
-    row.appendChild(el("span", "pip " + d.state));
-
-    var body = el("div", "body");
-    var l1 = el("div", "line1");
-    // The short name reads better in a list already grouped by host, but the
-    // full ID is what an operator types into `rc run -d`, so keep it one
-    // hover away rather than gone.
-    var devName = el("span", "dev mono", d.name || d.id);
-    devName.title = d.id;
-    l1.appendChild(devName);
-    l1.appendChild(el("span", "state " + d.state, stateWord(v)));
-    var spec = specLine(v);
-    if (spec) l1.appendChild(el("span", "spec", spec));
-    body.appendChild(l1);
-
-    // Who has it and for how long — the question this page exists to answer.
-    if (v.holder) {
-      var l2 = el("div", "line2");
-      l2.appendChild(el("span", "who", v.holder));
-      if (v.kind === "hold" && v.reason) l2.appendChild(document.createTextNode(" — " + v.reason));
-      l2.appendChild(el("span", "dur", " · " + ago(v.elapsed_seconds)));
-      body.appendChild(l2);
-    }
-
-    // A worker that has gone quiet while still holding a lease is a ghost
-    // lease: the row says "in use" but nobody is confirming it.
-    if (v.heartbeat_age_seconds > 30) {
-      var q = el("div", "line2");
-      q.appendChild(el("span", "dur", "no contact for " + ago(v.heartbeat_age_seconds)));
-      body.appendChild(q);
-    }
-
-    // The explanation. Promoted above everything else on a device that is
-    // out of the pool, because it is what decides whether clearing is safe.
-    if (down) {
-      var why = el("div", "why");
-      why.appendChild(el("b", null, "Why: "));
-      why.appendChild(el("span", "txt mono", v.quarantine_reason || "no reason was recorded"));
-      body.appendChild(why);
-    }
-
-    if (v.kind !== "hold" && v.command && v.command.length) {
-      body.appendChild(el("div", "cmd mono", shortCmd(v.command)));
-    }
-
-    // Anything queued for this device, with how long it has waited. A wait
-    // over ten minutes is called out: that is the case the old page could
-    // not show at all.
-    if (queuedFor.length) {
-      var w = el("div", "waits");
-      queuedFor.forEach(function (j) {
-        var secs = j.waited;
-        var line = el("span", "w" + (secs >= 600 ? " long" : ""));
-        line.textContent = "waiting " + ago(secs) + " · " + j.submitter;
-        w.appendChild(line);
-      });
-      body.appendChild(w);
-    }
-
-    var detail = el("div", "detail hide");
-    body.appendChild(detail);
-    if (open[d.id]) { detail.classList.remove("hide"); fillDetail(detail, v); }
-
-    row.appendChild(body);
-
-    var right = el("div", "right");
-    if (down) {
-      var clear = el("button", "act danger", "Return to pool");
-      clear.type = "button";
-      clear.addEventListener("click", function () { clearDevice(d.id, v.quarantine_reason); });
-      right.appendChild(clear);
-    }
-    // Retiring is offered on anything nothing is holding: a dead card is the
-    // common case, but dropping a device you removed from a worker's config
-    // is just as ordinary and that device is perfectly healthy.
-    if (!v.holder) {
-      var retire = el("button", "act", "Retire");
-      retire.type = "button";
-      retire.title = "remove " + d.id + " from the fleet (admin)";
-      retire.addEventListener("click", function () { retireDevice(d.id); });
-      right.appendChild(retire);
-    }
-    if (v.job_id && identity) {
-      var job = { id: v.job_id, device_id: d.id, submitter: v.holder };
-      var kill = el("button", "act" + (v.holder === identity ? "" : " foreign"), "Kill");
-      kill.type = "button";
-      if (v.holder !== identity) kill.title = "submitted by " + v.holder +
-        ": the controller refuses a kill from anyone else";
-      kill.addEventListener("click", function () { killJob(job); });
-      right.appendChild(kill);
-    }
-    var more = el("button", "more", open[d.id] ? "less ▴" : "details ▾");
-    more.type = "button";
-    more.addEventListener("click", function () {
-      open[d.id] = !open[d.id];
-      more.textContent = open[d.id] ? "less ▴" : "details ▾";
-      detail.classList.toggle("hide", !open[d.id]);
-      if (open[d.id]) fillDetail(detail, v);
-    });
-    right.appendChild(more);
-    row.appendChild(right);
-    return row;
-  }
-
-  // Everything an operator scans past most of the time: every label with its
-  // provenance, and the host's own usage sheet.
-  function fillDetail(box, v) {
+  function renderFeed() {
+    var box = document.getElementById("feed");
     box.textContent = "";
-    var labels = (v.device.labels || []).slice().sort(function (a, b) {
-      return a.key < b.key ? -1 : a.key > b.key ? 1 : 0;
-    });
-    if (!labels.length) {
-      box.appendChild(el("div", "spec", "no labels reported"));
-    } else {
-      var dl = el("dl", "facts");
-      labels.forEach(function (l) {
-        dl.appendChild(el("dt", null, prettyKey(l.key)));
-        var dd = el("dd", null, prettyValue(l.key, l.value));
-        dd.appendChild(el("span", "src", l.source));
-        dl.appendChild(dd);
+    if (!feed.length) {
+      box.appendChild(el("div", "empty", "Nothing has happened yet."));
+      return;
+    }
+    feed.forEach(function (e) {
+      var row = el("div", "ev" + (e.tone ? " " + e.tone : ""));
+      var inner;
+      if (e.open) {
+        inner = el("button", "ev-open");
+        inner.type = "button";
+        inner.addEventListener("click", e.open);
+      } else {
+        inner = el("div", "ev-static");
+      }
+      var when = el("span", "ev-time", sinceLocal(e.at));
+      when.title = new Date(e.at).toLocaleTimeString();
+      e.timeEl = when;   // ticked in place once a second, rather than
+                         // rebuilding this list under the reader's cursor
+      inner.appendChild(when);
+      var body = el("span", "ev-text");
+      e.parts.forEach(function (p) {
+        if (typeof p === "string") body.appendChild(txt(p));
+        else body.appendChild(el("b", null, p.b));
       });
-      box.appendChild(dl);
-    }
-    // Server-computed, like every age here.
-    if (typeof v.oldest_label_age_seconds === "number" && v.oldest_label_age_seconds > 3600) {
-      box.appendChild(el("div", "agewarn",
-        "⚠ nothing has confirmed these facts for " + ago(v.oldest_label_age_seconds)));
-    }
-    var sheetBox = el("div");
-    box.appendChild(sheetBox);
-    loadSheet(v.device.id, sheetBox);
+      inner.appendChild(body);
+      row.appendChild(inner);
+      box.appendChild(row);
+    });
   }
+
+  function tickFeed() {
+    feed.forEach(function (e) {
+      if (e.timeEl) e.timeEl.textContent = sinceLocal(e.at);
+    });
+  }
+
+  function sinceLocal(at) {
+    var s = Math.floor((Date.now() - at) / 1000);
+    if (s < 5) return "now";
+    return ago(s);
+  }
+
+  // A job event arrives as {job_id, state} and nothing else, so the words
+  // come from whatever this page already knows about the job. If it knows
+  // nothing — an event for a job submitted from a terminal before this tab
+  // ever saw it — the job is fetched once and the sentence is filled in.
+  function noteJobEvent(payload) {
+    if (!payload || !payload.job_id) return;
+    var id = payload.job_id, state = payload.state;
+    var entry = {
+      parts: jobEventWords(jobIndex[id], id, state),
+      tone: (state === "failed" || state === "lost") ? "bad" : "",
+      open: function () { openJob(id); }
+    };
+    record(entry);
+    if (!jobIndex[id]) {
+      fetch("/v1/jobs/" + encodeURIComponent(id), { headers: authHeaders() })
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (v) {
+          if (!v || !v.job) return;
+          jobIndex[id] = v.job;
+          entry.parts = jobEventWords(v.job, id, state);
+          renderFeed();
+        })
+        .catch(function () { /* the short-ID sentence stands */ });
+    }
+  }
+
+  function jobEventWords(job, id, state) {
+    var who = job && job.submitter;
+    var where = (job && job.device_id) || "";
+    var target = where ? " on " + where
+      : (job && job.selector ? " on a device matching " + job.selector : "");
+    // Two subjects, because a person queues work but a job finishes: "alice
+    // was stopped" is not what happened. When the submitter is unknown, the
+    // job's own short ID is the subject either way.
+    var actor = [{ b: who || ("job " + id.slice(0, 8)) }];
+    var owned = who ? [{ b: who }, "'s job"] : [{ b: "job " + id.slice(0, 8) }];
+    switch (state) {
+      case "queued": return actor.concat([" queued work" + target]);
+      case "assigned": return owned.concat([" was given a device" + (where ? " — " + where : "")]);
+      case "running": return actor.concat([" started running" + target]);
+      case "succeeded": return owned.concat([" finished" + target]);
+      case "failed": return owned.concat([" failed" + target]);
+      case "killed": return owned.concat([" was stopped" + target]);
+      case "lost": return owned.concat([" was lost" + target]);
+    }
+    return owned.concat([" — " + jobStateWord(state) + target]);
+  }
+
+  // Device transitions are derived by diffing successive snapshots rather
+  // than read off an event: the `devices` event carries a whole snapshot
+  // too, so there is nothing extra on the wire to use, and diffing also
+  // covers the polling fallback when the stream is down.
+  //
+  // Deliberately quiet about ready↔busy caused by ordinary work: a job
+  // event already said "alice started running on gpubox:gpu0", and saying
+  // it twice is how a feed becomes noise. A hold has no such event worth
+  // reading, so it is announced here.
+  function noteDeviceChanges(views) {
+    var now = {};
+    views.forEach(function (v) {
+      now[v.device.id] = { state: v.device.state, holder: v.holder || "", kind: v.kind || "" };
+    });
+    if (prevDevices === null) { prevDevices = now; return; }
+
+    Object.keys(now).forEach(function (id) {
+      var was = prevDevices[id], is = now[id];
+      var opener = function () { openDevice(id); };
+      if (!was) {
+        record({ parts: [{ b: id }, " joined the fleet"], open: opener });
+        return;
+      }
+      if (was.state !== is.state) {
+        if (is.state === "unhealthy") {
+          var view = deviceIndex[id];
+          record({
+            parts: [{ b: id }, " left the pool — " +
+              explain(view && view.quarantine_reason).headline.toLowerCase().replace(/\.$/, "")],
+            tone: "bad", open: opener
+          });
+        } else if (was.state === "unhealthy") {
+          record({ parts: [{ b: id }, " is back in the pool"], open: opener });
+        } else if (is.state === "unknown") {
+          record({ parts: [{ b: id }, " stopped reporting"], tone: "bad", open: opener });
+        } else if (was.state === "unknown") {
+          record({ parts: [{ b: id }, " is reporting again"], open: opener });
+        }
+      }
+      if (is.kind === "hold" && was.kind !== "hold" && is.holder) {
+        record({ parts: [{ b: is.holder }, " took a hold on " + id], open: opener });
+      }
+      if (was.kind === "hold" && is.kind !== "hold" && was.holder) {
+        record({ parts: [{ b: was.holder }, " released " + id], open: opener });
+      }
+    });
+    Object.keys(prevDevices).forEach(function (id) {
+      if (!now[id]) record({ parts: [{ b: id }, " was retired"] });
+    });
+    prevDevices = now;
+  }
+
+  // The first snapshot is not a set of changes, but it does carry real,
+  // server-measured ages — so the feed opens with a true timeline of what
+  // is already happening rather than an empty box. Every seeded entry is
+  // backdated by the age the controller reported for it.
+  function seedFeed(state) {
+    (state.devices || []).forEach(function (v) {
+      if (!v.holder) return;
+      var id = v.device.id;
+      var at = Date.now() - (v.elapsed_seconds || 0) * 1000;
+      var words = v.kind === "hold"
+        ? [{ b: v.holder }, " took a hold on " + id + (v.reason ? " — " + clip(v.reason, 60) : "")]
+        : [{ b: v.holder }, " started running on " + id];
+      record({ parts: words, at: at, open: function () { openDevice(id); } });
+    });
+    (state.queued || []).forEach(function (j) {
+      var waited = (state.queued_waiting_seconds || {})[j.id] || 0;
+      record({
+        parts: jobEventWords(j, j.id, "queued"),
+        at: Date.now() - waited * 1000,
+        open: function () { openJob(j.id); }
+      });
+    });
+    // Nothing records WHEN a device was quarantined, so the ones already out
+    // of the pool cannot be placed on this timeline honestly. They get one
+    // line saying so — the board above is where they are actually shown, in
+    // full and in red.
+    var out = (state.devices || []).filter(function (v) { return v.device.state === "unhealthy"; });
+    if (out.length) {
+      record({
+        parts: [out.length === 1 ? "1 device was" : out.length + " devices were",
+                " already out of the pool when this page opened"],
+        tone: "bad"
+      });
+    }
+  }
+
+  // ---- the board --------------------------------------------------------
 
   function render(state) {
     err.textContent = "";
     connectEvents();
+    latest = state;
 
     var views = state.devices || [];
-    var waitingBy = {};
-    (state.queued || []).forEach(function (j) {
-      var secs = (state.queued_waiting_seconds || {})[j.id];
-      var entry = { submitter: j.submitter, waited: typeof secs === "number" ? secs : 0 };
-      (waitingBy[j.device_id] = waitingBy[j.device_id] || []).push(entry);
-    });
+    deviceIndex = {};
+    views.forEach(function (v) { deviceIndex[v.device.id] = v; });
+    (state.jobs || []).concat(state.queued || []).forEach(function (j) { jobIndex[j.id] = j; });
 
-    // The fleet in one sentence. Counting cards is work; this is not.
-    var free = 0, busy = 0, down = 0;
+    // The first snapshot is a baseline, not a set of changes: it seeds the
+    // feed with what is already happening instead of announcing the whole
+    // fleet as if it had just arrived.
+    var first = prevDevices === null;
+    noteDeviceChanges(views);
+    if (first) seedFeed(state);
+
+    renderSummary(state, views);
+    renderFleet(views, state);
+    renderWork(state, views);
+    if (panelView) renderPanel();
+  }
+
+  function renderSummary(state, views) {
+    var free = 0, busy = 0, down = 0, quiet = 0;
     views.forEach(function (v) {
       if (v.device.state === "unhealthy") down++;
       else if (v.device.state === "busy") busy++;
       else if (v.device.state === "ready") free++;
+      else quiet++;
     });
     var sum = document.getElementById("summary");
     sum.textContent = "";
@@ -700,24 +1015,47 @@
       sum.textContent = "No devices yet.";
     } else {
       sum.appendChild(el("b", null, String(free)));
-      sum.appendChild(document.createTextNode(free === 1 ? " device free, " : " devices free, "));
+      sum.appendChild(txt(free === 1 ? " device free, " : " devices free, "));
       sum.appendChild(el("b", null, String(busy)));
-      sum.appendChild(document.createTextNode(busy === 1 ? " in use" : " in use"));
+      sum.appendChild(txt(" in use"));
+      if (quiet) sum.appendChild(txt(", " + quiet + " not reporting"));
       if (down) {
-        sum.appendChild(document.createTextNode(", "));
+        sum.appendChild(txt(", "));
         sum.appendChild(el("span", "bad", down + " out of the pool"));
       }
-      sum.appendChild(document.createTextNode("."));
+      sum.appendChild(txt("."));
     }
-    var queuedCount = (state.queued || []).length;
-    document.getElementById("sub").textContent = queuedCount
-      ? queuedCount + (queuedCount === 1 ? " job waiting for a device." : " jobs waiting for a device.")
-      : "Nothing waiting.";
 
-    var byHost = {};
-    views.forEach(function (v) {
-      var h = v.device.host || "—";
-      (byHost[h] = byHost[h] || []).push(v);
+    // The queue, with the one fact a snapshot cannot show: that something
+    // has been waiting far longer than it should.
+    var sub = document.getElementById("sub");
+    sub.textContent = "";
+    var queued = state.queued || [];
+    var waits = state.queued_waiting_seconds || {};
+    if (!queued.length) {
+      sub.textContent = "Nothing waiting.";
+      return;
+    }
+    var longest = 0;
+    queued.forEach(function (j) { longest = Math.max(longest, waits[j.id] || 0); });
+    sub.appendChild(txt(queued.length + (queued.length === 1 ? " job waiting" : " jobs waiting")));
+    if (longest >= 600) {
+      sub.appendChild(txt(" — "));
+      sub.appendChild(el("span", "long", "one for " + ago(longest)));
+      sub.appendChild(txt("."));
+    } else {
+      sub.appendChild(txt(", longest " + ago(longest) + "."));
+    }
+  }
+
+  function renderFleet(views, state) {
+    var waitingBy = {};
+    (state.queued || []).forEach(function (j) {
+      if (!j.device_id) return;
+      var secs = (state.queued_waiting_seconds || {})[j.id];
+      (waitingBy[j.device_id] = waitingBy[j.device_id] || []).push({
+        submitter: j.submitter, waited: typeof secs === "number" ? secs : 0
+      });
     });
 
     var fleet = document.getElementById("fleet");
@@ -728,25 +1066,791 @@
       fleet.appendChild(e);
       return;
     }
+
+    var byHost = {};
+    views.forEach(function (v) {
+      var h = v.device.host || "—";
+      (byHost[h] = byHost[h] || []).push(v);
+    });
     Object.keys(byHost).sort().forEach(function (h) {
       var sec = el("div", "host");
       var hd = el("div", "host-name");
       hd.appendChild(el("span", null, h));
-      var hostFacts = hostSummary(byHost[h]);
-      if (hostFacts) hd.appendChild(el("span", "host-note", hostFacts));
+      var facts = hostSummary(byHost[h]);
+      if (facts) hd.appendChild(el("span", "host-note", facts));
       sec.appendChild(hd);
       var rows = el("div", "rows");
-      byHost[h].sort(function (a, b) {
-        return a.device.id < b.device.id ? -1 : 1;
-      }).forEach(function (v) {
-        rows.appendChild(renderRow(v, waitingBy[v.device.id] || []));
-      });
+      byHost[h].sort(function (a, b) { return a.device.id < b.device.id ? -1 : 1; })
+        .forEach(function (v) { rows.appendChild(deviceRow(v, waitingBy[v.device.id] || [])); });
       sec.appendChild(rows);
       fleet.appendChild(sec);
     });
   }
 
-  // ---- liveness --------------------------------------------------------
+  function deviceRow(v, queuedFor) {
+    var d = v.device;
+    var down = d.state === "unhealthy";
+    var row = el("div", "row" + (down ? " down" : ""));
+
+    var open = el("button", "open");
+    open.type = "button";
+    open.addEventListener("click", function () { openDevice(d.id); });
+
+    var l1 = el("div", "line1");
+    l1.appendChild(el("span", "pip " + d.state));
+    // The short name reads better in a list already grouped by host, but the
+    // full ID is what an operator types into `rc run -d`, so keep it one
+    // hover away rather than gone.
+    var name = el("span", "dev mono", d.name || d.id);
+    name.title = d.id;
+    l1.appendChild(name);
+    l1.appendChild(el("span", "state " + d.state, stateWord(d.state)));
+    var spec = specLine(v);
+    if (spec) l1.appendChild(el("span", "spec", spec));
+    open.appendChild(l1);
+
+    // Who has it and for how long — the question this page exists to answer.
+    if (v.holder) {
+      var l2 = el("div", "line2");
+      l2.appendChild(el("span", "who", v.holder));
+      if (v.kind === "hold") l2.appendChild(txt(" is holding it" + (v.reason ? " — " + clip(v.reason, 60) : "")));
+      l2.appendChild(el("span", "dur", " · " + ago(v.elapsed_seconds)));
+      open.appendChild(l2);
+    }
+
+    // A worker that has gone quiet while still holding a claim is a ghost:
+    // the row says "in use" but nobody is confirming it.
+    if (v.heartbeat_age_seconds > 30) {
+      var quiet = el("div", "line2");
+      quiet.appendChild(el("span", "quiet",
+        "nothing heard from this host for " + ago(v.heartbeat_age_seconds)));
+      open.appendChild(quiet);
+    }
+
+    // The explanation, promoted above everything else on a device that is
+    // out of the pool, because it decides whether returning it is safe.
+    // Only the headline here: the host's own words can be long, and they
+    // are one click away in full.
+    if (down) {
+      var reason = explain(v.quarantine_reason);
+      var why = el("div", "why");
+      why.appendChild(el("b", null, reason.headline));
+      if (reason.quote) why.appendChild(el("span", "txt", clip(reason.quote, 160)));
+      open.appendChild(why);
+    }
+
+    if (v.kind !== "hold" && v.command && v.command.length) {
+      open.appendChild(el("div", "cmd mono", clip(v.command.join(" "), 200)));
+    }
+
+    if (queuedFor.length) {
+      var w = el("div", "waits");
+      queuedFor.forEach(function (j) {
+        var line = el("span", "w" + (j.waited >= 600 ? " long" : ""));
+        line.textContent = "waiting " + ago(j.waited) + " · " + j.submitter;
+        w.appendChild(line);
+      });
+      open.appendChild(w);
+    }
+
+    row.appendChild(open);
+
+    var actions = el("div", "actions");
+    if (down) {
+      actions.appendChild(button("act danger", "Return to pool", function () {
+        clearDevice(d.id, v.quarantine_reason);
+      }));
+    }
+    // No kill control here: the work list below carries one for every
+    // running job, and putting the same button in two places on the board
+    // is exactly the instrumentation this page is trying not to be.
+    actions.appendChild(el("span", "chev", "›"));
+    row.appendChild(actions);
+    return row;
+  }
+
+  // Work is the second half of the board: what is running right now and
+  // what is waiting for a device, each one click from its own detail and
+  // its live output. Running work is read off the device views because
+  // their elapsed time is server-measured; queued work off the queue, for
+  // the same reason.
+  function renderWork(state, views) {
+    var box = document.getElementById("work");
+    var section = document.getElementById("workSection");
+    box.textContent = "";
+
+    var running = views.filter(function (v) { return v.job_id; });
+    var queued = state.queued || [];
+    if (!running.length && !queued.length) {
+      section.classList.add("hide");
+      return;
+    }
+    section.classList.remove("hide");
+
+    var rows = el("div", "rows");
+    running.forEach(function (v) { rows.appendChild(workRow(v, null, state)); });
+    queued.forEach(function (j) { rows.appendChild(workRow(null, j, state)); });
+    box.appendChild(rows);
+  }
+
+  function workRow(view, queuedJob, state) {
+    var row = el("div", "row");
+    var open = el("button", "open");
+    open.type = "button";
+
+    var jobID = view ? view.job_id : queuedJob.id;
+    var submitter = view ? view.holder : queuedJob.submitter;
+    var device = view ? view.device.id : (queuedJob.device_id || "");
+    var isHold = view ? view.kind === "hold" : queuedJob.kind === "hold";
+    open.addEventListener("click", function () { openJob(jobID); });
+
+    var l1 = el("div", "line1");
+    l1.appendChild(el("span", "pip" + (view ? " busy" : "")));
+    l1.appendChild(el("span", "dev", submitter || "—"));
+    if (view) {
+      l1.appendChild(el("span", "state busy", isHold ? "holding" : "running"));
+      l1.appendChild(el("span", "spec", ago(view.elapsed_seconds)));
+    } else {
+      var waited = (state.queued_waiting_seconds || {})[queuedJob.id] || 0;
+      // Waiting is not a fault, so it is grey until it has gone on long
+      // enough to be one.
+      l1.appendChild(el("span", "state waiting", "waiting for a device"));
+      // A wait past ten minutes is the case a snapshot could never show,
+      // and the one worth colouring.
+      l1.appendChild(el("span", "spec" + (waited >= 600 ? " long" : ""), ago(waited)));
+    }
+    open.appendChild(l1);
+
+    var l2 = el("div", "line2");
+    l2.appendChild(el("span", "dur", device ? device
+      : (queuedJob && queuedJob.selector ? "any device matching " + clip(queuedJob.selector, 60)
+                                         : "no device yet")));
+    open.appendChild(l2);
+
+    // The command, one dim line, never wider than its column.
+    var cmd = view ? (view.kind === "hold" ? "hold" + (view.reason ? " — " + view.reason : "")
+                                           : (view.command || []).join(" "))
+                   : commandText(queuedJob);
+    if (cmd) open.appendChild(el("div", "cmd mono", clip(cmd, 200)));
+
+    row.appendChild(open);
+
+    var actions = el("div", "actions");
+    if (identity) {
+      var mine = submitter === identity;
+      var kill = button("act" + (mine ? "" : " foreign"), isHold ? "Release" : "Kill", function () {
+        killJob({ id: jobID, device_id: device, submitter: submitter });
+      });
+      if (!mine) kill.title = "submitted by " + submitter +
+        ": the controller refuses a kill from anyone else";
+      actions.appendChild(kill);
+    }
+    actions.appendChild(el("span", "chev", "›"));
+    row.appendChild(actions);
+    return row;
+  }
+
+  // ---- detail panel -----------------------------------------------------
+  //
+  // One panel, two kinds of subject, and a one-step back stack so a device
+  // can lead to a job and a job back to its device. The board keeps
+  // updating underneath: the panel re-renders on every refresh, except for
+  // the log pane, which is a live stream and is carried across re-renders
+  // untouched.
+
+  var panelView = null;   // {kind:"device"|"job", id:string}
+  var panelStack = [];
+  var panelBody = document.getElementById("panelBody");
+
+  function openDevice(id) { pushView({ kind: "device", id: id }); }
+  function openJob(id) { pushView({ kind: "job", id: id }); }
+
+  function pushView(v) {
+    if (panelView) panelStack.push(panelView);
+    panelView = v;
+    dropLogBlock();
+    panelBody.scrollTop = 0;
+    document.getElementById("panel").classList.remove("hide");
+    document.getElementById("scrim").classList.remove("hide");
+    document.getElementById("panelBack").classList.toggle("hide", !panelStack.length);
+    renderPanel();
+  }
+
+  function backView() {
+    if (!panelStack.length) { closePanel(); return; }
+    panelView = panelStack.pop();
+    dropLogBlock();
+    document.getElementById("panelBack").classList.toggle("hide", !panelStack.length);
+    renderPanel();
+  }
+
+  function closePanel() {
+    panelView = null;
+    panelStack = [];
+    dropLogBlock();
+    document.getElementById("panel").classList.add("hide");
+    document.getElementById("scrim").classList.add("hide");
+  }
+
+  // The panel is rebuilt on every state refresh so it never shows a stale
+  // picture — but the reader's scroll position is theirs, not ours, and the
+  // log pane is a live stream that is carried across untouched (see
+  // logBlock).
+  function renderPanel() {
+    if (!panelView) return;
+    var scroll = panelBody.scrollTop;
+    panelBody.textContent = "";
+    document.getElementById("panelKind").textContent =
+      panelView.kind === "device" ? "device" : "job";
+    if (panelView.kind === "device") renderDevicePanel(panelView.id);
+    else renderJobPanel(panelView.id);
+    panelBody.scrollTop = scroll;
+  }
+
+  function renderDevicePanel(id) {
+    document.getElementById("panelTitle").textContent = id;
+    var v = deviceIndex[id];
+    if (!v) {
+      panelBody.appendChild(el("p", "under", "This device is no longer in the fleet."));
+      return;
+    }
+    var d = v.device;
+
+    panelBody.appendChild(el("p", "big " + d.state, stateWord(d.state)));
+    var under = el("p", "under");
+    if (v.holder) {
+      under.appendChild(txt((v.kind === "hold" ? "held by " : "running work for ") + v.holder +
+        " for " + ago(v.elapsed_seconds)));
+    } else if (d.state === "ready") {
+      under.appendChild(txt("nothing is using it"));
+    } else if (d.state === "unknown") {
+      under.appendChild(txt("nothing heard from this host for " + ago(v.heartbeat_age_seconds)));
+    }
+    panelBody.appendChild(under);
+
+    // Why it is out of the pool, in full: headline, the host's own words
+    // verbatim, and what to do next. This is the reason this panel exists.
+    if (d.state === "unhealthy") {
+      var reason = explain(v.quarantine_reason);
+      var note = el("div", "note alarm");
+      note.appendChild(el("h3", null, reason.headline));
+      if (reason.body) note.appendChild(el("p", null, reason.body));
+      if (reason.quote) note.appendChild(el("span", "quote", reason.quote));
+      if (reason.advice) note.appendChild(el("p", null, reason.advice));
+      panelBody.appendChild(note);
+    } else if (v.heartbeat_age_seconds > 30 && v.holder) {
+      var stale = el("div", "note caution");
+      stale.appendChild(el("h3", null, "Nobody is confirming this work."));
+      stale.appendChild(el("p", null, "The host has not been heard from for " +
+        ago(v.heartbeat_age_seconds) + ", so what is shown here may already be over."));
+      panelBody.appendChild(stale);
+    }
+
+    // Current work, one click away.
+    if (v.job_id) {
+      var block = el("div", "block");
+      block.appendChild(el("h3", "sec", "Current work"));
+      var jobBtn = el("button", "jrow");
+      jobBtn.type = "button";
+      jobBtn.addEventListener("click", function () { openJob(v.job_id); });
+      jobBtn.appendChild(el("span", "jst", v.kind === "hold" ? "holding" : "running"));
+      jobBtn.appendChild(el("span", "jwho", v.holder || "—"));
+      jobBtn.appendChild(el("span", "jcmd mono",
+        clip(v.kind === "hold" ? (v.reason || "hold") : (v.command || []).join(" "), 200)));
+      block.appendChild(jobBtn);
+      panelBody.appendChild(block);
+    }
+
+    // Actions, gathered rather than scattered.
+    var actions = el("div", "block");
+    var actionRow = el("div", "line1");
+    if (d.state === "unhealthy") {
+      actionRow.appendChild(button("act danger", "Return to pool", function () {
+        clearDevice(d.id, v.quarantine_reason);
+      }));
+    }
+    if (!v.holder) {
+      var retire = button("act", "Retire", function () { retireDevice(d.id); });
+      retire.title = "remove " + d.id + " from the fleet (admin)";
+      actionRow.appendChild(retire);
+    }
+    if (actionRow.childNodes.length) {
+      actions.appendChild(actionRow);
+      panelBody.appendChild(actions);
+    }
+
+    // Facts, with provenance. describe is painted from cache first so
+    // reopening a device never flashes empty, and refetched only when what
+    // is cached has had time to go stale — this panel is rebuilt on every
+    // five-second refresh, and a per-device store query on each of those
+    // would be a poll nobody asked for.
+    var factsBox = el("div", "block");
+    panelBody.appendChild(factsBox);
+    var cached = describes[id];
+    paintDescribe(factsBox, v, cached);
+    if (cached && Date.now() - cached.fetchedAt < 15000) return;
+    fetch("/v1/devices/" + encodeURIComponent(id) + "/describe", { headers: authHeaders() })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (data) {
+        if (!data) return;
+        data.fetchedAt = Date.now();
+        describes[id] = data;
+        if (panelView && panelView.kind === "device" && panelView.id === id) {
+          paintDescribe(factsBox, v, data);
+        }
+      })
+      .catch(function () { /* the labels from /v1/state still stand */ });
+  }
+
+  function paintDescribe(box, v, data) {
+    box.textContent = "";
+
+    var labels = ((data && data.labels) || (v.device && v.device.labels) || []).slice()
+      .sort(function (a, b) { return a.key < b.key ? -1 : a.key > b.key ? 1 : 0; });
+    var ages = (data && data.label_age_seconds) || null;
+
+    box.appendChild(el("h3", "sec", "What this is"));
+    if (!labels.length) {
+      box.appendChild(el("p", "under", "Nothing has reported any facts about this device."));
+    } else {
+      var dl = el("dl", "facts");
+      labels.forEach(function (l) {
+        dl.appendChild(el("dt", null, prettyKey(l.key)));
+        var dd = el("dd", null, prettyValue(l.key, l.value));
+        // "detected" means a probe on the host found it; "declared" means
+        // the operator wrote it into the worker's config. A hand-written
+        // value that survived a hardware change is worse than none, so the
+        // difference is always shown.
+        dd.appendChild(el("span", "src", l.source === "declared" ? "written by hand" : "detected"));
+        // An age missing from the map is an explicit unknown, never a
+        // zero: "0s ago" is indistinguishable from the freshest possible
+        // reading, which is exactly the confusion this guards against.
+        if (ages) {
+          var key = l.key + "/" + l.source;
+          var age = Object.prototype.hasOwnProperty.call(ages, key) ? ages[key] : null;
+          dd.appendChild(el("span", "src", age === null ? "age unknown" : "seen " + ago(age) + " ago"));
+        }
+        dl.appendChild(dd);
+      });
+      box.appendChild(dl);
+    }
+    if (typeof v.oldest_label_age_seconds === "number" && v.oldest_label_age_seconds > 3600) {
+      box.appendChild(el("div", "agewarn",
+        "Nothing has confirmed these facts for " + ago(v.oldest_label_age_seconds) + "."));
+    }
+
+    if (data && data.sheet) {
+      var sheetBlock = el("div", "block");
+      sheetBlock.style.marginTop = "20px";
+      sheetBlock.appendChild(el("h3", "sec",
+        (data.sheet_is_host_wide ? "How to use this host" : "How to use this device") +
+        (typeof data.sheet_age_seconds === "number" ? " · written " + ago(data.sheet_age_seconds) + " ago" : "")));
+      var sheet = el("div", "sheet");
+      sheet.appendChild(renderMarkdown(data.sheet));
+      sheetBlock.appendChild(sheet);
+      box.appendChild(sheetBlock);
+    }
+
+    // Recent history answers the question a single state cannot: "has this
+    // box been failing?" A device that is ready right now and failed its
+    // last three jobs is not the same device as one that is simply ready.
+    // The job it is running right now is already shown above, so it is not
+    // repeated here.
+    var recent = ((data && data.recent_jobs) || []).filter(function (j) { return j.id !== v.job_id; });
+    if (recent.length) {
+      var hist = el("div", "block");
+      hist.style.marginTop = "20px";
+      hist.appendChild(el("h3", "sec", "Recently on this device"));
+      recent.forEach(function (j) {
+        jobIndex[j.id] = j;
+        var line = el("button", "jrow");
+        line.type = "button";
+        line.addEventListener("click", function () { openJob(j.id); });
+        line.appendChild(el("span", "jst " + jobStateClass(j.state), jobStateShort(j.state)));
+        line.appendChild(el("span", "jwho", j.submitter || "—"));
+        line.appendChild(el("span", "jcmd mono", clip(commandText(j), 200)));
+        hist.appendChild(line);
+      });
+      box.appendChild(hist);
+    }
+  }
+
+  function renderJobPanel(id) {
+    document.getElementById("panelTitle").textContent = "job " + id.slice(0, 8);
+    var known = jobIndex[id];
+    var meta = el("div");
+    panelBody.appendChild(meta);
+    if (known) paintJob(meta, id, known, null);
+    else meta.appendChild(el("p", "under", "loading…"));
+
+    fetch("/v1/jobs/" + encodeURIComponent(id), { headers: authHeaders() })
+      .then(function (r) {
+        if (!r.ok) return serverError(r).then(function (m) { throw new Error(m); });
+        return r.json();
+      })
+      .then(function (v) {
+        jobIndex[id] = v.job;
+        if (panelView && panelView.kind === "job" && panelView.id === id) {
+          paintJob(meta, id, v.job, v.queue_position);
+        }
+      })
+      .catch(function (e) {
+        if (!known && panelView && panelView.kind === "job" && panelView.id === id) {
+          meta.textContent = "";
+          meta.appendChild(el("p", "under", "This job could not be read: " + e.message));
+        }
+      });
+  }
+
+  function paintJob(box, id, job, queuePosition) {
+    box.textContent = "";
+
+    var stateClass = job.state === "failed" || job.state === "lost" ? "failed"
+      : job.state === "succeeded" ? "done" : "busy";
+    box.appendChild(el("p", "big " + stateClass, jobStateWord(job.state)));
+
+    var under = el("p", "under");
+    under.appendChild(txt((job.submitter || "someone") + " · "));
+    if (job.device_id) {
+      under.appendChild(button("linkish", job.device_id, function () { openDevice(job.device_id); }));
+    } else {
+      under.appendChild(txt(job.selector ? "any device matching " + job.selector : "no device yet"));
+    }
+    box.appendChild(under);
+
+    // How long, from the numbers the controller measured. A queued job's
+    // wait and a running job's elapsed both come off /v1/state rather than
+    // being computed here.
+    var waits = (latest && latest.queued_waiting_seconds) || {};
+    var view = job.device_id ? deviceIndex[job.device_id] : null;
+    if (job.state === "queued" && typeof waits[id] === "number") {
+      var wait = el("div", "note" + (waits[id] >= 600 ? " caution" : ""));
+      wait.appendChild(el("h3", null, "Waiting " + ago(waits[id]) + " for a device."));
+      var why = job.device_id
+        ? "It asked for " + job.device_id + " by name, so it waits for that one device."
+        : "It will start on the first matching device that comes free.";
+      // queue_position is 1-based, so position 1 means nothing is ahead of
+      // it (see store.QueuePosition). Saying "1 job ahead" for that would be
+      // off by one in the direction that makes a queue look worse than it is.
+      if (queuePosition === 1) why += " It is next in line.";
+      else if (queuePosition > 1) why += " There " + (queuePosition === 2 ? "is 1 job" : "are " + (queuePosition - 1) + " jobs") +
+        " ahead of it.";
+      if (waits[id] >= 600) why += " That is a long wait — check whether whatever holds the device is stuck.";
+      wait.appendChild(el("p", null, why));
+      box.appendChild(wait);
+    } else if (view && view.job_id === id && view.elapsed_seconds) {
+      box.appendChild(el("p", "under", "Running for " + ago(view.elapsed_seconds) + "."));
+    }
+
+    if (job.kill_reason) {
+      var stopped = el("div", "note caution");
+      stopped.appendChild(el("h3", null, "Why it stopped"));
+      stopped.appendChild(el("p", null, job.kill_reason));
+      box.appendChild(stopped);
+    }
+
+    var facts = el("dl", "facts");
+    function fact(k, val) {
+      if (val === undefined || val === null || val === "") return;
+      facts.appendChild(el("dt", null, k));
+      facts.appendChild(el("dd", null, String(val)));
+    }
+    fact("job id", id);
+    fact("submitted", clockTime(job.submitted_at));
+    fact("started", job.started_at ? clockTime(job.started_at) : "");
+    fact("finished", job.finished_at ? clockTime(job.finished_at) : "");
+    if (typeof job.exit_code === "number") fact("exit code", job.exit_code);
+    if (job.priority) fact("priority", job.priority);
+    if (job.max_runtime_seconds) fact("time limit", ago(job.max_runtime_seconds));
+    if (job.cwd) fact("working directory", job.cwd);
+    if (job.kind === "hold") fact("kind", "a hold — the device is claimed, nothing is being run for it");
+    if (job.stdio === "tty") fact("output", "attached to a terminal (rc attach)");
+    if (job.stdio === "pipe") fact("output", "attached to a pipe (rc cp)");
+    var block = el("div", "block");
+    block.appendChild(el("h3", "sec", "Details"));
+    block.appendChild(facts);
+    box.appendChild(block);
+
+    // The full command, on demand and out of the way — the thing that used
+    // to be the widest element on the page. Shown in a bounded, wrapped,
+    // scrollable box with its size stated, so a 6 kB base64 argument is a
+    // scrollbar rather than a broken layout.
+    if (job.kind !== "hold" && job.command && job.command.length) {
+      var full = (job.command || []).join(" ");
+      var cmdBlock = el("div", "block");
+      var head = el("div", "full-head");
+      head.appendChild(el("h3", "sec", "Command" + (full.length > 400 ? " · " + bytes(full.length) : "")));
+      head.appendChild(button("tiny", "copy", function () { copyText(full); }));
+      cmdBlock.appendChild(head);
+      cmdBlock.appendChild(el("pre", "full mono", full));
+      box.appendChild(cmdBlock);
+    }
+
+    if (identity && !terminalState(job.state)) {
+      var actions = el("div", "block");
+      var kill = button("act" + (job.submitter === identity ? "" : " foreign"),
+        job.kind === "hold" ? "Release this hold" : "Kill this job",
+        function () { killJob({ id: id, device_id: job.device_id, submitter: job.submitter }); });
+      actions.appendChild(kill);
+      box.appendChild(actions);
+    }
+
+    // The output pane is built once per job and then carried across every
+    // re-render of this panel: rebuilding it would restart the stream from
+    // the top of the file every five seconds, which is both a waste of the
+    // controller's file handles and unreadable. It IS rebuilt when a job
+    // that had nothing to show starts running.
+    if (logBlock === null || logBlockJob !== id || (logBlockQueued && job.state !== "queued")) {
+      logBlock = logSection(id, job);
+      logBlockJob = id;
+      logBlockQueued = job.state === "queued";
+    }
+    box.appendChild(logBlock);
+  }
+
+  function terminalState(s) {
+    return s === "succeeded" || s === "failed" || s === "killed" || s === "lost";
+  }
+
+  function copyText(s) {
+    if (!navigator.clipboard) { actFail("this browser will not let the page copy — select it instead"); return; }
+    navigator.clipboard.writeText(s).then(function () { actOK("copied"); },
+      function () { actFail("could not copy — select it instead"); });
+  }
+
+  // ---- the live log -----------------------------------------------------
+  //
+  // /v1/jobs/{id}/logs is not SSE: it is a plain streaming response that
+  // ends when the job does. It is read chunk by chunk off a ReadableStream
+  // and appended as text nodes, so output appears as it is produced rather
+  // than when the job ends.
+
+  var logAbort = null, logPane = null, logStatus = null, logChars = 0;
+  var logBlock = null, logBlockJob = null, logBlockQueued = false;
+  var LOG_CAP = 400000;   // characters kept in the DOM; older output is dropped
+
+  function stopLogStream() {
+    if (logAbort) { logAbort.abort(); logAbort = null; }
+    logPane = null;
+    logStatus = null;
+    logChars = 0;
+  }
+
+  // Called whenever the panel moves to a different subject: the stream is
+  // dropped and the pane with it, so nothing keeps a connection open to a
+  // job nobody is looking at any more.
+  function dropLogBlock() {
+    stopLogStream();
+    logBlock = null;
+    logBlockJob = null;
+    logBlockQueued = false;
+  }
+
+  function logSection(id, job) {
+    var block = el("div", "block");
+    block.appendChild(el("h3", "sec", "Output"));
+
+    if (job.stdio === "tty" || job.stdio === "pipe") {
+      block.appendChild(el("p", "under",
+        "This job's output goes straight to whoever attached to it, not to the controller. " +
+        "Use rc attach from a terminal."));
+      return block;
+    }
+    if (job.state === "queued") {
+      block.appendChild(el("p", "under", "Nothing has run yet."));
+      return block;
+    }
+    if (job.kind === "hold") {
+      block.appendChild(el("p", "under", "A hold runs nothing, so it produces no output."));
+      return block;
+    }
+
+    var pre = el("pre", "log mono");
+    var status = el("div", "log-status");
+    status.appendChild(el("span", null, "waiting for output…"));
+    block.appendChild(pre);
+    block.appendChild(status);
+
+    // Only one stream at a time, and it is dropped the moment the panel
+    // moves on: an abandoned reader keeps a connection, a goroutine and a
+    // file handle alive on the controller.
+    stopLogStream();
+    logPane = pre;
+    logStatus = status;
+    logChars = 0;
+    var ctrl = new AbortController();
+    logAbort = ctrl;
+
+    fetch("/v1/jobs/" + encodeURIComponent(id) + "/logs",
+          { headers: authHeaders(), signal: ctrl.signal })
+      .then(function (r) {
+        if (!r.ok) return serverError(r).then(function (m) { logSay("no output: " + m, "bad"); });
+        if (!r.body) { logSay("this browser cannot stream the log", "bad"); return; }
+        logSay("streaming", "streaming");
+        var reader = r.body.getReader();
+        var decoder = new TextDecoder();
+        function pump() {
+          return reader.read().then(function (res) {
+            if (ctrl !== logAbort) { reader.cancel(); return; }
+            if (res.done) {
+              logAppend(decoder.decode());
+              logSay(logChars ? "output ended" : "the job produced no output");
+              return;
+            }
+            logAppend(decoder.decode(res.value, { stream: true }));
+            return pump();
+          });
+        }
+        return pump();
+      })
+      .catch(function (e) {
+        if (e && e.name === "AbortError") return;
+        logSay("the log stream stopped: " + e.message, "bad");
+      });
+
+    return block;
+  }
+
+  function logSay(text, cls) {
+    if (!logStatus) return;
+    logStatus.textContent = "";
+    logStatus.appendChild(el("span", cls || null, text));
+  }
+
+  function logAppend(chunk) {
+    if (!chunk || !logPane) return;
+    var pane = logPane;
+    var atBottom = pane.scrollHeight - pane.scrollTop - pane.clientHeight < 30;
+    pane.appendChild(txt(chunk));
+    logChars += chunk.length;
+    // Bounded: a job that prints for a day must not grow this tab without
+    // limit. The oldest nodes go first, which is the right end to lose.
+    while (logChars > LOG_CAP && pane.firstChild && pane.childNodes.length > 1) {
+      logChars -= (pane.firstChild.textContent || "").length;
+      pane.removeChild(pane.firstChild);
+    }
+    // Stick to the bottom only if the reader was already there: scrolling
+    // up to read something must not be undone by the next chunk.
+    if (atBottom) pane.scrollTop = pane.scrollHeight;
+  }
+
+  // ---- usage sheets -----------------------------------------------------
+  //
+  // A usage sheet is Markdown an operator wrote on the host, and it is the
+  // most important prose on this page — it is how a machine explains itself.
+  // It is also, from this page's point of view, untrusted input: it arrives
+  // over the API and nothing this page can check wrote it.
+  //
+  // So this renderer builds DOM nodes and only DOM nodes. Every scrap of
+  // text goes through textContent; there is no innerHTML, no template, no
+  // string of markup anywhere in it. It supports a deliberately small
+  // subset — headings, lists, quotes, rules, code, emphasis — and anything
+  // it does not recognise, including any HTML in the source, is shown as
+  // the plain text it is.
+  //
+  // Links are rendered as their text followed by the URL, NOT as anchors:
+  // the href would be the one attacker-influenceable value on this page
+  // that is not a text node, and "javascript:" is one typo in a scheme
+  // check away. A URL that is readable and has to be copied is a small
+  // price for closing that off entirely.
+
+  function renderMarkdown(src) {
+    var frag = document.createDocumentFragment();
+    var lines = String(src == null ? "" : src).replace(/\r\n?/g, "\n").split("\n");
+    var i = 0;
+
+    while (i < lines.length) {
+      var line = lines[i];
+
+      if (/^\s*```/.test(line)) {
+        var fence = [];
+        i++;
+        while (i < lines.length && !/^\s*```/.test(lines[i])) { fence.push(lines[i]); i++; }
+        i++; // the closing fence, if there was one
+        frag.appendChild(el("pre", null, fence.join("\n")));
+        continue;
+      }
+      if (/^\s*$/.test(line)) { i++; continue; }
+      if (/^\s*(-{3,}|\*{3,}|_{3,})\s*$/.test(line)) { frag.appendChild(el("hr")); i++; continue; }
+
+      var heading = /^\s*(#{1,6})\s+(.*)$/.exec(line);
+      if (heading) {
+        // h3/h4 rather than h1/h2: the panel already owns the top of the
+        // document outline, and a sheet is a section within it.
+        var h = el(heading[1].length <= 2 ? "h3" : "h4");
+        inline(heading[2], h);
+        frag.appendChild(h);
+        i++;
+        continue;
+      }
+
+      if (/^\s*>/.test(line)) {
+        var quoted = [];
+        while (i < lines.length && /^\s*>/.test(lines[i])) {
+          quoted.push(lines[i].replace(/^\s*>\s?/, ""));
+          i++;
+        }
+        var bq = el("blockquote");
+        var p = el("p");
+        inline(quoted.join(" "), p);
+        bq.appendChild(p);
+        frag.appendChild(bq);
+        continue;
+      }
+
+      var bullet = /^\s*([-*+]|\d+[.)])\s+(.*)$/.exec(line);
+      if (bullet) {
+        var ordered = /\d/.test(bullet[1]);
+        var list = el(ordered ? "ol" : "ul");
+        while (i < lines.length) {
+          var item = /^\s*([-*+]|\d+[.)])\s+(.*)$/.exec(lines[i]);
+          if (!item || /\d/.test(item[1]) !== ordered) break;
+          var li = el("li");
+          inline(item[2], li);
+          list.appendChild(li);
+          i++;
+        }
+        frag.appendChild(list);
+        continue;
+      }
+
+      var para = [];
+      while (i < lines.length && !/^\s*$/.test(lines[i]) &&
+             !/^\s*(#{1,6})\s+/.test(lines[i]) && !/^\s*```/.test(lines[i]) &&
+             !/^\s*([-*+]|\d+[.)])\s+/.test(lines[i]) && !/^\s*>/.test(lines[i])) {
+        para.push(lines[i]);
+        i++;
+      }
+      var pn = el("p");
+      inline(para.join(" "), pn);
+      frag.appendChild(pn);
+    }
+    return frag;
+  }
+
+  var INLINE = /`([^`]+)`|\*\*([^*]+)\*\*|__([^_]+)__|\*([^*]+)\*|_([^_]+)_|\[([^\]]*)\]\(([^)\s]*)\)/;
+
+  function inline(text, into) {
+    var rest = String(text);
+    while (rest) {
+      var m = INLINE.exec(rest);
+      if (!m) { into.appendChild(txt(rest)); return; }
+      if (m.index > 0) into.appendChild(txt(rest.slice(0, m.index)));
+      if (m[1] !== undefined) into.appendChild(el("code", null, m[1]));
+      else if (m[2] !== undefined) into.appendChild(el("strong", null, m[2]));
+      else if (m[3] !== undefined) into.appendChild(el("strong", null, m[3]));
+      else if (m[4] !== undefined) into.appendChild(el("em", null, m[4]));
+      else if (m[5] !== undefined) into.appendChild(el("em", null, m[5]));
+      else {
+        // A link, flattened to text on purpose — see the note above.
+        into.appendChild(txt(m[6] || ""));
+        if (m[7]) into.appendChild(txt((m[6] ? " " : "") + "(" + m[7] + ")"));
+      }
+      rest = rest.slice(m.index + m[0].length);
+    }
+  }
+
+  // ---- liveness ---------------------------------------------------------
 
   function stopLive() {
     if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
@@ -756,6 +1860,7 @@
 
   function returnToGate() {
     stopLive();
+    closePanel();
     sessionStorage.removeItem("rc_token");
     actOK("");
     gate.classList.remove("hide");
@@ -763,7 +1868,12 @@
   }
 
   function fetchState() {
-    return fetch("/v1/state", { headers: { Authorization: "Bearer " + token } })
+    return fetch("/v1/state", { headers: authHeaders() })
+      // A network failure rejects with the browser's own wording ("Failed to
+      // fetch"), which reads as a bug in the page rather than as what it is.
+      // Said plainly here; the freshness pill beside it says how long ago the
+      // picture below was true.
+      .catch(function () { throw new Error("cannot reach the controller"); })
       .then(function (r) {
         if (r.status === 401 || r.status === 403) {
           returnToGate();
@@ -785,6 +1895,7 @@
     var age = Math.floor((Date.now() - lastFetchAt) / 1000);
     text.textContent = age < 10 ? "live" : "updated " + ago(age) + " ago";
     live.className = "live" + (age > 30 ? " stale" : age > 10 ? " warn" : "");
+    tickFeed();  // the feed's own ages tick with this
   }
 
   function refresh() {
@@ -793,11 +1904,28 @@
       .catch(function (e) { fail(e.message); });
   }
 
+  // A burst of events (a worker registering ten devices) must not become a
+  // burst of /v1/state reads.
+  function nudge() {
+    if (nudgePending) return;
+    nudgePending = true;
+    setTimeout(function () { nudgePending = false; refresh(); }, 250);
+  }
+
   function connectEvents() {
     if (es) return;
     try {
       es = new EventSource("/v1/events?token=" + encodeURIComponent(token));
-      es.onmessage = refresh;
+      es.onmessage = function (m) {
+        // A job event is the one thing on the wire that says what actually
+        // happened, rather than that something did — so the feed reads it
+        // directly, and the board catches up on the refresh it triggers.
+        try {
+          var ev = JSON.parse(m.data);
+          if (ev && ev.kind === "jobs") noteJobEvent(ev.payload);
+        } catch (e) { /* a frame we cannot read still means "refetch" */ }
+        nudge();
+      };
       es.onerror = function () { if (!err.textContent) fail("event stream dropped; polling"); };
     } catch (e) { /* polling remains the fallback */ }
   }
@@ -805,7 +1933,7 @@
   // Ask the controller what this token can do, so the page offers the actions
   // it actually has rather than finding out from a 403.
   function loadRole() {
-    return fetch("/v1/whoami", { headers: { Authorization: "Bearer " + token } })
+    return fetch("/v1/whoami", { headers: authHeaders() })
       .then(function (r) { return r.ok ? r.json() : null; })
       .then(function (d) { role = (d && d.role) || ""; renderRole(); })
       .catch(function () { role = ""; renderRole(); });
@@ -817,6 +1945,11 @@
     badge.className = role === "admin" ? "badge" : "hide";
   }
 
+  function renderWho() {
+    document.getElementById("whoHint").textContent =
+      identity ? "— kill controls act as " + identity : "— set this to enable kill controls";
+  }
+
   function start() {
     stopLive();
     gate.classList.add("hide");
@@ -824,12 +1957,38 @@
     document.getElementById("who").value = identity;
     renderWho();
     lastFetchAt = null;
+    prevDevices = null;
+    feed = [];
+    renderFeed();
     updateFreshness();
     loadRole();
     refresh();
     pollTimer = setInterval(refresh, 5000);
     freshTimer = setInterval(updateFreshness, 1000);
   }
+
+  // ---- wiring -----------------------------------------------------------
+
+  document.getElementById("gateForm").addEventListener("submit", function (e) {
+    e.preventDefault();
+    token = document.getElementById("token").value.trim();
+    sessionStorage.setItem("rc_token", token);
+    start();
+  });
+
+  document.getElementById("whoBar").addEventListener("submit", function (e) {
+    e.preventDefault();
+    identity = document.getElementById("who").value.trim();
+    renderWho();
+    refresh();
+  });
+
+  document.getElementById("panelClose").addEventListener("click", closePanel);
+  document.getElementById("panelBack").addEventListener("click", backView);
+  document.getElementById("scrim").addEventListener("click", closePanel);
+  document.addEventListener("keydown", function (e) {
+    if (e.key === "Escape" && panelView) closePanel();
+  });
 
   if (token) start();
 })();
