@@ -60,7 +60,14 @@ func (c *Client) AttachTTY(ctx context.Context, jobID string, term Terminal) err
 	// The size goes first, before anything is typed. A shell that has already
 	// drawn its prompt at the wrong width redraws on the next command; one
 	// that never learns the width is wrong forever.
-	if rows, cols, err := term.Size(); err == nil {
+	//
+	// Unless there is no size to send. A zero dimension is what
+	// ioctl(TIOCGWINSZ) reports when the far end is not a real terminal, and
+	// sending it would replace the PTY's usable 24x80 default with a window
+	// no full-screen program can draw in. The far side rejects one too — a
+	// worker must not be talked into 0x0 by any client — but not sending
+	// nonsense in the first place is this side's job.
+	if rows, cols, err := term.Size(); err == nil && rows > 0 && cols > 0 {
 		if err := send(server.TTYResize(rows, cols)); err != nil {
 			return err
 		}
@@ -92,7 +99,7 @@ func (c *Client) AttachTTY(ctx context.Context, jobID string, term Terminal) err
 					return
 				case <-term.Resized:
 					rows, cols, err := term.Size()
-					if err != nil {
+					if err != nil || rows == 0 || cols == 0 {
 						continue
 					}
 					if err := send(server.TTYResize(rows, cols)); err != nil {

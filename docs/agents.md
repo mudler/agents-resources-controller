@@ -182,6 +182,37 @@ While you hold it, `ssh` to that host and work directly — that is the
 legitimate way to use a box interactively, because the lease is real and
 everyone else can see it.
 
+...or, if what you actually want is a terminal on the box, ask for one
+directly:
+
+```sh
+rc run --tty --select 'vram>=40G'
+```
+
+`--tty` is the controlled path and is better than `hold` + `ssh` for anything
+interactive: the shell runs under the lease, it queues like any other job,
+and it is **supervised** — `rc kill` ends it, the watchdogs bound it, and its
+children die with it instead of outliving your session and keeping the GPU.
+An interactive job's output goes to your terminal and is not kept, so
+`rc attach` has nothing to show for it afterwards.
+
+### If you need a file on the box
+
+```sh
+rc cp ./train.py gpubox:gpu0:/workspace/       # up
+rc cp gpubox:gpu0:/workspace/out.json ./       # back
+```
+
+For a **script, a config, a patch** — something you name, once. The copy runs
+under a lease, so you can only copy to a device that is free for you to take,
+and a box someone else holds is refused by name.
+
+**Not for models, datasets or checkpoints.** Every byte crosses the
+controller twice and it is a scheduler, not a file server; tens of gigabytes
+through it is the wrong shape. Large or persistent data belongs on whatever
+shared storage the host mounts — the host's usage sheet (`rc describe`) says
+where that is, and if it does not, ask rather than pushing it through `rc cp`.
+
 **A hold's TTL is a promise. Keep it short and extend deliberately.** A
 forgotten hold is indistinguishable from a leak to everyone else, and it is
 the most antisocial thing you can do here.
@@ -237,7 +268,8 @@ not authentication**. Do not kill jobs that are not yours.
 
 ## What this does not do
 
-- It does not copy your code or data anywhere.
+- It does not deploy, sync or reconcile anything. `rc cp` moves a file you
+  name, onto a box you hold, once — nothing recurring, nothing large.
 - It does not install anything on the device host.
 - It does not give you fractions of a GPU. A lease is the whole device.
 - It does not protect you from someone who ignores it. It is cooperative:

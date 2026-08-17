@@ -115,9 +115,11 @@ and nothing below assumes them:
   run it somewhere that stays up and back up `--data`.
 - **No fractional device sharing.** A lease is the whole device. There is no
   MIG-style partition, no "half a GPU", no memory-quota scheduling.
-- **No shipping code to hosts.** The controller runs the command you give it
-  on a host that already has everything that command needs. It is not a
-  deployment tool and never copies a payload anywhere.
+- **No deployment, sync, or package management.** `rc cp` moves a file you
+  name, onto a box you hold, once — see "Moving a file onto a box" below. It
+  does not watch directories, reconcile trees, or install anything, and every
+  byte of a copy crosses the controller twice, so models, datasets and
+  checkpoints belong on shared storage the host already mounts.
 - **No per-client or per-worker tokens.** `RC_TOKENS` is a small set of
   shared secrets with three roles; identity (`--as`, the `submitter` field)
   is a label, not a credential. Read "`rc kill` checks ownership" under
@@ -1018,6 +1020,59 @@ that a human is sitting there, and leaving means they're done with it.
 `rc release <job-id>` does the same thing from any terminal, and is a thin
 alias over `rc kill`: only the hold's own submitter, or an admin token, may
 end it early.
+
+### An interactive session: `rc run --tty`
+
+```sh
+rc run --tty -d gpubox:gpu0                 # a shell on the box, under a lease
+rc run --tty --select 'vram>=40G'           # pick a free box, then a shell on it
+rc run --tty -d gpubox:gpu0 -- python -i    # anything that wants a terminal
+```
+
+`--tty` is a flag on the command that already exists, not a second command,
+and that is the whole point: everything `rc run` does still applies. It
+queues, printing its position, and drops you into the shell when the device
+is yours. It stays supervised — `rc kill` works, the watchdogs work, the
+lease is real, and the process dies with the job rather than outliving it the
+way an `ssh` session's children do. It needs no inbound access to the box:
+the worker dials out, exactly as it does for logs.
+
+With no command, you get the box's shell (`bash` where there is one). Window
+resizes follow your terminal, and `Ctrl-C` reaches the job rather than this
+client — in raw mode it is a byte on the wire, not a signal here.
+
+An interactive job's bytes go through the controller and are **not** kept: a
+terminal is not a log, so `rc attach` and the job's log stream have nothing
+to show for it. Everything else about the job is recorded as usual — command,
+submitter, exit code, history.
+
+### Moving a file onto a box: `rc cp`
+
+```sh
+rc cp ./train.py gpubox:gpu0:/workspace/          # a script, a config, a patch
+rc cp ./project gpubox:gpu0:/workspace/           # a directory, recursively
+rc cp gpubox:gpu0:/workspace/result.json ./       # and back off it
+```
+
+A remote path is `host:name:path` — the device ID keeps its own colon, and
+only the last one separates the path.
+
+This is `tar` over the same stream `--tty` uses, which is how `kubectl cp`
+works and for the same reason: no new endpoint, no upload storage, and
+nothing buffered on the controller. The copy runs as a job under a lease, so
+**you can only copy to a device that is free for you to take** — a box
+somebody else holds is refused, by name, rather than queued behind them.
+
+The executable bit survives. Symlinks are archived as symlinks and never
+followed out of the source tree, and an incoming archive that tries to write
+outside the destination is refused.
+
+The line this draws: `rc cp` moves a file you name, onto a box you hold,
+once. It does not sync, watch, reconcile or install. Every byte crosses the
+controller twice and the controller is a scheduler with a one-connection
+database — so models, datasets and checkpoints belong on whatever shared
+storage the host already mounts, and the host's
+[usage sheet](#usage-sheets-and-rc-describe) is where to say where that is.
 
 ## Event notifications
 

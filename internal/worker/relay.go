@@ -176,6 +176,22 @@ func runTTY(ctx context.Context, spec JobSpec, streams *relayStreams) Result {
 					return
 				}
 			case server.TTYFrameResize:
+				// A zero dimension is not a window, it is ioctl(TIOCGWINSZ)
+				// saying it has no answer — which is what a client gets when
+				// its own stdout is not a real terminal, and that happens for
+				// real: a session started under `script`, or a wrapper that
+				// forgot to size its PTY. Applying it undoes the 24x80
+				// default startPTY sets precisely so vim, less and top have
+				// something usable before the first frame arrives, and the
+				// operator gets a full-screen program drawing into nothing.
+				// Found by hand-driving a session: `stty size` said "0 0".
+				//
+				// Refused here as well as at the client, because a worker
+				// must not be talked into 0x0 by any client.
+				if f.Rows == 0 || f.Cols == 0 {
+					slog.Warn("ignoring a zero terminal size", "rows", f.Rows, "cols", f.Cols)
+					continue
+				}
 				if err := s.Resize(f.Rows, f.Cols); err != nil {
 					slog.Warn("tty resize failed", "rows", f.Rows, "cols", f.Cols, "err", err)
 				}

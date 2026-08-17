@@ -264,6 +264,40 @@ func TestWorkerRunsAnInteractiveJobThroughTheRelay(t *testing.T) {
 	require.Equal(t, string(model.JobSucceeded), h.state(1))
 }
 
+// Found by hand-driving a real session: `stty size` answered "0 0".
+//
+// A zero dimension is not a window, it is ioctl(TIOCGWINSZ) saying it has no
+// answer — which is what a client gets when its own stdout is not a real
+// terminal, and that happens for real (a session started under `script`, a
+// wrapper that forgot to size its PTY). Applying it undoes the 24x80 default
+// startPTY sets precisely so vim, less and top have something usable, and the
+// operator gets a full-screen program drawing into nothing. The far side has
+// to refuse it: a worker must not be talked into 0x0 by any client.
+func TestWorkerIgnoresAZeroTerminalSize(t *testing.T) {
+	h := newRelayHarness(t, map[string]any{
+		"job_id":    "job1",
+		"device_id": "gpubox:gpu0",
+		"command":   []string{"/bin/sh"},
+		"stdio":     model.StdioTTY,
+	})
+	h.run(t, 60*time.Second)
+
+	h.send(t, server.TTYResize(0, 0))
+	h.send(t, server.TTYData([]byte("stty size\n")))
+	// startPTY's default, still intact. Asserting the default is there says
+	// more than asserting "0 0" is absent: it names what the window should be.
+	readUntil(t, h.fromBox, "24 80")
+
+	// And a real size still lands, so this is not "ignore every resize".
+	h.send(t, server.TTYResize(48, 180))
+	h.send(t, server.TTYData([]byte("stty size\n")))
+	readUntil(t, h.fromBox, "48 180")
+
+	h.send(t, server.TTYData([]byte("exit\n")))
+	require.Eventually(t, func() bool { return h.state(1) != "" },
+		20*time.Second, 50*time.Millisecond, "the session never ended")
+}
+
 // A terminal's bytes must not be copied into the log store as well. That is
 // not tidiness: the same relay carries `rc cp`'s tar stream, and a controller
 // that wrote those bytes to its own disk would be the upload service this
