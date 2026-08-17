@@ -222,6 +222,66 @@ func TestCancellationReportIsSelfConsistent(t *testing.T) {
 	}
 }
 
+// The straggler sweep added for the PTY's clean-exit path runs for EVERY job,
+// piped ones included, and it must not turn an ordinary success into a
+// cancellation. A process that has already exited but has not yet been reaped
+// by its parent — a zombie — is still a member of its process group, and
+// kill(-pgid, 0) answers "yes, something is there" for it exactly as it does
+// for a live process. That is not a straggler: a zombie holds no memory, no
+// device and no CPU, and there is nothing to kill.
+//
+// The shape below is completely routine (background something, let the shell
+// exit) and it hits the window every time: the backgrounded child holds the
+// inherited stdout pipe, so cmd.Wait() returns the instant that child exits —
+// which is the instant it becomes a zombie owned by init, before init has had
+// a chance to reap it. Measured at 40/40 mislabelled before the fix. The
+// consequences are not cosmetic: worker.go maps Killed onto model.JobKilled,
+// hooks.go treats a killed hook as a failed hook (so an on_acquire hook that
+// backgrounds anything would refuse the lease), and verify.go treats a killed
+// probe as a failed probe, which quarantines the device.
+func TestCleanExitDoesNotMistakeAnUnreapedChildForAStraggler(t *testing.T) {
+	// Repeated because the window is a race: one green pass would prove
+	// nothing about whether it is reliably closed.
+	for i := 0; i < 20; i++ {
+		var out syncBuf
+		res := worker.Run(context.Background(), worker.JobSpec{
+			Command: []string{"sh", "-c", "sleep 0.05 & exit 0"},
+		}, &out)
+
+		require.NoErrorf(t, res.Err, "iteration %d", i)
+		require.Equalf(t, 0, res.ExitCode, "iteration %d", i)
+		require.Falsef(t, res.Killed,
+			"iteration %d: a job whose backgrounded child had already exited was reported killed (%q)", i, res.Reason)
+		require.Emptyf(t, res.Reason, "iteration %d", i)
+	}
+}
+
+// The other half of the same rule, so the fix above cannot be "never report a
+// straggler": a background job that is genuinely still running when the leader
+// exits must still be reaped and still be reported. This is Run's equivalent
+// of TestPTYCleanShellExitReapsBackgroundedStragglers, and it is the exact
+// assertion a fix that simply stopped scanning would break.
+func TestCleanExitStillReapsALiveStraggler(t *testing.T) {
+	var out syncBuf
+	res := worker.Run(context.Background(), worker.JobSpec{
+		// The subshell detaches from the inherited stdio so it cannot hold
+		// the pipe open — without that redirection cmd.Wait() would simply
+		// block for the full 300s rather than returning to a live group.
+		Command: []string{"sh", "-c", "(exec sleep 300 >/dev/null 2>&1) & echo child:$!; exit 0"},
+	}, &out)
+
+	childPID := waitForChildPID(t, &out)
+
+	require.NoError(t, res.Err)
+	require.True(t, res.Killed,
+		"a clean exit that leaves a live background job must not be reported as an unremarkable success")
+	require.Equal(t, "stragglers reaped after exit", res.Reason)
+
+	require.Eventually(t, func() bool {
+		return !processAlive(t, childPID)
+	}, 5*time.Second, 50*time.Millisecond, "live straggler %d survived a clean exit", childPID)
+}
+
 // The round-2 PTY review found that spec.GraceCeiling's actual DURATION was
 // unguarded: every other test's target process dies to SIGTERM immediately
 // (default disposition), so the SIGTERM -> grace -> SIGKILL window's length

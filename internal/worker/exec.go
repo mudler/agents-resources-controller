@@ -253,12 +253,30 @@ func runSupervised(ctx context.Context, cmd *exec.Cmd, target processTarget, spe
 	}
 }
 
-// groupAlive reports whether any process still belongs to the process group
-// pgid. Signal 0 performs no signalling, only an existence/permission check;
-// a live process (ours or not) yields nil, a group with no members yields
-// ESRCH.
+// groupAlive reports whether any process that still belongs to the process
+// group pgid is a real process rather than a zombie.
+//
+// Signal 0 performs no signalling, only an existence/permission check, and it
+// is the fast path: a group with no members at all yields ESRCH and we are
+// done in one syscall. It is not sufficient on its own, though, and the
+// difference is not academic. A process that has exited but whose parent has
+// not yet reaped it is still a group member and still answers kill(-pgid, 0)
+// with success — while holding no memory, no device and no CPU, and having no
+// user-space code left to receive a signal. Treating one as a straggler made
+// every ordinary job that backgrounds anything report itself killed, because
+// cmd.Wait() returns the instant the last pipe-holder exits, which is the
+// instant it becomes a zombie and not one moment later. So when the cheap
+// check says something is there, look at what it actually is.
+//
+// If /proc cannot be read at all we keep the old, coarser answer: on this
+// worker's only platform that does not happen, and reporting "alive" when we
+// cannot tell errs toward killing a straggler rather than leaking one.
 func groupAlive(pgid int) bool {
-	return syscall.Kill(-pgid, 0) == nil
+	if syscall.Kill(-pgid, 0) != nil {
+		return false
+	}
+	live, scanned := liveProcExists(func(st procStat) bool { return st.pgid == pgid })
+	return live || !scanned
 }
 
 // awaitTargetExit polls, bounded by timeout, until target has no members
