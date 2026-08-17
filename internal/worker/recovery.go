@@ -12,11 +12,13 @@ import (
 	"github.com/mudler/resource-controller/internal/model"
 )
 
-// jobEnvPrefix is the marker every process this worker has ever started
-// carries: execute() puts RC_JOB_ID in the environment of the job it spawns,
-// and a child inherits its parent's environment, so the whole tree of a
-// running job is stamped with it. That is what makes a survivor findable
-// after the worker that started it has died — see survivorsFromPreviousRun.
+// jobEnvPrefix is the marker every process this worker has ever started for
+// a job carries: execute() puts RC_JOB_ID in the environment of the job it
+// spawns, and a child inherits its parent's environment, so the whole tree of
+// a running job is stamped with it. Lifecycle hooks (hooks.go) and verify
+// scripts (verify.go) are given the same variable, so a hung release hook or
+// a wedged verify script left over from a previous run is found here too —
+// which is right: either can still be touching the device.
 //
 // The trailing '=' is part of it, and the value must be non-empty: lifecycle
 // hooks are run with RC_JOB_ID set to "" when no job is behind them (see
