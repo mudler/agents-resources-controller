@@ -1320,3 +1320,7 @@ from — still requires the header and rejects a query-string token.
   or `env` is refused outright. `--ttl` is required and is capped by the
   device's `max_runtime` exactly as a job's is — rejected, never clamped.
   See "Client" above.
+
+## License
+
+Apache License 2.0 — see [LICENSE](LICENSE).
