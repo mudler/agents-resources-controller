@@ -169,4 +169,6 @@ rc kill <job-id>       # stop a job you submitted
 - It does not protect you from someone who ignores it. It is cooperative: the
   lease means something because everyone goes through it.
 
-Fuller reference: [`docs/agents.md`](../../docs/agents.md).
+Fuller reference: [`docs/agents.md`](https://github.com/mudler/resource-controller/blob/master/docs/agents.md)
+(a relative link would break once this skill is symlinked into an agent's
+skills directory).
