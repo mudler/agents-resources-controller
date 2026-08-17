@@ -72,8 +72,14 @@ type deviceSpec struct {
 // worker registers or pushes. nil means "leave the stored host sheet
 // alone"; a non-nil pointer, even to "", is an explicit, trustworthy report.
 type registerRequest struct {
-	Host           string                       `json:"host"`
-	BootID         string                       `json:"boot_id,omitempty"`
+	Host   string `json:"host"`
+	BootID string `json:"boot_id,omitempty"`
+	// Recovery is what this worker can prove about processes left behind by
+	// an interrupted job — see recovery.go, and model.RecoveryProof for why
+	// the type is shared with the controller rather than mirrored here like
+	// the rest of this struct: three packages have to agree on this one
+	// exactly, and a hand-written copy is where they would drift.
+	Recovery       model.RecoveryProof          `json:"recovery,omitzero"`
 	Devices        []deviceSpec                 `json:"devices"`
 	Labels         map[string]map[string]string `json:"labels"`
 	DeclaredLabels map[string]map[string]string `json:"declared_labels"`
@@ -408,9 +414,16 @@ func (w *Worker) register(ctx context.Context) error {
 	declared := declaredLabelsPayload(w.cfg.Devices)
 	sheet, deviceSheets := sheetPayload(w.cfg.SheetDir, w.cfg.Devices)
 
+	// The proof is computed HERE, before this worker has started a single
+	// job, and never again. That ordering is the claim's whole validity: at
+	// this moment every RC_JOB_ID-carrying process on the box belongs to a
+	// previous incarnation of this worker, and a scan can say something
+	// about them. A pass run later would be looking at this worker's own
+	// running jobs and would report a survivor on every healthy host.
 	payload, err := json.Marshal(registerRequest{
 		Host:           w.cfg.Host,
 		BootID:         BootID(),
+		Recovery:       w.recoveryProof(),
 		Devices:        devices,
 		Labels:         labels,
 		DeclaredLabels: declared,

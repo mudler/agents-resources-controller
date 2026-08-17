@@ -65,6 +65,27 @@ verify_pass_budget: 2m
 # capped at 64KB — a worker exceeding that truncates before pushing it.
 sheet_dir: /etc/rc
 
+# require_manual_clear stops this worker from telling the controller anything
+# about processes left over from an interrupted job, so a device quarantined
+# because its worker vanished, its lease lapsed, or it re-registered with a
+# job in flight comes back ONLY through an admin's `rc clear` or a proven
+# reboot — the behaviour every worker had before autonomous recovery existed.
+#
+# Leave it off (the default) and this worker reports what it can observe: that
+# it is PID 1 alone in its own PID namespace (a container restart destroyed
+# everything a previous job was running), or that it looked for processes
+# carrying RC_JOB_ID and found none. It never declares which of those it is —
+# it reports what it saw, and a worker that can see neither says nothing,
+# which keeps the device quarantined.
+#
+# The setting only ever points one way: there is no option that FORCES
+# recovery, because that is the only direction in which a mistake hands out a
+# GPU with a live training process on it. RC_REQUIRE_MANUAL_CLEAR in the
+# environment sets it too (for a containerised worker whose config comes from
+# a ConfigMap it does not template) and can only turn it ON — an explicit
+# `true` here cannot be switched off by the environment.
+# require_manual_clear: true
+
 # hooks: is host-level defaults for the lease lifecycle hooks below. Either
 # field may be omitted; an omitted field falls back to the built-in default
 # (timeout: 60s, release_linger: 30s). A device's own timeout/release_linger

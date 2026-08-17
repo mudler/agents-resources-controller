@@ -304,6 +304,7 @@ func TestParseProcStat(t *testing.T) {
 	cases := []struct {
 		name      string
 		stat      string
+		wantPid   int
 		wantState byte
 		wantPgid  int
 		wantSid   int
@@ -312,6 +313,7 @@ func TestParseProcStat(t *testing.T) {
 		{
 			name:      "ordinary comm",
 			stat:      "12345 (sh) S 1 12345 12345 34816 12345 4194304 10 0 0 0 0 0 0 0 20 0 1 0\n",
+			wantPid:   12345,
 			wantState: 'S',
 			wantPgid:  12345,
 			wantSid:   12345,
@@ -320,6 +322,7 @@ func TestParseProcStat(t *testing.T) {
 		{
 			name:      "comm containing spaces and parens",
 			stat:      "999 (my (weird) cmd) S 100 200 300 34816 300 4194304 10 0 0 0 0 0 0 0 20 0 1 0\n",
+			wantPid:   999,
 			wantState: 'S',
 			wantPgid:  200,
 			wantSid:   300,
@@ -330,6 +333,7 @@ func TestParseProcStat(t *testing.T) {
 			// group 200 as far as kill(2) is concerned, and holds nothing.
 			name:      "zombie is reported as such",
 			stat:      "999 (sleep) Z 100 200 300 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0\n",
+			wantPid:   999,
 			wantState: 'Z',
 			wantPgid:  200,
 			wantSid:   300,
@@ -340,6 +344,14 @@ func TestParseProcStat(t *testing.T) {
 			stat:   "999 (sh) S 100\n",
 			wantOK: false,
 		},
+		{
+			// The pid precedes comm, so it is read from the front rather
+			// than from the last ')'. A line with nothing in front of the
+			// comm has no pid to read and is malformed, not a process 0.
+			name:   "missing leading pid",
+			stat:   "(sh) S 100 200 300 34816 300\n",
+			wantOK: false,
+		},
 	}
 
 	for _, tc := range cases {
@@ -347,6 +359,7 @@ func TestParseProcStat(t *testing.T) {
 			st, ok := parseProcStat([]byte(tc.stat))
 			require.Equal(t, tc.wantOK, ok)
 			if tc.wantOK {
+				require.Equal(t, tc.wantPid, st.pid)
 				require.Equal(t, tc.wantState, st.state)
 				require.Equal(t, tc.wantPgid, st.pgid)
 				require.Equal(t, tc.wantSid, st.sid)
