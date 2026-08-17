@@ -1,0 +1,288 @@
+#cloud-config
+# Network and memory resilience for the GPU boxes.
+#
+# Two failures on dgx, four minutes apart in cause and effect:
+#
+#   08:05:59  systemd-networkd: enP7s7: Could not set route: Connection timed out
+#   08:05:59  systemd-networkd: enP7s7: Failed
+#   08:10:04  kernel: helm-controller invoked oom-killer
+#
+# The route died BEFORE the OOM kills. Under memory-reclaim stall a netlink
+# transaction timed out, networkd called link_enter_failed(), and that state is
+# terminal: no retry, no DHCP renewal, no route re-add. The address and its
+# on-link route survived, so the LAN kept working and nothing looked wrong
+# until WireGuard had been down for 65 minutes. It had already happened once
+# before, on 2026-08-15.
+#
+# Underneath it: dgx and thor have ~120Gi RAM and zero swap, so parallel CUDA
+# compiles drive the kernel into sustained reclaim stall. orin has never hit
+# this, and orin is the one box that already had zram.
+#
+# So: remove the trigger (IPv6 RA, which buys nothing on this LAN), give
+# reclaim an outlet (zram), and keep a safety net for the terminal state that
+# cannot be configured away (the route guard).
+#
+# Lives in /oem so it survives upgrades and /system/oem resets. The IPv6 change
+# is a drop-in, never an edit of 20-dhcp.network, which Kairos rewrites on
+# every boot.
+name: "Network and memory resilience"
+
+stages:
+  boot:
+    - name: "Install the route guard, zram swap, and drop IPv6 RA on the LAN NIC"
+      directories:
+        - path: /usr/local/sbin
+          permissions: 0755
+          owner: 0
+          group: 0
+        - path: /etc/systemd/network/20-dhcp.network.d
+          permissions: 0755
+          owner: 0
+          group: 0
+      files:
+        - path: /usr/local/sbin/default-route-guard.sh
+          permissions: 0755
+          owner: 0
+          group: 0
+          content: |
+            #!/bin/sh
+            # Restore the default route if systemd-networkd dropped it.
+            #
+            # Why this exists: networkd puts a link into a TERMINAL "failed" state when a
+            # netlink transaction times out. Observed twice on dgx under memory pressure:
+            #
+            #   Aug 15 08:06:20  enP7s7: Could not set NDisc address: Connection timed out
+            #   Aug 17 08:05:59  enP7s7: Could not set route: Connection timed out
+            #   ...             enP7s7: Failed
+            #
+            # link_enter_failed() is terminal: no retry, no DHCP renewal, no route re-add.
+            # The address and its on-link route survive in the kernel, so the LAN keeps
+            # working and the fault is invisible until something needs the internet. The
+            # box stayed unreachable over WireGuard for 65 minutes.
+            #
+            # Deliberately generic: the interface and gateway come from networkd's own
+            # recorded DHCP lease, so the same file works on every box.
+            set -u
+
+            # Resolve an ifindex to a link name. Lease files in /run/systemd/netif/leases
+            # are named by ifindex.
+            iface_for() {
+                ip -o link show 2>/dev/null | awk -F'[: ]+' -v i="$1" '$1 == i { print $2; exit }'
+            }
+
+            # Retire our own fallback once networkd is managing the link again. Without
+            # this the static route survives forever, and a fallback pointing at a gateway
+            # that has since changed is worse than no fallback at all.
+            if ip route show default | grep -q "proto dhcp"; then
+                if ip route show default metric 2048 | grep -q .; then
+                    ip route del default metric 2048 2>/dev/null &&
+                        logger -t default-route-guard "removed fallback route; networkd is healthy again"
+                fi
+            fi
+
+            # Only act when there is NO default route at all. This is conservative on
+            # purpose: on a box where NetworkManager owns the default route (thor, over
+            # wifi) we must never install a competing one.
+            if ip route show default | grep -q .; then
+                exit 0
+            fi
+
+            logger -t default-route-guard "no default route; asking networkd to reconfigure"
+
+            for lease in /run/systemd/netif/leases/*; do
+                [ -f "$lease" ] || continue
+                iface="$(iface_for "${lease##*/}")"
+                [ -n "$iface" ] || continue
+                logger -t default-route-guard "reconfiguring $iface"
+                networkctl reconfigure "$iface" >/dev/null 2>&1 || true
+            done
+
+            # Give DHCP time to complete. Reconfigure is the preferred outcome because it
+            # clears the FAILED state and restores full lease management; a static route
+            # alone would paper over a link that is still unmanaged.
+            i=0
+            while [ "$i" -lt 20 ]; do
+                if ip route show default | grep -q .; then
+                    logger -t default-route-guard "default route restored by networkd"
+                    exit 0
+                fi
+                sleep 1
+                i=$((i + 1))
+            done
+
+            # Last resort, so remote management comes back even if networkd cannot be
+            # revived. Metric 2048 is deliberately worse than networkd's 1024, so a real
+            # DHCP route supersedes this one the moment the link recovers.
+            for lease in /run/systemd/netif/leases/*; do
+                [ -f "$lease" ] || continue
+                iface="$(iface_for "${lease##*/}")"
+                gw="$(sed -n 's/^ROUTER=//p' "$lease" | head -1)"
+                [ -n "$iface" ] && [ -n "$gw" ] || continue
+                if ip route add default via "$gw" dev "$iface" metric 2048 2>/dev/null; then
+                    logger -t default-route-guard "installed fallback default via $gw dev $iface"
+                    exit 0
+                fi
+            done
+
+            logger -t default-route-guard "FAILED to restore a default route"
+            exit 1
+        - path: /usr/local/sbin/zram-swap.sh
+          permissions: 0755
+          owner: 0
+          group: 0
+          content: |
+            #!/bin/sh
+            # Compressed in-RAM swap.
+            #
+            # Why this exists: dgx has 119Gi of RAM and zero swap. Parallel `cicc` CUDA
+            # compiles drove it into sustained global reclaim stall on 2026-08-15 and
+            # 2026-08-17; journald logged 105 and 121 "Under memory pressure" events on
+            # those boots against 1-2 on every other boot. The stall is what timed out
+            # systemd-networkd's netlink transaction and cost the box its default route,
+            # and it later escalated into the OOM killer taking local-ai, coredns and rc.
+            #
+            # With no swap the kernel has nowhere to put anonymous pages, so reclaim can
+            # only spin on the page cache. zram gives it an outlet at RAM speed. orin has
+            # never hit this, and orin is the one box that already had zram (12 devices
+            # from Jetson's nvzramconfig) -- this gives dgx and thor what orin has.
+            #
+            # The size is a CAP, not an allocation: an idle zram device costs almost no
+            # memory, and grows only as pages are actually swapped into it, compressed.
+            set -eu
+
+            FRACTION="${ZRAM_FRACTION:-25}"   # percent of RAM
+            PRIORITY="${ZRAM_PRIORITY:-100}"  # above any disk swap, so zram is used first
+
+            start() {
+                # Defer to Jetson's nvzramconfig.service where it exists. It runs
+                # `modprobe zram num_devices=<ncpus>` to create one device per CPU; if we
+                # load the module first it comes up with the default SINGLE device, the
+                # num_devices argument is silently ignored, and nvzramconfig then dies with
+                #   /sys/block/zram11/disksize: No such file or directory
+                #   nvzramconfig.service: Failed with result 'exit-code'
+                # Observed on orin: it replaced 12 devices totalling 14Gi with one 7.5Gi
+                # device. An ordering dependency cannot fix this -- whoever loads the
+                # module first wins -- so the only correct move is not to compete.
+                if systemctl is-enabled nvzramconfig.service >/dev/null 2>&1; then
+                    echo "nvzramconfig.service manages swap on this box; deferring to it"
+                    return 0
+                fi
+
+                # Idempotent, and deliberately checks for ANY swap rather than only zram:
+                # orin already gets 12 zram devices from Jetson's nvzramconfig.service, and
+                # keying on "no swap at all" makes this a no-op there regardless of which
+                # unit wins the boot race.
+                if swapon --show=NAME --noheadings 2>/dev/null | grep -q .; then
+                    echo "swap already active, nothing to do"
+                    swapon --show
+                    return 0
+                fi
+
+                modprobe zram
+
+                total_kb="$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo)"
+                size_kb=$((total_kb * FRACTION / 100))
+
+                # zstd where the kernel has it, otherwise whatever it offers. Jetson
+                # kernels ship lzo-rle only, so this must not be a hard requirement.
+                dev=""
+                for algo in zstd lzo-rle lzo; do
+                    if dev="$(zramctl --find --size "${size_kb}KiB" --algorithm "$algo" 2>/dev/null)"; then
+                        echo "zram: $dev at ${size_kb}KiB using $algo"
+                        break
+                    fi
+                    dev=""
+                done
+                if [ -z "$dev" ]; then
+                    dev="$(zramctl --find --size "${size_kb}KiB")"
+                    echo "zram: $dev at ${size_kb}KiB using kernel default algorithm"
+                fi
+
+                mkswap "$dev" >/dev/null
+                swapon --priority "$PRIORITY" "$dev"
+                swapon --show
+            }
+
+            stop() {
+                for dev in $(swapon --show=NAME --noheadings 2>/dev/null | grep '^/dev/zram' || true); do
+                    swapoff "$dev" || true
+                    zramctl --reset "$dev" || true
+                done
+            }
+
+            case "${1:-start}" in
+                start) start ;;
+                stop) stop ;;
+                *) echo "usage: $0 {start|stop}" >&2; exit 2 ;;
+            esac
+        - path: /etc/systemd/system/default-route-guard.service
+          permissions: 0644
+          owner: 0
+          group: 0
+          content: |
+            [Unit]
+            Description=Restore the default route if systemd-networkd dropped it
+            After=network.target
+
+            [Service]
+            Type=oneshot
+            ExecStart=/usr/local/sbin/default-route-guard.sh
+        - path: /etc/systemd/system/default-route-guard.timer
+          permissions: 0644
+          owner: 0
+          group: 0
+          content: |
+            [Unit]
+            Description=Check the default route every minute
+
+            [Timer]
+            OnBootSec=2min
+            OnUnitActiveSec=1min
+            AccuracySec=10s
+
+            [Install]
+            WantedBy=timers.target
+        - path: /etc/systemd/system/zram-swap.service
+          permissions: 0644
+          owner: 0
+          group: 0
+          content: |
+            [Unit]
+            Description=Compressed in-RAM swap (zram)
+            # Ordinary late-boot ordering, deliberately. An earlier version used
+            # DefaultDependencies=no with Before=sysinit.target so swap would exist as
+            # early as possible; on orin that produced
+            #   sysinit.target: Found ordering cycle on zram-swap.service/start
+            # because Jetson's nvzramconfig.service is itself After=sysinit.target, and
+            # systemd resolved the cycle by silently dropping THIS unit. It was enabled,
+            # it just never ran. Swap arriving a few seconds later in boot costs nothing:
+            # the memory pressure this exists for happens under workload, not during boot.
+            After=local-fs.target nvzramconfig.service
+
+            [Service]
+            Type=oneshot
+            RemainAfterExit=yes
+            ExecStart=/usr/local/sbin/zram-swap.sh start
+            ExecStop=/usr/local/sbin/zram-swap.sh stop
+
+            [Install]
+            WantedBy=multi-user.target
+        - path: /etc/systemd/network/20-dhcp.network.d/10-no-ipv6.conf
+          permissions: 0644
+          owner: 0
+          group: 0
+          content: |
+            # This LAN advertises ULA IPv6 but offers NO IPv6 default route, so IPv6 buys
+            # nothing here. It is also what tripped systemd-networkd's link_enter_failed()
+            # on dgx twice (2026-08-15 NDisc, 2026-08-17 route), taking IPv4 down with it,
+            # and it makes container pulls fail whenever a registry resolves to AAAA only.
+            # Link-local (fe80::) is deliberately left alone.
+            [Network]
+            DHCP=ipv4
+            IPv6AcceptRA=no
+      commands:
+        - systemctl daemon-reload
+      systemctl:
+        enable:
+          - default-route-guard.timer
+          - zram-swap.service

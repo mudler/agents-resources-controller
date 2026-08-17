@@ -1,0 +1,261 @@
+#cloud-config
+#
+# Mount the Samba share from the `starlink` cluster on a Kairos node.
+#
+# This is NOT a full machine config like master.yaml / worker.yaml. Drop it on a
+# node as `/oem/91_nas.yaml` (mode 0600, root:root). /system/oem is reset on
+# upgrade and its own 00_rootfs.yaml says to add local changes as /oem/9x_*.yaml,
+# which is why the 91 prefix matters.
+#
+# The share it mounts is the one `docs/services.md` lists for starlink:
+#   NAS (Samba)   smb://NAS_IP_HERE:NAS_PORT_HERE   nas/smbshare1
+# It is a NodePort, which is why the port is NAS_PORT_HERE and not 445. Omitting `port=`
+# gives "could not connect" and a probe of 445 shows closed -- that looks exactly
+# like a firewall block and is not one.
+#
+# In use on dgx.casa and thor (see manifests/dgx, manifests/thor). Verified
+# across a real reboot on dgx: unit finished in 508ms and the share was mounted
+# unattended.
+#
+# ---------------------------------------------------------------------------
+# THREE THINGS THIS FILE IS SHAPED BY. Each one cost time to find.
+# ---------------------------------------------------------------------------
+#
+# 1. MOUNT UNDER /usr/local, NEVER /mnt.
+#    / is read-only on Kairos, so a mountpoint under /mnt requires adding /mnt
+#    to RW_PATHS from a `rootfs` stage -- and that stage runs in initramfs. Doing
+#    exactly that left dgx.casa unbootable for ~38 minutes: it answered ping with
+#    every port closed, and was recoverable only by clearing the file at the
+#    console. The hung boot never reached systemd-journal-flush, so it left NO
+#    journal at all -- the only evidence was a gap in `journalctl --list-boots`.
+#    /usr/local is the COS_PERSISTENT volume and is already writable, so nothing
+#    here touches the boot layout. There is no `rootfs` stage below on purpose.
+#
+# 2. CREDENTIALS GO IN /usr/local/etc, NOT /etc.
+#    /etc is in RW_PATHS, i.e. an ephemeral tmpfs overlay. Only paths under
+#    PERSISTENT_STATE_PATHS (/etc/systemd, /etc/ssh, /home, /opt, /root, ...)
+#    survive a reboot. A credentials file written to /etc silently disappears.
+#
+# 3. THERE IS NO mount.cifs ON THESE IMAGES.
+#    They ship the cifs KERNEL module but not the /sbin/mount.cifs userspace
+#    helper, so `mount -t cifs` fails with a misleading "cannot mount read-only".
+#    That helper is only an option parser -- the kernel module does the SMB
+#    negotiation -- so nas-mount.py calls mount(2) directly.
+#
+# Kernel portability note: `iocharset=utf8` needs the nls_utf8 module, which the
+# Tegra kernel (thor, 6.8.12-*-tegra) does not ship; the x86/GB10 kernel does.
+# Without it the mount fails with errno 79 ELIBACC, "Can not access a needed
+# shared library" -- which names neither the option nor the module. Only dmesg
+# says "CIFS mount error: iocharset utf8 not found". The helper therefore retries
+# without iocharset and LOGS the fallback rather than leaving the share
+# unmounted.
+
+name: "NAS Data share -> /usr/local/nas_share"
+
+stages:
+  boot:
+    - name: "NAS credentials, mount helper and unit"
+      files:
+        # UNUSED while the Data share is mounted anonymously (see SHARES
+        # below). Kept because the file is what an authenticated share would
+        # read, and because flipping SHARES back to authenticated is then a
+        # one-line change. If you do flip it back, replace these first: the
+        # live values are the nas/users1 Secret in the starlink cluster
+        # (manifests/starlink/nas.yaml). Do not commit real credentials here.
+        #
+        # This placeholder is exactly what broke dgx on 2026-08-17: it was
+        # never substituted, so the mount authenticated as literal
+        # "REPLACE_ME" and the server answered STATUS_LOGON_FAILURE.
+        - path: /usr/local/etc/smb-credentials
+          permissions: 0600
+          owner: 0
+          group: 0
+          content: |
+            username=REPLACE_ME
+            password=REPLACE_ME
+
+        - path: /usr/local/sbin/nas-mount.py
+          permissions: 0755
+          owner: 0
+          group: 0
+          content: |
+            #!/usr/bin/env python3
+            """Mount the NAS SMB share on a Kairos immutable host."""
+
+            import ctypes
+            import os
+            import sys
+
+            NAS_IP = "NAS_IP_HERE"
+            CREDENTIALS = "/usr/local/etc/smb-credentials"
+
+            # (source, target, port, extra options, authenticated)
+            #
+            # authenticated=False: the Data share grants anonymous access,
+            # which is how devbox has always mounted it and -- verified from
+            # thor's live mount options -- what thor is actually running on.
+            # The authenticated path never worked anywhere: smb-credentials
+            # shipped with the REPLACE_ME placeholder still in it, so every
+            # fresh mount got STATUS_LOGON_FAILURE. thor only kept working
+            # because it had not remounted since; already_mounted() skips a
+            # live mount, so the breakage stayed invisible until dgx rebooted.
+            #
+            # This grants nobody any access they did not already have. Set it
+            # back to True once smb-credentials holds real values.
+            SHARES = [
+                ("//%s/Data" % NAS_IP, "/usr/local/nas_share", NAS_PORT_HERE,
+                 "iocharset=utf8,nounix,noserverino", False),
+            ]
+
+
+            def read_credentials(path):
+                user = password = ""
+                try:
+                    with open(path) as fh:
+                        for line in fh:
+                            line = line.strip()
+                            if line.startswith("username="):
+                                user = line.split("=", 1)[1]
+                            elif line.startswith("password="):
+                                password = line.split("=", 1)[1]
+                except OSError as exc:
+                    print("nas-mount: cannot read %s: %s" % (path, exc), file=sys.stderr)
+                return user, password
+
+
+            def already_mounted(target):
+                with open("/proc/mounts") as fh:
+                    for line in fh:
+                        parts = line.split()
+                        if len(parts) > 1 and parts[1] == target:
+                            return True
+                return False
+
+
+            def resolve_owner(name="mudler"):
+                try:
+                    import pwd
+
+                    ent = pwd.getpwnam(name)
+                    return ent.pw_uid, ent.pw_gid
+                except (ImportError, KeyError):
+                    return 0, 0
+
+
+            # The rc worker container runs as uid/gid 10001 (see the rc-worker
+            # image), and its jobs write to /usr/local/nas_share/rc. CIFS has
+            # no server-side ownership here: forceuid/forcegid mean every file
+            # reports whatever uid/gid the MOUNT was given, and file_mode /
+            # dir_mode are fixed at mount time — so a chown inside the
+            # container silently succeeds and changes nothing. Found exactly
+            # that way: `touch /workspace/x` returned Permission denied while
+            # the chown initContainer exited 0.
+            #
+            # Granting the share to that GID with group-write is the narrow
+            # fix: root still writes (it bypasses the mode check), a human
+            # owner is unaffected, and nothing needs 0777.
+            RC_WORKER_GID = 10001
+
+
+            def main():
+                uid, gid = resolve_owner()
+                gid = RC_WORKER_GID
+                user, password = read_credentials(CREDENTIALS)
+                libc = ctypes.CDLL("libc.so.6", use_errno=True)
+                failures = 0
+
+                for source, target, port, extra, authenticated in SHARES:
+                    if already_mounted(target):
+                        print("nas-mount: %s already mounted" % target)
+                        continue
+                    try:
+                        os.makedirs(target, exist_ok=True)
+                    except OSError as exc:
+                        print("nas-mount: cannot create %s: %s" % (target, exc),
+                              file=sys.stderr)
+                        failures += 1
+                        continue
+
+                    creds = ("user=%s,pass=%s" % (user, password)) if authenticated \
+                        else "user=anonymous,pass=anonymous"
+                    base = ("%s,ip=%s,port=%d,uid=%d,gid=%d,"
+                            "file_mode=0664,dir_mode=0775,soft,_netdev"
+                            % (creds, NAS_IP, port, uid, gid))
+
+                    # iocharset is an ATTEMPT, not a requirement: kernels without
+                    # nls_utf8 fail with errno 79 ELIBACC, naming neither the
+                    # option nor the module. Drop it and retry rather than leave
+                    # the share unmounted; log the fallback so it is not silent.
+                    attempts = [extra] if extra else [""]
+                    if extra and "iocharset=utf8" in extra:
+                        attempts.append(",".join(
+                            p for p in extra.split(",") if p != "iocharset=utf8"))
+
+                    rc = -1
+                    err = 0
+                    for i, opt_extra in enumerate(attempts):
+                        opts = base + ("," + opt_extra if opt_extra else "")
+                        rc = libc.mount(source.encode(), target.encode(), b"cifs",
+                                        0, opts.encode())
+                        if rc == 0:
+                            if i:
+                                print("nas-mount: %s mounted WITHOUT iocharset=utf8 "
+                                      "(this kernel has no nls_utf8)" % target)
+                            break
+                        err = ctypes.get_errno()
+
+                    if rc != 0:
+                        print("nas-mount: FAILED %s -> %s: errno=%d %s"
+                              % (source, target, err, os.strerror(err)),
+                              file=sys.stderr)
+                        failures += 1
+                    else:
+                        print("nas-mount: mounted %s -> %s (port %d)"
+                              % (source, target, port))
+
+                return 1 if failures else 0
+
+
+            if __name__ == "__main__":
+                sys.exit(main())
+
+        - path: /etc/systemd/system/nas-mounts.service
+          permissions: 0644
+          owner: 0
+          group: 0
+          content: |
+            [Unit]
+            Description=Mount the NAS Data share under /usr/local/nas_share
+            After=network-online.target
+            Wants=network-online.target
+
+            [Service]
+            Type=oneshot
+            RemainAfterExit=yes
+            # BOUNDED. A oneshot pulled in by multi-user.target is waited on, so
+            # an unbounded network mount can hold up the boot. Worst case here is
+            # a 45s delay, and a failure is not allowed to fail the target.
+            TimeoutStartSec=45
+            SuccessExitStatus=0 1
+            ExecStartPre=-/sbin/modprobe cifs
+            ExecStart=/usr/local/sbin/nas-mount.py
+            ExecStop=-/bin/umount -l /usr/local/nas_share
+
+            [Install]
+            WantedBy=multi-user.target
+
+      commands:
+        - systemctl daemon-reload
+        - systemctl enable nas-mounts.service
+        - systemctl start nas-mounts.service || true
+
+# Applying it without a reboot (the boot stage is what runs at boot anyway):
+#
+#   sudo install -m 600 -o root -g root nas-client.yaml /oem/91_nas.yaml
+#   sudo kairos-agent run-stage boot
+#   systemctl is-active nas-mounts.service
+#   ls /usr/local/nas_share
+#
+# To prove the stage is self-sufficient rather than merely idempotent, delete the
+# three files it writes and unmount the share first, then run the stage: it
+# should rebuild all three and remount from /oem alone.
