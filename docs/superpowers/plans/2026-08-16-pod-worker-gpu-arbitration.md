@@ -1,5 +1,7 @@
 # Pod worker and GPU arbitration on orin/thor/dgx — Implementation Plan
 
+> **STATUS:** SHIPPED. Deployed on dgx, thor and orin as a DaemonSet and verified end to end on real hardware (lease -> drain -> LocalAI evicted -> job holds the GPU -> linger -> uncordon -> LocalAI returns). Checkboxes below were never maintained.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make `orin`, `thor` and `dgx` leasable through rc, with LocalAI evicted from the GPU for the life of a lease and restored afterwards.

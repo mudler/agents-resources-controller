@@ -1,5 +1,7 @@
 # Resource Controller Stage 1 Implementation Plan
 
+> **STATUS:** SHIPPED. Merged to master and deployed; the checkboxes below were never maintained during execution.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Ship the controller, worker, and client that let remote agents claim a device exclusively, run a supervised job on it, and see who holds what — replacing the `flock` mutex.

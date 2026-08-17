@@ -1,5 +1,7 @@
 # `rc cp` — file transfer over an existing lease — Implementation Plan
 
+> **STATUS:** NOT STARTED as of 2026-08-17. Blocked on the relay above. Note that `/workspace` on dgx and thor is already shared storage reachable from the LAN, so this now targets the narrower gap: orin (local disk) and callers off the LAN.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** `rc cp ./train.py dgx:gpu0:/workspace/` — move a file onto a box you hold, and back off it, without inventing an upload service.

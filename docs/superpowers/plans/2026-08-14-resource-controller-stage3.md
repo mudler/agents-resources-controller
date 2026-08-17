@@ -1,5 +1,7 @@
 # Resource Controller Stage 3 Implementation Plan
 
+> **STATUS:** SHIPPED. Merged to master and deployed; the checkboxes below were never maintained during execution.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make the fleet describe itself — devices carry labels the scheduler can select on, hosts carry an operating manual, and an agent can ask what a box is before writing commands for it.

@@ -1,5 +1,7 @@
 # Interactive sessions (`rc run --tty`) — Implementation Plan
 
+> **STATUS:** IN PROGRESS (2026-08-17). Task 1 is on master; Task 2 exists on the `tty-relay` branch, unreviewed. Tasks 5-7 (`rc lock`, the `rc devices`->`rc list` rename, whole-host claims) are explicitly NOT being done.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** `rc run --tty` gives you a real interactive shell on a leased device, supervised the same way an ordinary job is — killable, watchdogged, re-attachable.

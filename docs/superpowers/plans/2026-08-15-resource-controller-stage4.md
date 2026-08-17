@@ -1,5 +1,7 @@
 # Resource Controller Stage 4 Implementation Plan
 
+> **STATUS:** SHIPPED. Merged to master (19 commits, reviewed per task) and deployed; the checkboxes below were never maintained during execution.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make the controller notice trouble and tell someone — verify a device is genuinely clean before it returns to the pool, push events to a webhook, and let the dashboard act.

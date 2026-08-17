@@ -1,5 +1,7 @@
 # Resource Controller Stage 2 Implementation Plan
 
+> **STATUS:** SHIPPED. Merged to master and deployed; the checkboxes below were never maintained during execution.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make jobs safe to leave alone — a queue so a busy device means "you are next", watchdogs so a hung job cannot hold a GPU forever, reboot-aware recovery, `rc kill`/`rc attach`, and a read-only dashboard.
