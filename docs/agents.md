@@ -160,6 +160,37 @@ exist *there*. Nothing is copied for you — this is not a deployment tool. If
 your code is not on that host, get it there first (the usage sheet usually
 says how).
 
+### What you get inside a job
+
+Your command runs **in a container on that host**, with the GPU attached. The
+stock worker image is Ubuntu 24.04 and runs your command as **root**, with a
+normal toolchain already present:
+
+```
+bash git curl wget ssh  |  gcc g++ make cmake ninja pkg-config
+python3 pip venv        |  jq rsync tar unzip  |  kubectl  |  nvidia-smi
+```
+
+**If something is missing, install it — do not give up and take a hold
+instead.** That reflex is why this section exists:
+
+```sh
+rc run -d <device> -- bash -c 'apt-get update && apt-get install -y <pkg> && ./build.sh'
+```
+
+Two things to know about that:
+
+- **Installs are shared and temporary.** The container is long-lived, so a
+  package you install stays for the next job — anyone's job — until the pod
+  restarts, then it is gone. Fine for tools; a global `pip install` can break
+  somebody else. Put project dependencies in a virtualenv on the shared
+  workspace instead, where they persist and collide with nobody.
+- **There is no CUDA toolkit** in the stock image. The driver is injected and
+  `nvidia-smi` works, but `nvcc` is not there — install it, or build elsewhere.
+
+You do not get your local filesystem, and the operator may have changed the
+image, so confirm with `rc describe <device>` rather than trusting this list.
+
 ### If you need the device for several commands
 
 Do not call `rc run` repeatedly and hope you get the same device — you will
@@ -181,6 +212,15 @@ until you Ctrl-C, until the TTL expires, or until someone runs `rc release`.
 While you hold it, `ssh` to that host and work directly — that is the
 legitimate way to use a box interactively, because the lease is real and
 everyone else can see it.
+
+**But prefer the one-command form above.** A hold gives you the lease and
+nothing else: the worker ignores your command and runs its own sleeper, so you
+get no execution, no captured output, no exit code, and no automatic release —
+and the `ssh` puts you on the *host*, outside the job container, so you lose
+the workspace mount and the toolchain with it. Reach for a hold only when you
+genuinely need a shell on the host itself. On this fleet holds have consumed
+roughly 98% of all leased GPU time while real jobs took 2%, almost always
+because the container looked empty; that is what the section above is for.
 
 **A hold's TTL is a promise. Keep it short and extend deliberately.** A
 forgotten hold is indistinguishable from a leak to everyone else, and it is

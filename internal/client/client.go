@@ -350,6 +350,24 @@ func (c *Client) Retire(ctx context.Context, deviceID string) (string, error) {
 	return body.Note, nil
 }
 
+// Clear returns a quarantined device to the pool. Admin-only server-side.
+//
+// The controller answers 409 when the device still has a live lease, and that
+// is deliberately surfaced as an error rather than swallowed: this is the one
+// manual override for a stuck GPU, and reporting success when nothing was
+// cleared is worse than failing.
+func (c *Client) Clear(ctx context.Context, deviceID string) error {
+	resp, err := c.do(ctx, http.MethodPost, "/v1/devices/"+url.PathEscape(deviceID)+"/clear", nil)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return apiError(resp)
+	}
+	return nil
+}
+
 // StreamLogs copies the job's output to out until the job finishes.
 func (c *Client) StreamLogs(ctx context.Context, id string, out io.Writer) error {
 	resp, err := c.do(ctx, http.MethodGet, "/v1/jobs/"+id+"/logs", nil)

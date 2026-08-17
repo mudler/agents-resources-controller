@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -49,6 +50,20 @@ func NewHoldCmd() *cobra.Command {
 			}
 			if device == "" && selector == "" {
 				return errors.New("a device ID or --select is required")
+			}
+			// Checked before --ttl on purpose: a caller missing both should
+			// not be told to fix the ttl, fix it, and only then learn about
+			// the reason.
+			//
+			// Required, unlike on rc run, because a hold is the one lease
+			// with nothing to show for itself. A job's command says what it
+			// is doing; a hold runs a sleeper, so without this rc devices
+			// shows a bare submitter name and a held box is indistinguishable
+			// from a forgotten one. On this fleet holds took ~98% of all
+			// leased GPU time and 3 of the first 7 carried no reason at all.
+			if strings.TrimSpace(reason) == "" {
+				return errors.New("--reason is required: say why you are holding the device, " +
+					"because a hold with no reason cannot be told apart from a leak")
 			}
 			if ttl <= 0 {
 				return errors.New("--ttl is required")
@@ -165,7 +180,7 @@ func NewHoldCmd() *cobra.Command {
 
 	cmd.Flags().StringVar(&selector, "select", "", "device selector, e.g. vram>=40G (mutually exclusive with a positional device ID)")
 	cmd.Flags().DurationVar(&ttl, "ttl", 0, "how long to hold the device — required, capped by the device's max_runtime")
-	cmd.Flags().StringVar(&reason, "reason", "", "why you're holding it, shown in rc devices and the dashboard")
+	cmd.Flags().StringVar(&reason, "reason", "", "why you're holding it, shown in rc devices and the dashboard (required)")
 	cmd.Flags().StringVar(&as, "as", "", "identity shown in rc ps (defaults to $RC_SUBMITTER, else user@host/session)")
 	return cmd
 }

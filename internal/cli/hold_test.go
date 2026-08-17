@@ -119,7 +119,7 @@ func TestHoldCtrlCOnAGrantedHoldReleasesIt(t *testing.T) {
 	cmd.SilenceUsage = true
 	cmd.SilenceErrors = true
 	cmd.SetErr(&syncBuffer{})
-	cmd.SetArgs([]string{"gpubox:gpu0", "--ttl", "30m", "--as", "tester"})
+	cmd.SetArgs([]string{"gpubox:gpu0", "--ttl", "30m", "--reason", "release-on-ctrl-c", "--as", "tester"})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cmd.SetContext(ctx)

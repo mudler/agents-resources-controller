@@ -59,9 +59,19 @@ That has consequences worth knowing up front:
   controller.
 - **The command runs on the device host**, not where you typed it. Paths must
   exist there. Nothing is copied for you — this is not a deployment tool.
-- **The worker cannot be containerised.** It supervises the real processes
-  touching the hardware, so it has to see and signal them. Only the
-  *controller* ships as an image.
+- **A job runs in the worker's container, as root.** The published worker image
+  (`images/rc-worker/`) is Ubuntu 24.04 with a normal toolchain — compiler,
+  cmake, python, git, curl — and a job can `apt-get install` anything else. It
+  gets the GPU and whatever volumes the operator mounted, not your filesystem.
+  Installs persist into later jobs until the pod restarts, so project
+  dependencies belong in a virtualenv on shared storage.
+- **The worker must see the processes it supervises.** It signals real process
+  groups, so it runs either directly on the host or in a container whose
+  namespace those processes share — it cannot sit behind an indirection that
+  hides them. Running it as a privileged DaemonSet pod with the GPU attached
+  works and is how the reference fleet is deployed (see
+  `docs/superpowers/plans/2026-08-16-pod-worker-gpu-arbitration.md`); running
+  it under systemd on the host works too.
 - **A lost client is not a lost job.** If your `rc run` dies, the worker keeps
   running the job and the lease stays valid. Re-attach with `rc attach`.
 
@@ -615,6 +625,14 @@ comparison is unanswerable and **never matches** — `nvidia-smi` reports
 fallback there made `vram>=40G` match a device whose VRAM is unknown. A term whose key is
 absent from a device's labels never matches, `!=` included: an absent
 label is not proof the device differs.
+
+**That rule bites dotted version strings, and the surprise is worth naming.**
+A multi-part version is not a quantity, so `driver>=500` does not match a
+device reporting `driver=580.173.02` — one side parses, the other does not, and
+the comparison fails closed. It *does* match `driver=595.78`, which parses as
+a number. This is deliberate: `580.173.02` has no defensible numeric value, and
+the alternative is the lexicographic accident above. Compare versions with `=`
+against a known value, or ask the operator for a label that is a plain number.
 
 **A selector matching no device right now is rejected outright at submit
 time — not queued in case one registers later.** A typo in `--select` is
