@@ -199,8 +199,13 @@ func (t sessionTarget) signal(sig syscall.Signal) (delivered bool) {
 	return delivered
 }
 
+// alive asks whether anything in the session is a real process. A session
+// whose only remaining members are zombies is empty for every purpose this
+// worker has: nothing holds the GPU, nothing runs, and nothing can receive a
+// signal. See groupAlive in exec.go for what treating them as alive cost.
 func (t sessionTarget) alive() bool {
-	return len(sessionProcessGroups(int(t))) > 0
+	live, _ := liveProcExists(func(st procStat) bool { return st.sid == int(t) })
+	return live
 }
 
 // sessionProcessGroups returns every distinct process-group id currently
@@ -208,6 +213,12 @@ func (t sessionTarget) alive() bool {
 // kill-a-whole-session syscall; this is the standard way to approximate one
 // from userspace on Linux, the only platform this worker targets (see
 // BootID in bootid.go for the same /proc-or-nothing precedent).
+//
+// Zombies are deliberately NOT filtered out here, unlike in alive: this list
+// is what signal aims at, and a group that currently holds only a zombie may
+// still hold a live process a moment later (the reverse ordering of the same
+// race). Signalling one is harmless — it is what kill(2) against a zombie
+// already does — whereas skipping a group is not.
 func sessionProcessGroups(sid int) []int {
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
@@ -220,49 +231,86 @@ func sessionProcessGroups(sid int) []int {
 		if err != nil {
 			continue // not a /proc/<pid> entry
 		}
-		pgid, psid, ok := procGroupAndSession(pid)
-		if !ok || psid != sid {
+		st, ok := readProcStat(pid)
+		if !ok || st.sid != sid {
 			continue
 		}
-		if _, dup := seen[pgid]; dup {
+		if _, dup := seen[st.pgid]; dup {
 			continue
 		}
-		seen[pgid] = struct{}{}
-		pgids = append(pgids, pgid)
+		seen[st.pgid] = struct{}{}
+		pgids = append(pgids, st.pgid)
 	}
 	return pgids
 }
 
-// procGroupAndSession reads /proc/<pid>/stat and extracts the process group
-// and session ids via parseStatGroupAndSession.
-func procGroupAndSession(pid int) (pgid, sid int, ok bool) {
-	data, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+// liveProcExists reports whether any process matching want is more than a
+// zombie — an entry that has already exited and is only waiting for its
+// parent to reap it.
+//
+// scanned reports whether /proc could be read at all, because "found nothing"
+// and "could not look" mean opposite things to a caller deciding whether to
+// declare a target empty.
+func liveProcExists(want func(procStat) bool) (live, scanned bool) {
+	entries, err := os.ReadDir("/proc")
 	if err != nil {
-		return 0, 0, false
+		return false, false
 	}
-	return parseStatGroupAndSession(data)
+	for _, e := range entries {
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil {
+			continue // not a /proc/<pid> entry
+		}
+		st, ok := readProcStat(pid)
+		if !ok {
+			continue // exited while we walked; it holds nothing either
+		}
+		if st.state == 'Z' || !want(st) {
+			continue
+		}
+		return true, true
+	}
+	return false, true
 }
 
-// parseStatGroupAndSession extracts the process group and session ids
-// (fields 5 and 6 in proc(5), 1-indexed) from the raw contents of a
-// /proc/<pid>/stat file. The comm field (field 2) is parenthesized and may
-// itself contain spaces or even parens (a process can name itself anything
-// via prctl/argv[0]), so fields are located from the LAST ')' rather than by
-// naive whitespace splitting, exactly as proc(5) documents.
-func parseStatGroupAndSession(data []byte) (pgid, sid int, ok bool) {
+// procStat is the three fields this worker reads out of /proc/<pid>/stat.
+type procStat struct {
+	// state is proc(5)'s single-character state. Only 'Z' (zombie: exited,
+	// unreaped) is interpreted here, and only to mean "not really there".
+	state byte
+	pgid  int
+	sid   int
+}
+
+// readProcStat reads /proc/<pid>/stat and parses it via parseProcStat.
+func readProcStat(pid int) (procStat, bool) {
+	data, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+	if err != nil {
+		return procStat{}, false
+	}
+	return parseProcStat(data)
+}
+
+// parseProcStat extracts the state, process group and session ids (fields 3,
+// 5 and 6 in proc(5), 1-indexed) from the raw contents of a /proc/<pid>/stat
+// file. The comm field (field 2) is parenthesized and may itself contain
+// spaces or even parens (a process can name itself anything via prctl/argv[0]),
+// so fields are located from the LAST ')' rather than by naive whitespace
+// splitting, exactly as proc(5) documents.
+func parseProcStat(data []byte) (procStat, bool) {
 	i := strings.LastIndexByte(string(data), ')')
 	if i < 0 || i+2 >= len(data) {
-		return 0, 0, false
+		return procStat{}, false
 	}
 	// Fields after ") ": state(1) ppid(2) pgrp(3) session(4) ...
 	fields := strings.Fields(string(data[i+2:]))
 	if len(fields) < 4 {
-		return 0, 0, false
+		return procStat{}, false
 	}
 	pgrp, err1 := strconv.Atoi(fields[2])
 	sess, err2 := strconv.Atoi(fields[3])
-	if err1 != nil || err2 != nil {
-		return 0, 0, false
+	if err1 != nil || err2 != nil || fields[0] == "" {
+		return procStat{}, false
 	}
-	return pgrp, sess, true
+	return procStat{state: fields[0][0], pgid: pgrp, sid: sess}, true
 }

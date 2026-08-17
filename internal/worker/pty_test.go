@@ -295,31 +295,45 @@ func TestPTYRunsInRequestedDirectoryWithRequestedEnv(t *testing.T) {
 	t.Fatalf("never saw expected cwd/env output; got: %q", got.String())
 }
 
-// parseStatGroupAndSession pins the "locate fields from the last ')'" rule
-// against synthetic /proc/<pid>/stat contents, since exercising it for real
-// only ever happens to touch the common case (a comm field with no spaces
-// or parens in it).
-func TestParseStatGroupAndSession(t *testing.T) {
+// parseProcStat pins the "locate fields from the last ')'" rule against
+// synthetic /proc/<pid>/stat contents, since exercising it for real only ever
+// happens to touch the common case (a comm field with no spaces or parens in
+// it), and pins the state character, which is what tells a zombie from a
+// process that is genuinely still holding the device.
+func TestParseProcStat(t *testing.T) {
 	cases := []struct {
-		name     string
-		stat     string
-		wantPgid int
-		wantSid  int
-		wantOK   bool
+		name      string
+		stat      string
+		wantState byte
+		wantPgid  int
+		wantSid   int
+		wantOK    bool
 	}{
 		{
-			name:     "ordinary comm",
-			stat:     "12345 (sh) S 1 12345 12345 34816 12345 4194304 10 0 0 0 0 0 0 0 20 0 1 0\n",
-			wantPgid: 12345,
-			wantSid:  12345,
-			wantOK:   true,
+			name:      "ordinary comm",
+			stat:      "12345 (sh) S 1 12345 12345 34816 12345 4194304 10 0 0 0 0 0 0 0 20 0 1 0\n",
+			wantState: 'S',
+			wantPgid:  12345,
+			wantSid:   12345,
+			wantOK:    true,
 		},
 		{
-			name:     "comm containing spaces and parens",
-			stat:     "999 (my (weird) cmd) S 100 200 300 34816 300 4194304 10 0 0 0 0 0 0 0 20 0 1 0\n",
-			wantPgid: 200,
-			wantSid:  300,
-			wantOK:   true,
+			name:      "comm containing spaces and parens",
+			stat:      "999 (my (weird) cmd) S 100 200 300 34816 300 4194304 10 0 0 0 0 0 0 0 20 0 1 0\n",
+			wantState: 'S',
+			wantPgid:  200,
+			wantSid:   300,
+			wantOK:    true,
+		},
+		{
+			// The whole reason state is parsed: this entry is a member of
+			// group 200 as far as kill(2) is concerned, and holds nothing.
+			name:      "zombie is reported as such",
+			stat:      "999 (sleep) Z 100 200 300 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0\n",
+			wantState: 'Z',
+			wantPgid:  200,
+			wantSid:   300,
+			wantOK:    true,
 		},
 		{
 			name:   "truncated line has too few fields after comm",
@@ -330,11 +344,12 @@ func TestParseStatGroupAndSession(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			pgid, sid, ok := parseStatGroupAndSession([]byte(tc.stat))
+			st, ok := parseProcStat([]byte(tc.stat))
 			require.Equal(t, tc.wantOK, ok)
 			if tc.wantOK {
-				require.Equal(t, tc.wantPgid, pgid)
-				require.Equal(t, tc.wantSid, sid)
+				require.Equal(t, tc.wantState, st.state)
+				require.Equal(t, tc.wantPgid, st.pgid)
+				require.Equal(t, tc.wantSid, st.sid)
 			}
 		})
 	}
