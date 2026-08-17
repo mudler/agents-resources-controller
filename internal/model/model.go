@@ -149,3 +149,66 @@ type Worker struct {
 	BootID          string    `json:"boot_id,omitempty"`
 	LastHeartbeatAt time.Time `json:"last_heartbeat_at"`
 }
+
+// RecoveryProof is what a worker can prove, at registration, about processes
+// left behind by an interrupted job. It travels beside Worker.BootID, which
+// is the same kind of claim — "nothing from before can still be holding this
+// device" — established a different, much more expensive way (a reboot).
+//
+// Every field is a POSITIVE assertion, and the zero value therefore says
+// nothing at all. That is deliberate and load-bearing: a worker too old to
+// know about this field, one that could not read /proc, and one that
+// deliberately declines to claim anything (require_manual_clear) are all
+// indistinguishable on the wire, and all three mean "no proof", which means
+// no auto-recovery. There is no field that can force recovery, because that
+// is the only direction in which a mistake hands out a GPU with a live
+// training process on it.
+//
+// It lives in model rather than in the server's request types because three
+// packages have to agree on it exactly — the worker that fills it in, the
+// server that decodes it, and the store that acts on it — and a hand-written
+// mirror per package is precisely where the three would drift.
+type RecoveryProof struct {
+	// Isolated means the worker is PID 1 in a PID namespace containing
+	// nothing but itself, so no process from any previous job can exist:
+	// the container restart destroyed the namespace they lived in. This is
+	// the pod/DaemonSet deployment, and it is derived by observation, never
+	// declared in configuration — see internal/worker/recovery.go.
+	Isolated bool `json:"isolated,omitempty"`
+	// SurvivorsChecked means the worker was able to look for processes left
+	// over from a previous instance of itself at all (the host/systemd
+	// deployment, where a worker restart does NOT kill the jobs it started).
+	// SurvivorsFound is what that look turned up. Checked-and-found-none is
+	// a proof; checked-and-found-some is a proof of the opposite; not
+	// checked is no information whatsoever.
+	SurvivorsChecked bool `json:"survivors_checked,omitempty"`
+	SurvivorsFound   bool `json:"survivors_found,omitempty"`
+}
+
+// Proves reports whether this claim answers the question a
+// process-caused quarantine asks — "can anything from the interrupted job
+// still be holding this device?" — with a No.
+//
+// Isolation answers it outright. A survivor check answers it only when it
+// both ran and came back empty: a worker that looked and found something is
+// reporting the opposite, and a worker that never looked is reporting
+// nothing.
+func (p RecoveryProof) Proves() bool {
+	return p.Isolated || (p.SurvivorsChecked && !p.SurvivorsFound)
+}
+
+// Summary names the proof for an operator reading an event or a log line,
+// answering "why is this device back?" without a trip through the source. It
+// is deliberately empty when nothing is proven, so a caller that ignores
+// Proves cannot accidentally print a reassuring sentence about a claim that
+// establishes nothing.
+func (p RecoveryProof) Summary() string {
+	switch {
+	case p.Isolated:
+		return "worker restarted in an isolated PID namespace"
+	case p.SurvivorsChecked && !p.SurvivorsFound:
+		return "worker found no surviving processes from its previous run"
+	default:
+		return ""
+	}
+}

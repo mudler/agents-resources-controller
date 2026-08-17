@@ -145,6 +145,38 @@ var migrations = []struct {
 			`ALTER TABLE jobs ADD COLUMN stdio TEXT NOT NULL DEFAULT ''`,
 		},
 	},
+	{
+		name: "autonomous recovery flap history",
+		stmts: []string{
+			// One row per device returned to the pool by AutoRecover (see
+			// recover.go), which is the only thing standing between a card
+			// that quarantines-clears-quarantines and a controller that
+			// silently loops putting it back. The count inside
+			// autoRecoveryWindow is the guard; older rows are pruned as the
+			// window slides past them, so this table is bounded by
+			// devices * autoRecoveryLimit rather than growing forever.
+			//
+			// reason records what the device was quarantined FOR at the
+			// moment it was recovered ('worker_lost', 'registration',
+			// 'lease_expired'). The counter does not read it — it exists so
+			// an operator debugging a flapping device can see whether it has
+			// been the same cause every time.
+			//
+			// Deliberately NOT a primary key on device_id: a device recovers
+			// repeatedly and every occurrence has to be countable. No
+			// foreign key to devices either, for the same reason nothing else
+			// in this schema has one — a device row that is removed and
+			// re-registered under the same id (a rename in worker.yaml and
+			// back) must not silently take its flap history with it.
+			`CREATE TABLE IF NOT EXISTS device_recoveries (
+			   device_id TEXT NOT NULL,
+			   at        INTEGER NOT NULL,
+			   reason    TEXT NOT NULL DEFAULT ''
+			 )`,
+			`CREATE INDEX IF NOT EXISTS device_recoveries_by_device
+			   ON device_recoveries(device_id, at)`,
+		},
+	},
 }
 
 // migrate brings the database up to len(migrations). It runs each pending

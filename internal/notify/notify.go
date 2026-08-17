@@ -33,6 +33,14 @@ const (
 	KindJobLost         Kind = "job_lost"
 	KindVerifyFailed    Kind = "verify_failed"
 	KindLeaseExpired    Kind = "lease_expired"
+	// KindDeviceRecovered is the counterpart to device_unhealthy: a device
+	// that left the pool because a process might still have been holding it
+	// has come back, on proof from its worker rather than an operator's
+	// clear. It is the one event here that reports something going right,
+	// and it exists because an unexplained recovery is as alarming as an
+	// unexplained quarantine — Reason names both what the device was out for
+	// and what proof brought it back.
+	KindDeviceRecovered Kind = "device_recovered"
 )
 
 // Event is one notification. It is the payload a Sink delivers, and its
