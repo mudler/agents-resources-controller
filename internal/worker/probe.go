@@ -223,10 +223,10 @@ func (w *Worker) gatherLabels(ctx context.Context) ProbeResult {
 	}
 
 	// nvidiaSmiSeenAtStartup is recorded exactly once, on this worker's
-	// very first probe pass (always inside register(), before probeLoop's
-	// goroutine is even started — see Start — so there is no concurrent
-	// access to worry about, the same happens-before guarantee w.workerID
-	// already relies on elsewhere in this package). Every later pass only
+	// very first probe pass (always inside register()); every pass, from
+	// whichever goroutine, runs under probeMu — see the field's own comment
+	// for why that lock had to exist once a reconnection could register
+	// again from the poll loop. Every later pass only
 	// READS it, never updates it. This is the fix-round-3 ruling: fix
 	// round 2 made ANY absence of nvidia-smi a failure, which correctly
 	// closed the fleet-wide-wipe scenario (a driver upgrade removing the

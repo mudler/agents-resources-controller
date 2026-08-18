@@ -43,7 +43,7 @@ func TestReportTerminalWithRetryBoundsEachAttempt(t *testing.T) {
 	defer close(blackholeOver)
 
 	w := New(Config{ControllerURL: ts.URL, Token: "t"})
-	w.workerID = "w1"
+	w.setID("w1")
 
 	start := time.Now()
 	done := make(chan struct{})

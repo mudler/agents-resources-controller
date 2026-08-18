@@ -126,8 +126,22 @@ type Worker struct {
 	// answer; it would cut an interactive session off mid-sentence exactly
 	// two minutes in, which is a bug that would have looked like a network
 	// problem for as long as it took someone to time it.
-	stream   *http.Client
+	stream *http.Client
+
+	// workerID is the id the controller derived for this host, learned at
+	// registration. idMu guards it because registration is no longer a
+	// once-per-process event: the poll loop registers again when contact
+	// with the controller was lost or the controller itself restarted (see
+	// contactTracker), while the heartbeat, probe and job goroutines are
+	// reading this to build their URLs. Before that it rested on the
+	// happens-before of the `go` statements in Start, which no longer holds.
+	idMu     sync.RWMutex
 	workerID string
+
+	// contact decides when this worker owes the controller a fresh
+	// registration. See reconnect.go: it is the half of autonomous recovery
+	// that a CONTROLLER restart needs, as opposed to a worker restart.
+	contact *contactTracker
 
 	mu      sync.Mutex
 	running map[string]context.CancelFunc // jobs currently in flight on this worker
@@ -144,14 +158,26 @@ type Worker struct {
 	hooksMu     sync.Mutex
 	deviceHooks map[string]*deviceHookState
 
+	// probeMu serialises the probe passes and the per-source memory they
+	// build up: everything from nvidiaSmiStartupChecked down to
+	// probeSourceClearWarned is written by gatherLabels and read while the
+	// payload it feeds is assembled.
+	//
+	// It used to need no lock at all. register() ran the first pass before
+	// Start had spawned probeLoop's goroutine, and pushLabels ran every pass
+	// after that on probeLoop alone — one goroutine, in sequence, forever.
+	// A reconnection breaks that: the poll loop can now register (and so
+	// probe) again at any moment, concurrently with a probe-interval pass on
+	// the other goroutine. This is the lock that keeps the two from tearing
+	// that state between them; the fields' own reasoning below is otherwise
+	// unchanged.
+	probeMu sync.Mutex
+
 	// nvidiaSmiStartupChecked and nvidiaSmiSeenAtStartup are gatherLabels'
 	// fix-round-3 state: whether nvidia-smi's presence has been recorded
-	// yet, and what that one-time recording found. Written exactly once,
-	// on this worker's first probe pass (inside register(), which always
-	// completes before Start ever spawns probeLoop's goroutine — no mutex
-	// needed for the same reason w.workerID needs none: the `go` statement
-	// that starts probeLoop happens-after every write register() made).
-	// See gatherLabels for the full reasoning.
+	// yet, and what that one-time recording found. Written exactly once, on
+	// this worker's first probe pass (inside register()). See gatherLabels
+	// for the full reasoning.
 	nvidiaSmiStartupChecked bool
 	nvidiaSmiSeenAtStartup  bool
 
@@ -177,8 +203,8 @@ type Worker struct {
 	// a source deleted from the probe directory stops being remembered (and
 	// its facts clear the ordinary way), and so a probe directory whose
 	// script names churn cannot grow it without bound. Same concurrency
-	// story as the fields above: only ever touched from the sequential
-	// register()/pushLabels() call chain.
+	// story as the fields above: only ever touched from the
+	// register()/pushLabels() call chain, under probeMu.
 	probeSourceDevices map[string]map[string]bool
 
 	// probeSourceClearWarned is the once-per-episode marker for the OTHER
@@ -212,6 +238,7 @@ func New(cfg Config) *Worker {
 		cfg:             cfg,
 		http:            &http.Client{Timeout: 2 * time.Minute},
 		stream:          &http.Client{},
+		contact:         newContactTracker(),
 		running:         map[string]context.CancelFunc{},
 		started:         map[string]struct{}{},
 		hooks:           hooks,
@@ -378,6 +405,20 @@ func cudaDeviceIndex(deviceID string) (string, bool) {
 	return digits, true
 }
 
+// id is the controller-assigned worker ID, and setID records a fresh one.
+// Both go through idMu — see the field's own comment.
+func (w *Worker) id() string {
+	w.idMu.RLock()
+	defer w.idMu.RUnlock()
+	return w.workerID
+}
+
+func (w *Worker) setID(id string) {
+	w.idMu.Lock()
+	defer w.idMu.Unlock()
+	w.workerID = id
+}
+
 func (w *Worker) do(ctx context.Context, method, path string, body io.Reader) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, method, w.cfg.ControllerURL+path, body)
 	if err != nil {
@@ -385,7 +426,17 @@ func (w *Worker) do(ctx context.Context, method, path string, body io.Reader) (*
 	}
 	req.Header.Set("Authorization", "Bearer "+w.cfg.Token)
 	req.Header.Set("Content-Type", "application/json")
-	return w.http.Do(req)
+	resp, err := w.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	// Every exchange that reached the controller at all counts as contact,
+	// whatever it was for and whatever it answered: a 500 is a controller
+	// that is up, and a heartbeat, a poll and a log upload are equally good
+	// evidence of that. Recorded in the one place every request goes through
+	// so no future call site has to remember to.
+	w.contact.observe(time.Now(), resp.Header.Get(controllerInstanceHeader))
+	return resp, nil
 }
 
 func (w *Worker) register(ctx context.Context) error {
@@ -403,8 +454,20 @@ func (w *Worker) register(ctx context.Context) error {
 	// in once the probe loop's first tick fires (up to ProbeInterval — 5
 	// minutes by default — later). This can add up to probePassBudget
 	// (30s) to Start before the first heartbeat, which is acceptable for
-	// the same reason runStartupReleaseHooks already can: it happens once,
-	// before this worker's devices are relied on for anything.
+	// the same reason runStartupReleaseHooks already can: it happens before
+	// this worker's devices are relied on for anything. A re-registration
+	// pays the same cost again, and can afford to for the same reason —
+	// maybeReregister only runs it while this worker is idle, so the pass
+	// delays nothing but the next poll.
+	//
+	// probeMu is held across the pass and the payload it produces, not just
+	// around gatherLabels: the per-source memory a pass builds up
+	// (probeSourceDevices, labelOmitWarned, ...) is read while the payload is
+	// assembled. Registration used to be the one pass that could not overlap
+	// with the probe loop's, because it happened before that loop existed;
+	// now that a reconnection can register from the poll loop at any moment,
+	// this is what keeps the two from tearing that state between them.
+	w.probeMu.Lock()
 	res := w.gatherLabels(ctx)
 	labels := labelsPayload(res, w.labelOmitWarned)
 	if labels == nil {
@@ -413,13 +476,23 @@ func (w *Worker) register(ctx context.Context) error {
 	}
 	declared := declaredLabelsPayload(w.cfg.Devices)
 	sheet, deviceSheets := sheetPayload(w.cfg.SheetDir, w.cfg.Devices)
+	w.probeMu.Unlock()
 
-	// The proof is computed HERE, before this worker has started a single
-	// job, and never again. That ordering is the claim's whole validity: at
-	// this moment every RC_JOB_ID-carrying process on the box belongs to a
-	// previous incarnation of this worker, and a scan can say something
-	// about them. A pass run later would be looking at this worker's own
-	// running jobs and would report a survivor on every healthy host.
+	// The proof is computed HERE, at a moment when this worker is
+	// supervising nothing. That is the claim's whole validity, and it is why
+	// it may not be computed just anywhere: every RC_JOB_ID-carrying process
+	// on the box right now belongs to something this process is NOT running
+	// — a previous incarnation of this worker, or a straggler that outlived
+	// a job that has already finished — and either is a real reason to leave
+	// a device quarantined. A pass run while a job of ours was live would be
+	// looking at that job's own processes and would report a survivor on
+	// every healthy host.
+	//
+	// At startup that holds trivially: not a single job has been started
+	// yet. On a re-registration it holds because maybeReregister refuses to
+	// register while this worker has anything in hand — see its own comment,
+	// where the same condition is also what keeps a reconnection from
+	// reaping the job it is running.
 	payload, err := json.Marshal(registerRequest{
 		Host:           w.cfg.Host,
 		BootID:         BootID(),
@@ -447,8 +520,8 @@ func (w *Worker) register(ctx context.Context) error {
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return err
 	}
-	w.workerID = out.WorkerID
-	slog.Info("registered", "worker_id", w.workerID, "host", w.cfg.Host, "devices", w.cfg.Devices)
+	w.setID(out.WorkerID)
+	slog.Info("registered", "worker_id", out.WorkerID, "host", w.cfg.Host, "devices", w.cfg.Devices)
 	return nil
 }
 
@@ -587,7 +660,7 @@ func (w *Worker) heartbeatLoop(ctx context.Context) {
 				continue
 			}
 			resp, err := w.do(ctx, http.MethodPost,
-				"/v1/workers/"+w.workerID+"/heartbeat", bytes.NewReader(payload))
+				"/v1/workers/"+w.id()+"/heartbeat", bytes.NewReader(payload))
 			if err != nil {
 				slog.Warn("heartbeat failed", "err", err)
 				continue
@@ -628,6 +701,7 @@ func (w *Worker) probeLoop(ctx context.Context) {
 // cannot possibly be running anything, and would reap every job this worker
 // is actually supervising right now.
 func (w *Worker) pushLabels(ctx context.Context) {
+	w.probeMu.Lock()
 	res := w.gatherLabels(ctx)
 	labels := labelsPayload(res, w.labelOmitWarned)
 	if labels == nil {
@@ -636,6 +710,7 @@ func (w *Worker) pushLabels(ctx context.Context) {
 	}
 	declared := declaredLabelsPayload(w.cfg.Devices)
 	sheet, deviceSheets := sheetPayload(w.cfg.SheetDir, w.cfg.Devices)
+	w.probeMu.Unlock()
 
 	names := make([]string, 0, len(w.cfg.Devices))
 	for _, d := range w.cfg.Devices {
@@ -654,7 +729,7 @@ func (w *Worker) pushLabels(ctx context.Context) {
 		slog.Error("marshal labels push", "err", err)
 		return
 	}
-	resp, err := w.do(ctx, http.MethodPost, "/v1/workers/"+w.workerID+"/labels", bytes.NewReader(payload))
+	resp, err := w.do(ctx, http.MethodPost, "/v1/workers/"+w.id()+"/labels", bytes.NewReader(payload))
 	if err != nil {
 		slog.Warn("push labels failed", "err", err)
 		return
@@ -898,6 +973,14 @@ func (w *Worker) pollLoop(ctx context.Context) {
 		}
 
 		if len(toStart) == 0 {
+			// An idle poll that just came back is the one safe moment to
+			// register again: the controller has had its chance to hand this
+			// worker any work it was holding, and nothing is running here to
+			// be reaped by a registration. See maybeReregister, which is a
+			// no-op unless contact was actually lost or the controller
+			// itself changed.
+			w.maybeReregister(ctx)
+
 			// Whether this poll carried only kills (delivered on their own,
 			// or dropped above alongside their own assignment), or nothing
 			// at all, there is no new work to start locally: any kill just
@@ -929,7 +1012,7 @@ func (w *Worker) pollLoop(ctx context.Context) {
 }
 
 func (w *Worker) poll(ctx context.Context) (pollResponse, error) {
-	path := fmt.Sprintf("/v1/workers/%s/assignments?wait=%s", w.workerID, w.cfg.PollWait)
+	path := fmt.Sprintf("/v1/workers/%s/assignments?wait=%s", w.id(), w.cfg.PollWait)
 	resp, err := w.do(ctx, http.MethodGet, path, nil)
 	if err != nil {
 		return pollResponse{}, err
@@ -988,7 +1071,7 @@ func (w *Worker) reportPreKilled(ctx context.Context, jobID string) {
 	reportCtx := context.WithoutCancel(ctx)
 	body := map[string]any{
 		"state":     model.JobKilled,
-		"worker_id": w.workerID,
+		"worker_id": w.id(),
 		"reason":    "killed before this worker started it",
 	}
 	w.reportTerminalWithRetry(reportCtx, jobID, body)
@@ -1048,7 +1131,7 @@ func (w *Worker) execute(ctx context.Context, a assignment) {
 			slog.Warn("acquire hook cancelled; job not started, device not faulted",
 				"job", a.JobID, "device", a.DeviceID, "err", acq.err)
 			w.reportTerminalWithRetry(reportCtx, a.JobID, map[string]any{
-				"state": model.JobKilled, "worker_id": w.workerID,
+				"state": model.JobKilled, "worker_id": w.id(),
 				"reason": "cancelled during acquire hook: " + acq.err.Error(),
 			})
 			return
@@ -1063,7 +1146,7 @@ func (w *Worker) execute(ctx context.Context, a assignment) {
 			reason += "\n" + tail
 		}
 		w.reportTerminalWithRetry(reportCtx, a.JobID, map[string]any{
-			"state": model.JobFailed, "worker_id": w.workerID, "reason": reason,
+			"state": model.JobFailed, "worker_id": w.id(), "reason": reason,
 		})
 		w.reportFault(reportCtx, a.DeviceID, reason)
 		return
@@ -1075,7 +1158,7 @@ func (w *Worker) execute(ctx context.Context, a assignment) {
 	// transitioned this job to "running" the moment it handed out the
 	// assignment, so this call is normally a harmless no-op; it is kept as
 	// belt-and-suspenders in case that ever changes.)
-	w.report(reportCtx, a.JobID, map[string]any{"state": model.JobRunning, "worker_id": w.workerID})
+	w.report(reportCtx, a.JobID, map[string]any{"state": model.JobRunning, "worker_id": w.id()})
 
 	env := map[string]string{}
 	for k, v := range a.Env {
@@ -1166,7 +1249,7 @@ func (w *Worker) execute(ctx context.Context, a assignment) {
 	case res.Err != nil || res.ExitCode != 0:
 		state = model.JobFailed
 	}
-	body := map[string]any{"state": state, "exit_code": res.ExitCode, "worker_id": w.workerID}
+	body := map[string]any{"state": state, "exit_code": res.ExitCode, "worker_id": w.id()}
 	if res.Reason != "" {
 		body["reason"] = res.Reason
 	}
