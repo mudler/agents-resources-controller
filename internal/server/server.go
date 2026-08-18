@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/google/uuid"
 	"github.com/mudler/resource-controller/internal/clock"
 	"github.com/mudler/resource-controller/internal/logstore"
 	"github.com/mudler/resource-controller/internal/notify"
@@ -34,10 +35,36 @@ type Config struct {
 	Notifier *notify.Notifier
 }
 
+// ControllerInstanceHeader carries an identity for the controller PROCESS on
+// every response it writes. A worker that sees it change knows the controller
+// it registered with is gone and a new one is answering, which is the one
+// thing it cannot otherwise detect: the address is the same, the database is
+// the same, and a restart quick enough not to fail a request in flight is
+// invisible from outside.
+//
+// That blind spot is half of the defect of 2026-08-18. Autonomous recovery
+// evaluates a worker's proof at REGISTRATION, so a worker restart clears a
+// recoverable quarantine and a CONTROLLER restart clears nothing: the worker
+// never re-registered, never presented proof, and the device sat out of the
+// pool until a human cleared it by hand. Seeing this value change is what
+// sends the worker back through registration (see worker.contactTracker).
+//
+// It is an identity, not a credential. It grants nothing, says nothing about
+// the fleet, and is deliberately stamped on every response including
+// rejections -- a worker whose token was rotated out is still entitled to
+// know it is talking to a new controller.
+const ControllerInstanceHeader = "Rc-Controller-Instance"
+
 type Server struct {
 	cfg    Config
 	notify *notifier
 	events *broadcaster
+	// instanceID identifies this process, and is generated per Server rather
+	// than derived from anything durable (the host name, the database path)
+	// on purpose: two processes serving the same database from the same host
+	// across a restart are exactly the case a worker must be able to tell
+	// apart.
+	instanceID string
 	// tty holds the live interactive sessions. In memory and deliberately
 	// not persisted — see tty.go.
 	tty *ttyRegistry
@@ -45,10 +72,11 @@ type Server struct {
 
 func New(cfg Config) *Server {
 	return &Server{
-		cfg:    cfg,
-		notify: newNotifier(),
-		events: newBroadcaster(),
-		tty:    newTTYRegistry(),
+		cfg:        cfg,
+		notify:     newNotifier(),
+		events:     newBroadcaster(),
+		tty:        newTTYRegistry(),
+		instanceID: uuid.NewString(),
 	}
 }
 
@@ -97,7 +125,15 @@ func (s *Server) Handler() http.Handler {
 	// just documentation of that fact for the next reader.
 	mux.HandleFunc("GET /", s.handleDashboard)
 
-	return mux
+	// Stamped around the whole mux, so no route added later can forget to
+	// identify the process answering it, and so it lands on responses no
+	// handler wrote at all (a 404, an auth rejection). It has to be set
+	// before the handler runs: once a handler has written its status line
+	// the header map is no longer consulted.
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(ControllerInstanceHeader, s.instanceID)
+		mux.ServeHTTP(w, r)
+	})
 }
 
 // require authenticates the bearer token and enforces the minimum role.

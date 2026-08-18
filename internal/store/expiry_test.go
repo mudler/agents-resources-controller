@@ -24,7 +24,7 @@ func TestExpiredLeaseIsReleasedAndDeviceQuarantined(t *testing.T) {
 	// mechanisms) don't also fire and confound the assertions below.
 	c.Advance(20 * time.Minute)
 
-	res, err := s.Sweep(time.Hour, time.Hour)
+	res, err := s.Sweep(time.Hour, time.Hour, time.Time{})
 	require.NoError(t, err)
 	require.Equal(t, []string{job.ID}, res.LeasesExpired)
 
@@ -56,7 +56,7 @@ func TestLiveLeaseIsNotExpired(t *testing.T) {
 	// Generous grace/unhealthyAfter: this test is isolating lease expiry,
 	// not the silence-based demotion pass, and no heartbeat is recorded
 	// here since that would itself renew the lease under test.
-	res, err := s.Sweep(time.Hour, time.Hour)
+	res, err := s.Sweep(time.Hour, time.Hour, time.Time{})
 	require.NoError(t, err)
 	require.Empty(t, res.LeasesExpired)
 
@@ -75,7 +75,7 @@ func TestLeaseExpiresAtTTLBoundary(t *testing.T) {
 	require.NoError(t, err)
 
 	c.Advance(time.Minute) // exactly the TTL: now == expires_at
-	res, err := s.Sweep(time.Hour, time.Hour)
+	res, err := s.Sweep(time.Hour, time.Hour, time.Time{})
 	require.NoError(t, err)
 	require.Equal(t, []string{job.ID}, res.LeasesExpired)
 }
@@ -100,7 +100,7 @@ func TestHeartbeatRenewsALiveJobLease(t *testing.T) {
 		require.NoError(t, s.RecordHeartbeat("w1", c.Now(), []string{job.ID}))
 	}
 
-	res, err := s.Sweep(30*time.Second, 5*time.Minute)
+	res, err := s.Sweep(30*time.Second, 5*time.Minute, time.Time{})
 	require.NoError(t, err)
 	require.Empty(t, res.LeasesExpired)
 	require.Empty(t, res.JobsLost)
@@ -150,7 +150,7 @@ func TestHeartbeatDoesNotRenewAnUnclaimedJobLease(t *testing.T) {
 
 	// Still inside the original TTL: nothing has expired yet, and the worker
 	// itself is in perfect contact, so nothing else may demote the device.
-	res, err := s.Sweep(30*time.Second, 5*time.Minute)
+	res, err := s.Sweep(30*time.Second, 5*time.Minute, time.Time{})
 	require.NoError(t, err)
 	require.Empty(t, res.LeasesExpired)
 	require.Empty(t, res.DevicesUnhealthy)
@@ -160,7 +160,7 @@ func TestHeartbeatDoesNotRenewAnUnclaimedJobLease(t *testing.T) {
 	c.Advance(2 * time.Minute)
 	require.NoError(t, s.RecordHeartbeat("w1", c.Now(), nil))
 
-	res, err = s.Sweep(30*time.Second, 5*time.Minute)
+	res, err = s.Sweep(30*time.Second, 5*time.Minute, time.Time{})
 	require.NoError(t, err)
 	require.Equal(t, []string{job.ID}, res.LeasesExpired,
 		"a lease nobody claims to be holding must be allowed to expire")
@@ -215,7 +215,7 @@ func TestHeartbeatOnlyRenewsItsOwnJobs(t *testing.T) {
 	c.Advance(2 * time.Minute)
 	require.NoError(t, s.RecordHeartbeat("w1", c.Now(), nil))
 
-	res, err := s.Sweep(30*time.Second, 5*time.Minute)
+	res, err := s.Sweep(30*time.Second, 5*time.Minute, time.Time{})
 	require.NoError(t, err)
 	require.Equal(t, []string{job.ID}, res.LeasesExpired,
 		"another worker's claim must not renew this job's lease")
@@ -409,7 +409,7 @@ func TestRebootAfterProlongedDowntimeReturnsDevicesToReady(t *testing.T) {
 
 	// The host goes away for far longer than unhealthyAfter.
 	c.Advance(10 * time.Minute)
-	res, err := s.Sweep(30*time.Second, 5*time.Minute)
+	res, err := s.Sweep(30*time.Second, 5*time.Minute, time.Time{})
 	require.NoError(t, err)
 	require.ElementsMatch(t, []string{"gpubox:gpu0", "gpubox:gpu1"}, res.DevicesUnhealthy)
 	require.Equal(t, []string{job.ID}, res.JobsLost)
@@ -442,7 +442,7 @@ func TestRebootAfterProlongedDowntimeKeepsFaultQuarantine(t *testing.T) {
 	require.NoError(t, s.SetDeviceState("gpubox:gpu1", model.DeviceUnhealthy, c.Now(), ""))
 
 	c.Advance(10 * time.Minute)
-	_, err := s.Sweep(30*time.Second, 5*time.Minute)
+	_, err := s.Sweep(30*time.Second, 5*time.Minute, time.Time{})
 	require.NoError(t, err)
 
 	c.Advance(time.Minute)
@@ -470,7 +470,7 @@ func TestProlongedDowntimeWithoutRebootProofKeepsQuarantine(t *testing.T) {
 			require.NoError(t, err)
 
 			c.Advance(10 * time.Minute)
-			_, err = s.Sweep(30*time.Second, 5*time.Minute)
+			_, err = s.Sweep(30*time.Second, 5*time.Minute, time.Time{})
 			require.NoError(t, err)
 
 			c.Advance(time.Minute)
@@ -503,7 +503,7 @@ func TestRebootRecoversADeviceQuarantinedByLeaseExpiry(t *testing.T) {
 	// TestHeartbeatDoesNotRenewAnUnclaimedJobLease).
 	c.Advance(2 * time.Minute)
 	require.NoError(t, s.RecordHeartbeat("w1", c.Now(), nil))
-	res, err := s.Sweep(30*time.Second, 5*time.Minute)
+	res, err := s.Sweep(30*time.Second, 5*time.Minute, time.Time{})
 	require.NoError(t, err)
 	require.Equal(t, []string{job.ID}, res.LeasesExpired)
 	require.Equal(t, model.DeviceUnhealthy, devicesByID(t, s)["gpubox:gpu0"].State)
@@ -523,7 +523,7 @@ func TestRecoveredDeviceQuarantinesFreshlyAfterwards(t *testing.T) {
 	registerTwoDeviceHost(t, s, c.Now(), "boot-1")
 
 	c.Advance(10 * time.Minute)
-	_, err := s.Sweep(30*time.Second, 5*time.Minute) // quarantined: worker lost
+	_, err := s.Sweep(30*time.Second, 5*time.Minute, time.Time{}) // quarantined: worker lost
 	require.NoError(t, err)
 	registerTwoDeviceHost(t, s, c.Now(), "boot-2") // recovered by the reboot
 	require.Equal(t, model.DeviceReady, devicesByID(t, s)["gpubox:gpu0"].State)

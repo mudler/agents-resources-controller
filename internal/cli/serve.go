@@ -61,6 +61,36 @@ var (
 	sweepUnhealthyAfter = 5 * time.Minute
 )
 
+// startupGrace is how long after this process starts the reaper declines to
+// draw a destructive conclusion from a stored timestamp — it expires no lease
+// and writes off no silent worker until the window has passed. See
+// store.Sweep's holdOffUntil, which is where the rule itself lives.
+//
+// On 2026-08-18 the controller was restarted to pick up a new image. It was
+// down for a few seconds, and its first sweep expired a lease whose deadline
+// had lapsed during exactly that gap: the job was running perfectly well, its
+// holder had simply had no controller to renew against. The scheduler
+// restarting killed the work.
+//
+// The value is HeartbeatGrace, and it is the same number for the same reason:
+// HeartbeatGrace is this controller's own definition of how long a worker may
+// be quiet before we treat it as out of contact, and a worker heartbeats
+// every 10s by default (worker.defaultHeartbeatInterval), so it is three
+// heartbeats' worth of slack. Below it the controller has concluded nothing
+// about a worker, so it must not conclude anything about that worker's lease
+// either — a sweep that would expire a lease inside a window in which it does
+// not even consider the holder out of contact is contradicting itself. One
+// renewal is all a live holder needs, and it gets three chances at it.
+//
+// It is deliberately not a flag. An operator has no information with which to
+// tune it: it is a function of the heartbeat interval, which the worker
+// already owns, and every value that is not "long enough for one heartbeat"
+// is wrong in one direction or the other. It is a var for the same single
+// reason sweepInterval and sweepUnhealthyAfter are: a test driving the
+// reaper's own goroutine cannot wait out thirty seconds of real time to see
+// it write anything off. Nothing but a test ever assigns to it.
+var startupGrace = HeartbeatGrace
+
 func NewServeCmd() *cobra.Command {
 	var (
 		addr       string
@@ -121,6 +151,12 @@ func NewServeCmd() *cobra.Command {
 			// "sql: database is closed".
 			reaperCtx, cancelReaper := context.WithCancel(cmd.Context())
 
+			// Stamped once, here, rather than recomputed per tick: the
+			// window is "how long since this controller started", and a
+			// value the loop derived itself each time would silently become
+			// "how long since the last tick".
+			holdOffUntil := c.Now().Add(startupGrace)
+
 			var reaperWG sync.WaitGroup
 			reaperWG.Add(1)
 			go func() {
@@ -132,7 +168,7 @@ func NewServeCmd() *cobra.Command {
 					case <-reaperCtx.Done():
 						return
 					case <-t.C:
-						res, err := sweepAndNotify(st, notifier, HeartbeatGrace, sweepUnhealthyAfter)
+						res, err := sweepAndNotify(st, notifier, HeartbeatGrace, sweepUnhealthyAfter, holdOffUntil)
 						if err != nil {
 							slog.Error("sweep", "err", err)
 							continue
@@ -385,8 +421,8 @@ const (
 // fail the sweep — the reaper's job is to reclaim hardware, and a
 // notification it could not fully label is still worth sending — so the
 // events degrade to device_unhealthy instead.
-func sweepAndNotify(st *store.Store, n *notify.Notifier, grace, unhealthyAfter time.Duration) (store.SweepResult, error) {
-	res, err := st.Sweep(grace, unhealthyAfter)
+func sweepAndNotify(st *store.Store, n *notify.Notifier, grace, unhealthyAfter time.Duration, holdOffUntil time.Time) (store.SweepResult, error) {
+	res, err := st.Sweep(grace, unhealthyAfter, holdOffUntil)
 	if err != nil {
 		return res, err
 	}

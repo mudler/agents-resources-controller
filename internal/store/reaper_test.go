@@ -13,7 +13,7 @@ func TestSweepMarksSilentWorkerDevicesUnknown(t *testing.T) {
 	s, c := newStore(t)
 
 	c.Advance(45 * time.Second)
-	res, err := s.Sweep(30*time.Second, 5*time.Minute)
+	res, err := s.Sweep(30*time.Second, 5*time.Minute, time.Time{})
 	require.NoError(t, err)
 	require.Equal(t, []string{"gpubox:gpu0"}, res.DevicesUnknown)
 
@@ -26,7 +26,7 @@ func TestHeartbeatRestoresUnknownDeviceToReady(t *testing.T) {
 	s, c := newStore(t)
 
 	c.Advance(45 * time.Second)
-	_, err := s.Sweep(30*time.Second, 5*time.Minute)
+	_, err := s.Sweep(30*time.Second, 5*time.Minute, time.Time{})
 	require.NoError(t, err)
 
 	require.NoError(t, s.RecordHeartbeat("w1", c.Now(), nil))
@@ -46,7 +46,7 @@ func TestHeartbeatRestoresLeasedDeviceToBusyNotReady(t *testing.T) {
 	require.NoError(t, err)
 
 	c.Advance(45 * time.Second)
-	_, err = s.Sweep(30*time.Second, 5*time.Minute)
+	_, err = s.Sweep(30*time.Second, 5*time.Minute, time.Time{})
 	require.NoError(t, err)
 
 	// The worker is back and still supervising the job, so it names it.
@@ -77,7 +77,7 @@ func TestSweepMarksLostWorkerDevicesUnhealthyNotReady(t *testing.T) {
 	require.NoError(t, err)
 
 	c.Advance(10 * time.Minute)
-	res, err := s.Sweep(30*time.Second, 5*time.Minute)
+	res, err := s.Sweep(30*time.Second, 5*time.Minute, time.Time{})
 	require.NoError(t, err)
 	require.Equal(t, []string{"gpubox:gpu0"}, res.DevicesUnhealthy)
 	require.Equal(t, []string{job.ID}, res.JobsLost)
@@ -101,7 +101,7 @@ func TestClearDeviceMakesUnhealthyDeviceSchedulableAgain(t *testing.T) {
 	_, err := s.Allocate(req("agent-a"))
 	require.NoError(t, err)
 	c.Advance(10 * time.Minute)
-	_, err = s.Sweep(30*time.Second, 5*time.Minute)
+	_, err = s.Sweep(30*time.Second, 5*time.Minute, time.Time{})
 	require.NoError(t, err)
 
 	cleared, err := s.ClearDevice("gpubox:gpu0")
@@ -192,7 +192,7 @@ func TestSweepReapsJobsOnAlreadyUnhealthyDevice(t *testing.T) {
 	require.NoError(t, s.SetDeviceState("gpubox:gpu0", model.DeviceUnhealthy, c.Now(), ""))
 
 	c.Advance(10 * time.Minute)
-	_, err = s.Sweep(30*time.Second, 5*time.Minute)
+	_, err = s.Sweep(30*time.Second, 5*time.Minute, time.Time{})
 	require.NoError(t, err)
 
 	reloaded, err := s.Job(job.ID)

@@ -29,7 +29,7 @@ var clean = model.RecoveryProof{SurvivorsChecked: true}
 func quarantineIdleDevice(t *testing.T, s *store.Store, c interface{ Advance(time.Duration) }) {
 	t.Helper()
 	c.Advance(10 * time.Minute)
-	res, err := s.Sweep(30*time.Second, 5*time.Minute)
+	res, err := s.Sweep(30*time.Second, 5*time.Minute, time.Time{})
 	require.NoError(t, err)
 	require.Equal(t, []string{"gpubox:gpu0"}, res.DevicesUnhealthy)
 }
@@ -221,7 +221,7 @@ func TestAutoRecoverTouchesOnlyTheRegisteringWorkersDevices(t *testing.T) {
 	))
 
 	c.Advance(10 * time.Minute)
-	_, err := s.Sweep(30*time.Second, 5*time.Minute)
+	_, err := s.Sweep(30*time.Second, 5*time.Minute, time.Time{})
 	require.NoError(t, err)
 	require.Equal(t, model.DeviceUnhealthy, deviceState(t, s, "gpubox:gpu0"))
 	require.Equal(t, model.DeviceUnhealthy, deviceState(t, s, "orin:gpu0"))

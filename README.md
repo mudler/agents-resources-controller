@@ -392,6 +392,21 @@ interrupted job, and the controller clears the same three causes
 clear it. Neither is a device with a live lease, nor one whose quarantine
 cause was never recorded.
 
+**A worker also registers again when it reconnects**, which is what makes any
+of this work when the *controller* is the thing that restarted. Recovery is
+evaluated at registration, so a worker that registered once at startup and
+then heartbeated forever would never present its proof to a controller that
+came back after it — the device would sit quarantined until a human cleared
+it. Every response names the controller process (`Rc-Controller-Instance`),
+and a worker registers again when that name changes, or when it was out of
+contact for longer than the five minutes past which its devices are written
+off. Neither fires on a dropped request, each worker waits its own random
+delay of up to 30s so a fleet does not stampede a controller that has just
+started, and a worker that has a job in hand does not register at all until
+it is idle: registration reaps whatever the controller thinks is in flight,
+so re-registering mid-job would kill the job and quarantine the GPU under it
+— the exact damage this is here to avoid.
+
 **Flap protection:** a device that recovers automatically three times inside
 an hour stops doing so and waits for a human. A card that quarantines,
 clears and quarantines again is describing a real problem, and a controller
@@ -1421,6 +1436,18 @@ from — still requires the header and rejects a query-string token.
   admin. Otherwise a worker that stayed alive but never received a job could
   keep that job's lease renewed forever, and the expiry backstop would never
   fire for the one case that most needs it.
+- **Nothing is judged for the first 30 seconds after the controller
+  starts.** Both of those verdicts — an expired lease, a written-off worker
+  — are read off a stored timestamp, and a stored timestamp keeps running
+  while the controller does not. A controller restarted to pick up a new
+  image would otherwise come back, find every deadline that lapsed during
+  the outage, and kill jobs whose holders had been alive the whole time and
+  had simply had nobody to renew against. So for one heartbeat grace after
+  startup the reaper expires no lease and writes off no worker; it still
+  marks a device it has not heard from `unknown`, which the next heartbeat
+  undoes. It is not an amnesty: no deadline is moved, a holder that is
+  genuinely gone renews nothing, and the first sweep after the window
+  reaches the identical verdict.
 - A disconnected client does not release the device: the worker owns the
   process and reports its outcome directly to the controller.
 - A worker that stops reporting has its devices marked `unknown` after 30s
