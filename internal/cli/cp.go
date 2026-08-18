@@ -36,7 +36,12 @@ func parseCpArg(arg string) (remote bool, device, path string, err error) {
 		// literally named that, so say what the shape is.
 		if !ok && tail != "" && strings.HasPrefix(tail, "/") {
 			return false, "", "", fmt.Errorf(
-				"%q is not a device path: a remote path is host:name:path (e.g. dgx:gpu0%s)", arg, tail)
+				// The colon before the path is the whole point of this
+				// message, so the example has to carry it. Without it this
+				// printed "dgx:gpu0/workspace/" -- the exact malformed shape
+				// being rejected -- and a reader who copied the suggestion
+				// got the same error back.
+				"%q is not a device path: a remote path is host:name:path (e.g. dgx:gpu0:%s)", arg, tail)
 		}
 		return false, "", arg, nil
 	}
