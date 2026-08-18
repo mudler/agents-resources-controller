@@ -27,6 +27,13 @@
     --accent:#c86c08;
     --shadow:0 1px 2px rgba(20,22,28,.05);
     --scrim:rgba(22,24,29,.28);
+    /* Spacing scale. Before this the stylesheet used ten different gap values
+       (4,7,8,9,10,11,12,13,14,30) with no relationship between them, so every
+       new rule guessed. The steps are taken from what the page already was
+       rather than imposed on it: 10px stays its own step because it was the
+       most used and the board's density is deliberate. Collapsing only the
+       near-duplicates moved nothing by more than a pixel. */
+    --sp-1:4px; --sp-2:8px; --sp-3:10px; --sp-4:12px; --sp-5:14px; --sp-6:30px;
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -51,14 +58,14 @@
   .hide { display:none !important; }
 
   header {
-    display:flex; align-items:center; gap:14px; flex-wrap:wrap;
+    display:flex; align-items:center; gap:var(--sp-5); flex-wrap:wrap;
     padding:14px 24px; border-bottom:1px solid var(--line);
     background:var(--panel); position:sticky; top:0; z-index:5;
   }
-  header .brand { display:flex; align-items:center; gap:10px; margin-right:auto; }
+  header .brand { display:flex; align-items:center; gap:var(--sp-3); margin-right:auto; }
   header svg { display:block; }
   h1 { font-size:15px; margin:0; font-weight:600; letter-spacing:-.01em; }
-  .live { font-size:13px; color:var(--muted); display:flex; align-items:center; gap:7px; }
+  .live { font-size:13px; color:var(--muted); display:flex; align-items:center; gap:var(--sp-2); }
   .dot { width:7px; height:7px; border-radius:50%; background:var(--ready); flex:none; }
   .live.warn .dot { background:var(--warn); }
   .live.stale .dot { background:var(--bad); }
@@ -75,7 +82,7 @@
   /* Two columns: the fleet is what the eye lands on, and the activity feed
      sits beside it as peripheral vision rather than competing for the
      centre. One column below 980px, feed last. */
-  .board { display:grid; grid-template-columns:minmax(0,1fr) 320px; gap:30px; align-items:start; }
+  .board { display:grid; grid-template-columns:minmax(0,1fr) 320px; gap:var(--sp-6); align-items:start; }
   @media (max-width:980px) { .board { grid-template-columns:minmax(0,1fr); } }
 
   /* Summary line: the whole fleet in one sentence, so a glance needs no
@@ -92,7 +99,7 @@
   .host-name {
     font-size:12px; font-weight:600; color:var(--muted);
     letter-spacing:.06em; text-transform:uppercase;
-    display:flex; align-items:baseline; gap:9px; margin-bottom:8px;
+    display:flex; align-items:baseline; gap:var(--sp-2); margin-bottom:8px;
   }
   .host-note { font-size:12px; letter-spacing:0; text-transform:none;
                font-weight:400; color:var(--faint); }
@@ -112,7 +119,7 @@
   /* A device row, unlike a work row, leads with its glyph: the drawing is a
      column of its own and the text stacks beside it. Work rows keep the
      plain block layout above. */
-  .open.devrow { display:flex; align-items:flex-start; gap:13px; padding-left:14px; }
+  .open.devrow { display:flex; align-items:flex-start; gap:var(--sp-4); padding-left:14px; }
   .rowbody { flex:1; min-width:0; }
   .open:hover { background:var(--hover); }
   /* The rows box clips its corners, so an outlined focus ring drawn OUTSIDE
@@ -121,9 +128,9 @@
   .open:focus-visible, .ev-open:focus-visible { outline-offset:-2px; }
   .row.down .open:hover { background:transparent; text-decoration:none; }
   .row.down .open:hover .dev { text-decoration:underline; }
-  .actions { display:flex; align-items:center; gap:8px; padding:12px 14px 12px 0; flex:none; }
+  .actions { display:flex; align-items:center; gap:var(--sp-2); padding:12px 14px 12px 0; flex:none; }
 
-  .line1 { display:flex; align-items:baseline; gap:10px; flex-wrap:wrap; }
+  .line1 { display:flex; align-items:baseline; gap:var(--sp-3); flex-wrap:wrap; }
   /* The state pip carries the state at a glance; the word beside it carries
      it for anyone who cannot separate these hues. Never colour alone. */
   .pip { width:9px; height:9px; border-radius:50%; align-self:center; flex:none; background:var(--faint); }
@@ -229,7 +236,7 @@
           box-shadow:var(--shadow); overflow:hidden; }
   .ev { display:flex; border-top:1px solid var(--line); }
   .ev:first-child { border-top:0; }
-  .ev-open, .ev-static { flex:1; min-width:0; display:flex; gap:9px; align-items:baseline;
+  .ev-open, .ev-static { flex:1; min-width:0; display:flex; gap:var(--sp-2); align-items:baseline;
                          text-align:left; background:none; border:0; color:inherit; font:inherit;
                          padding:9px 12px; font-size:12.5px; }
   .ev-open { cursor:pointer; }
@@ -248,7 +255,7 @@
     background:var(--panel); border-left:1px solid var(--line); z-index:11;
     display:flex; flex-direction:column; box-shadow:-8px 0 30px rgba(20,22,28,.10);
   }
-  .panel-head { display:flex; align-items:center; gap:10px; padding:14px 18px;
+  .panel-head { display:flex; align-items:center; gap:var(--sp-3); padding:14px 18px;
                 border-bottom:1px solid var(--line); flex:none; }
   .panel-head h2 { font-size:15px; margin:0; font-weight:600; flex:1; min-width:0;
                    overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
@@ -269,9 +276,9 @@
      it: the glyph large enough to recognise, the one spec line that bears
      on a scheduling decision, and how much of the device is spoken for. */
   .portrait { border:1px solid var(--line); border-radius:10px; background:var(--sunk);
-              padding:14px; margin:0 0 20px; display:flex; flex-direction:column; gap:11px; }
+              padding:14px; margin:0 0 20px; display:flex; flex-direction:column; gap:var(--sp-4); }
   .portrait.unhealthy { border-color:var(--bad-line); background:var(--bad-bg); }
-  .ptop { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; }
+  .ptop { display:flex; align-items:flex-start; justify-content:space-between; gap:var(--sp-4); }
   .pname { font-size:15px; font-weight:600; letter-spacing:-.01em; word-break:break-word; }
   .pspec { color:var(--muted); font-size:12.5px; margin-top:2px; word-break:break-word; }
   .meter { height:5px; background:var(--line); border-radius:100px; overflow:hidden; }
@@ -279,7 +286,7 @@
   .meter > i.busy { background:var(--busy); }
   .meter > i.unhealthy { background:var(--bad); opacity:.4; }
   .meter > i.unknown { background:var(--unknown); opacity:.5; }
-  .pfoot { display:flex; align-items:baseline; justify-content:space-between; gap:10px;
+  .pfoot { display:flex; align-items:baseline; justify-content:space-between; gap:var(--sp-3);
            font-size:12.5px; color:var(--muted); }
   .pfoot .tnum { font-variant-numeric:tabular-nums; flex:none; }
 
@@ -298,7 +305,7 @@
 
   .block { margin:0 0 20px; }
   .block > .sec { margin-bottom:8px; }
-  .facts { display:grid; grid-template-columns:auto minmax(0,1fr); gap:4px 16px; margin:0; }
+  .facts { display:grid; grid-template-columns:auto minmax(0,1fr); gap:var(--sp-1) 16px; margin:0; }
   .facts dt { color:var(--muted); font-size:12.5px; }
   .facts dd { margin:0; font-size:13px; word-break:break-word; }
   .facts dd .src { color:var(--faint); font-size:11px; margin-left:6px; }
@@ -308,7 +315,7 @@
   .full { background:var(--sunk); border:1px solid var(--line); border-radius:8px;
           padding:10px 12px; font-size:12.5px; white-space:pre-wrap; word-break:break-all;
           max-height:200px; overflow:auto; margin:0; color:var(--ink-2); }
-  .full-head { display:flex; align-items:baseline; gap:10px; margin-bottom:6px; }
+  .full-head { display:flex; align-items:baseline; gap:var(--sp-3); margin-bottom:6px; }
   .full-head .sec { margin:0; flex:1; }
   .tiny { border:1px solid var(--line-2); background:var(--panel); color:var(--muted);
           border-radius:7px; padding:2px 8px; font:inherit; font-size:11.5px; cursor:pointer; }
@@ -321,7 +328,7 @@
   .log { background:var(--sunk); border:1px solid var(--line); border-radius:8px;
          padding:10px 12px; font-size:12px; line-height:1.5; height:260px; overflow:auto;
          white-space:pre-wrap; word-break:break-word; color:var(--ink-2); margin:0; }
-  .log-status { font-size:11.5px; color:var(--faint); margin:6px 2px 0; display:flex; gap:8px; }
+  .log-status { font-size:11.5px; color:var(--faint); margin:6px 2px 0; display:flex; gap:var(--sp-2); }
   .log-status .streaming { color:var(--ready); }
   .log-status .bad { color:var(--bad); }
 
@@ -341,7 +348,7 @@
                       color:var(--muted); }
   .sheet hr { border:0; border-top:1px solid var(--line); margin:12px 0; }
 
-  .jrow { display:flex; gap:9px; align-items:baseline; font-size:12.5px; width:100%;
+  .jrow { display:flex; gap:var(--sp-2); align-items:baseline; font-size:12.5px; width:100%;
           text-align:left; background:none; border:0; color:inherit; font-family:inherit;
           padding:5px 6px; border-radius:7px; cursor:pointer; }
   .jrow:hover { background:var(--hover); }
@@ -358,7 +365,7 @@
   /* The identity control is a footnote, not a headline: it is set once and
      never touched again, so it must not compete with the fleet. */
   .who-bar { margin-top:30px; padding-top:16px; border-top:1px solid var(--line);
-             display:flex; gap:9px; align-items:center; flex-wrap:wrap;
+             display:flex; gap:var(--sp-2); align-items:center; flex-wrap:wrap;
              font-size:13px; color:var(--muted); }
   .who-bar input { flex:0 1 240px; }
   .who-bar button { border:1px solid var(--line-2); background:var(--panel); color:var(--ink-2);
@@ -381,7 +388,7 @@
   #gate { padding:64px 24px; max-width:400px; margin:0 auto; }
   #gate h2 { font-size:16px; margin:0 0 6px; font-weight:600; }
   #gate p { color:var(--muted); font-size:13px; margin:0 0 18px; }
-  #gate form { display:flex; gap:8px; }
+  #gate form { display:flex; gap:var(--sp-2); }
   #gate input { flex:1; }
   #gate button { background:var(--ink); color:var(--bg); border:0; border-radius:8px;
                  padding:8px 15px; font:inherit; font-weight:600; cursor:pointer; }
