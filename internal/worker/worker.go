@@ -1119,6 +1119,13 @@ func (w *Worker) execute(ctx context.Context, a assignment) {
 		Env:         env,
 		MaxRuntime:  time.Duration(a.MaxRuntimeSeconds) * time.Second,
 		IdleTimeout: time.Duration(a.IdleTimeoutSeconds) * time.Second,
+		// Sweep this job's escapees once its process group is gone: a child
+		// that called setsid(2) is in neither the group nor the session the
+		// kill was aimed at, but it still carries RC_JOB_ID (set above) and
+		// is found by that. Jobs only — the hooks and verify probes below run
+		// with the same variable in their environment and deliberately never
+		// ask for a sweep. See sweepJobSurvivors.
+		SweepJobID: a.JobID,
 	}
 
 	// The one branch this whole feature adds to the job path. Everything
@@ -1134,6 +1141,23 @@ func (w *Worker) execute(ctx context.Context, a assignment) {
 		res = Run(jobCtx, jobSpec, sink)
 	}
 	sink.Flush()
+
+	// What the RC_JOB_ID sweep did is LOGGED and goes no further. It is
+	// deliberately not folded into the job's own outcome below: a job that
+	// exited 0 and happened to leave a detached process behind is a
+	// successful job, and the last time a straggler sweep was allowed to say
+	// otherwise it relabelled 40 out of 40 ordinary successful jobs as killed
+	// (337e23d). The device, not the job, is what a survivor casts doubt on,
+	// and the check that speaks for the device is runVerify below — it is
+	// what quarantines a GPU whose memory is still pinned, including by
+	// something the sweep could not name or could not kill.
+	if sw := res.Sweep; len(sw.Remaining) > 0 {
+		slog.Error("processes from this job survived SIGKILL; the device may still be occupied",
+			"job", a.JobID, "device", a.DeviceID, "pids", sw.Remaining)
+	} else if len(sw.Found) > 0 {
+		slog.Warn("processes from this job outlived its process group and were reaped by job id",
+			"job", a.JobID, "device", a.DeviceID, "pids", sw.Found)
+	}
 
 	state := model.JobSucceeded
 	switch {

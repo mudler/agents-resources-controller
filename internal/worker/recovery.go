@@ -201,6 +201,18 @@ func survivorsFromPreviousRun(self int) (checked, found bool) {
 
 // hasJobEnv reports whether the process's environment carries a non-empty
 // RC_JOB_ID, which marks it as something a worker started for a job.
+func hasJobEnv(pid int) (bool, error) {
+	id, err := jobEnvID(pid)
+	return id != "", err
+}
+
+// jobEnvID returns the value of RC_JOB_ID in the process's environment, or
+// "" if it carries none. It is hasJobEnv's own implementation, widened to
+// hand back the id itself, because the post-job sweep (sweep.go) has to
+// answer a stricter question than "is this one of ours": it has to answer
+// "is this THIS job's", and killing another job's processes because their
+// ids share a prefix would be a worse bug than the leak the sweep fixes.
+// One reader, one parse, one place to be wrong.
 //
 // A process that has exited by the time we get to it is not an error and not
 // a survivor: it holds nothing. Anything else — most realistically EACCES on
@@ -210,21 +222,21 @@ func survivorsFromPreviousRun(self int) (checked, found bool) {
 // A kernel thread reads back as zero bytes rather than an error (it has no
 // mm for the kernel to read an environment out of), so it falls out as a
 // plain non-match without needing a special case.
-func hasJobEnv(pid int) (bool, error) {
+func jobEnvID(pid int) (string, error) {
 	data, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/environ")
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ESRCH) {
-			return false, nil
+			return "", nil
 		}
-		return false, err
+		return "", err
 	}
 	// environ is NUL-separated, not newline-separated, and the last entry
 	// carries a trailing NUL — so an empty final element is normal and must
 	// not be mistaken for an empty variable.
 	for _, entry := range bytes.Split(data, []byte{0}) {
 		if v, ok := bytes.CutPrefix(entry, []byte(jobEnvPrefix)); ok && len(v) > 0 {
-			return true, nil
+			return string(v), nil
 		}
 	}
-	return false, nil
+	return "", nil
 }
