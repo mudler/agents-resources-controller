@@ -214,6 +214,70 @@ func TestDashboardNeverAssignsMarkup(t *testing.T) {
 	}
 }
 
+// glyphTemplate matches one of the device glyphs declared as static markup.
+var glyphTemplate = regexp.MustCompile(`(?s)<template id="glyph-([a-z]+)">\s*(?:<!--.*?-->\s*)?<svg`)
+
+// TestDashboardDrawsItsGlyphsFromStaticTemplates pins how the device glyphs
+// reach the page. They are the one part of it that is a picture rather than
+// a sentence, and a picture is exactly what somebody reaches for a string of
+// markup to build — `svg.innerHTML = "<rect …>"` is the obvious way to write
+// this and would take the whole no-markup boundary with it (see
+// TestDashboardNeverAssignsMarkup, which would also catch that, and this,
+// which says what to do INSTEAD).
+//
+// So: every glyph is a <template> in the served asset, put on the page by
+// cloneNode. Nothing is assembled at runtime, which means no device ID, no
+// label a host wrote, and no state name can ever be inside markup.
+func TestDashboardDrawsItsGlyphsFromStaticTemplates(t *testing.T) {
+	body := dashboardBody(t)
+
+	kinds := glyphTemplate.FindAllStringSubmatch(body, -1)
+	require.NotEmpty(t, kinds, "the device glyphs must be inline <template> SVG in the served asset")
+	for _, m := range kinds {
+		require.Contains(t, body, `document.getElementById("glyph-" + glyphKind(v))`,
+			"a glyph must be looked up by kind, not built")
+		require.NotEmpty(t, m[1])
+	}
+	require.Contains(t, body, ".content.firstElementChild.cloneNode(true)",
+		"a glyph reaches the page by cloning its template, never as a string of markup")
+}
+
+// TestDashboardChoosesGlyphsFromLabelsWithAFallback pins the rule that keeps
+// this page honest about a fleet it has never seen. A glyph is picked from
+// the labels the controller was given — never from a list of host names, so
+// the fourth box renders on the day its worker registers rather than on the
+// day somebody edits this file — and anything that matches no rule falls
+// back to the generic die. Delete the fallback and an unrecognised device
+// renders as nothing at all, which is the failure this guards.
+func TestDashboardChoosesGlyphsFromLabelsWithAFallback(t *testing.T) {
+	body := dashboardBody(t)
+
+	require.Contains(t, body, "function glyphKind(v)")
+	require.Contains(t, body, "var m = labelMap(v), text = \"\";",
+		"the glyph must be decided from this device's labels")
+	require.Regexp(t, `(?m)^\s*return "die";`, body,
+		"a device whose labels match no rule must still get a glyph")
+	// The one shape that is NOT chosen from the hardware: a device out of
+	// the pool reads as wrong by shape, whatever it is made of.
+	require.Contains(t, body, `if (v.device.state === "unhealthy") return "fault";`)
+}
+
+// TestDashboardCarriesStateInWordsNotOnlyColour pins the accessibility half
+// of the board's design. The rail is a colour and the glyph is a shape, but
+// the thing that has to survive colourblindness, a bad monitor and a glance
+// from the side is the WORD — so the state pill carries stateWord()'s text,
+// and the glyphs, which repeat what the words already say, are hidden from a
+// screen reader rather than read out twice.
+func TestDashboardCarriesStateInWordsNotOnlyColour(t *testing.T) {
+	body := dashboardBody(t)
+
+	require.Contains(t, body, `el("span", "pill " + d.state, stateWord(d.state))`,
+		"the state pill must say the state in words")
+	require.Equal(t, strings.Count(body, "<svg viewBox=\"0 0 48 48\" class=\"glyph\""),
+		strings.Count(body, "<svg viewBox=\"0 0 48 48\" class=\"glyph\" aria-hidden=\"true\""),
+		"every device glyph is decorative and must be hidden from a screen reader")
+}
+
 // externalRef matches a src= or href= pointing at another host: an absolute
 // http(s) URL or a protocol-relative one.
 var externalRef = regexp.MustCompile(`(?i)(src|href)\s*=\s*["']?\s*(https?:)?//`)

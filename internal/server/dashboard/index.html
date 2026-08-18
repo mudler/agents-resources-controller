@@ -27,6 +27,13 @@
     --accent:#c86c08;
     --shadow:0 1px 2px rgba(20,22,28,.05);
     --scrim:rgba(22,24,29,.28);
+    /* Spacing scale. Before this the stylesheet used ten different gap values
+       (4,7,8,9,10,11,12,13,14,30) with no relationship between them, so every
+       new rule guessed. The steps are taken from what the page already was
+       rather than imposed on it: 10px stays its own step because it was the
+       most used and the board's density is deliberate. Collapsing only the
+       near-duplicates moved nothing by more than a pixel. */
+    --sp-1:4px; --sp-2:8px; --sp-3:10px; --sp-4:12px; --sp-5:14px; --sp-6:30px;
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -51,14 +58,14 @@
   .hide { display:none !important; }
 
   header {
-    display:flex; align-items:center; gap:14px; flex-wrap:wrap;
+    display:flex; align-items:center; gap:var(--sp-5); flex-wrap:wrap;
     padding:14px 24px; border-bottom:1px solid var(--line);
     background:var(--panel); position:sticky; top:0; z-index:5;
   }
-  header .brand { display:flex; align-items:center; gap:10px; margin-right:auto; }
+  header .brand { display:flex; align-items:center; gap:var(--sp-3); margin-right:auto; }
   header svg { display:block; }
   h1 { font-size:15px; margin:0; font-weight:600; letter-spacing:-.01em; }
-  .live { font-size:13px; color:var(--muted); display:flex; align-items:center; gap:7px; }
+  .live { font-size:13px; color:var(--muted); display:flex; align-items:center; gap:var(--sp-2); }
   .dot { width:7px; height:7px; border-radius:50%; background:var(--ready); flex:none; }
   .live.warn .dot { background:var(--warn); }
   .live.stale .dot { background:var(--bad); }
@@ -75,7 +82,7 @@
   /* Two columns: the fleet is what the eye lands on, and the activity feed
      sits beside it as peripheral vision rather than competing for the
      centre. One column below 980px, feed last. */
-  .board { display:grid; grid-template-columns:minmax(0,1fr) 320px; gap:30px; align-items:start; }
+  .board { display:grid; grid-template-columns:minmax(0,1fr) 320px; gap:var(--sp-6); align-items:start; }
   @media (max-width:980px) { .board { grid-template-columns:minmax(0,1fr); } }
 
   /* Summary line: the whole fleet in one sentence, so a glance needs no
@@ -92,7 +99,7 @@
   .host-name {
     font-size:12px; font-weight:600; color:var(--muted);
     letter-spacing:.06em; text-transform:uppercase;
-    display:flex; align-items:baseline; gap:9px; margin-bottom:8px;
+    display:flex; align-items:baseline; gap:var(--sp-2); margin-bottom:8px;
   }
   .host-note { font-size:12px; letter-spacing:0; text-transform:none;
                font-weight:400; color:var(--faint); }
@@ -109,12 +116,21 @@
   .open { flex:1; min-width:0; display:block; width:100%; text-align:left;
           background:none; border:0; color:inherit; font:inherit;
           padding:14px 8px 14px 16px; cursor:pointer; }
+  /* A device row, unlike a work row, leads with its glyph: the drawing is a
+     column of its own and the text stacks beside it. Work rows keep the
+     plain block layout above. */
+  .open.devrow { display:flex; align-items:flex-start; gap:var(--sp-4); padding-left:14px; }
+  .rowbody { flex:1; min-width:0; }
   .open:hover { background:var(--hover); }
+  /* The rows box clips its corners, so an outlined focus ring drawn OUTSIDE
+     the button would be cut off at the top and bottom of the list. Drawn
+     inside, it stays whole wherever the row is. */
+  .open:focus-visible, .ev-open:focus-visible { outline-offset:-2px; }
   .row.down .open:hover { background:transparent; text-decoration:none; }
   .row.down .open:hover .dev { text-decoration:underline; }
-  .actions { display:flex; align-items:center; gap:8px; padding:12px 14px 12px 0; flex:none; }
+  .actions { display:flex; align-items:center; gap:var(--sp-2); padding:12px 14px 12px 0; flex:none; }
 
-  .line1 { display:flex; align-items:baseline; gap:10px; flex-wrap:wrap; }
+  .line1 { display:flex; align-items:baseline; gap:var(--sp-3); flex-wrap:wrap; }
   /* The state pip carries the state at a glance; the word beside it carries
      it for anyone who cannot separate these hues. Never colour alone. */
   .pip { width:9px; height:9px; border-radius:50%; align-self:center; flex:none; background:var(--faint); }
@@ -128,6 +144,56 @@
   .state.unknown { color:var(--unknown); } .state.unhealthy { color:var(--bad); }
   .state.waiting { color:var(--muted); }
   .spec { font-size:12px; color:var(--faint); }
+
+  /* ---- rail, glyph, pill --------------------------------------------
+     One fact carried three ways, so that none of them is carrying it
+     alone. The rail is the colour a glance catches without reading, down
+     the full height of the row. The pill says the same thing in words, for
+     a reader who cannot separate these hues or is looking at the screen
+     from the side. The glyph changes SHAPE — not merely colour — when a
+     device leaves the pool. Take the colour out of any of it and the row
+     still says what it says. */
+  .rail { flex:none; width:4px; align-self:stretch; background:var(--faint); }
+  .rail.ready { background:var(--ready); }
+  .rail.busy { background:var(--busy); }
+  .rail.unknown { background:var(--unknown); }
+  .rail.unhealthy { background:var(--bad); }
+
+  /* Every glyph is one of the four <template>s at the foot of this page,
+     cloned. They carry no colour of their own: the three variables below
+     are all a drawing ever names, so one drawing serves every state, and
+     both palettes come free with the tokens. */
+  .glyph { display:block; flex:none; fill:none; stroke-width:var(--gw);
+           --gw:1.6; --g-ink:var(--ink-2); --g-faint:var(--faint); --g-accent:var(--faint); }
+  .glyph .ink { stroke:var(--g-ink); }
+  .glyph .faint { stroke:var(--g-faint); }
+  .glyph .mark { stroke:var(--g-accent); }
+  .glyph .core { fill:var(--g-accent); }
+  .glyph .core-soft { fill:var(--g-accent); opacity:.32; }
+  .glyph .hi { stroke-width:calc(var(--gw) * 1.5); }
+  .glyph.ready { --g-accent:var(--ready); }
+  .glyph.busy { --g-accent:var(--busy); }
+  .glyph.unknown { --g-accent:var(--unknown); }
+  .glyph.unhealthy { --g-ink:var(--bad); --g-accent:var(--bad); }
+  /* One viewBox at two sizes, so the stroke is set in the drawing's own
+     units per size rather than shrinking with it — a hairline at 26px is
+     not a smaller version of the portrait, it is an invisible one. */
+  .glyph-sm { width:26px; height:26px; --gw:2.4; margin-top:1px; }
+  .glyph-lg { width:42px; height:42px; --gw:1.7; }
+
+  .pill { display:inline-flex; align-items:center; font-size:12px; font-weight:600;
+          padding:2px 9px; border-radius:100px; border:1px solid transparent; }
+  .pill.ready { color:var(--ready); border-color:color-mix(in srgb,var(--ready) 35%,transparent); }
+  .pill.busy { color:var(--busy); border-color:color-mix(in srgb,var(--busy) 35%,transparent);
+               background:var(--warn-bg); }
+  .pill.unknown { color:var(--unknown);
+                  border-color:color-mix(in srgb,var(--unknown) 35%,transparent); }
+  .pill.unhealthy { color:var(--bad); border-color:color-mix(in srgb,var(--bad) 35%,transparent);
+                    background:var(--bad-bg); }
+  /* The row itself is already tinted when a device is out of the pool, so
+     the pill needs the panel behind it to stay a pill rather than a
+     floating word. */
+  .row.down .pill.unhealthy { background:var(--panel); }
 
   .line2 { font-size:13.5px; color:var(--ink-2); margin-top:4px; }
   .line2 .who { font-weight:500; }
@@ -170,7 +236,7 @@
           box-shadow:var(--shadow); overflow:hidden; }
   .ev { display:flex; border-top:1px solid var(--line); }
   .ev:first-child { border-top:0; }
-  .ev-open, .ev-static { flex:1; min-width:0; display:flex; gap:9px; align-items:baseline;
+  .ev-open, .ev-static { flex:1; min-width:0; display:flex; gap:var(--sp-2); align-items:baseline;
                          text-align:left; background:none; border:0; color:inherit; font:inherit;
                          padding:9px 12px; font-size:12.5px; }
   .ev-open { cursor:pointer; }
@@ -189,7 +255,7 @@
     background:var(--panel); border-left:1px solid var(--line); z-index:11;
     display:flex; flex-direction:column; box-shadow:-8px 0 30px rgba(20,22,28,.10);
   }
-  .panel-head { display:flex; align-items:center; gap:10px; padding:14px 18px;
+  .panel-head { display:flex; align-items:center; gap:var(--sp-3); padding:14px 18px;
                 border-bottom:1px solid var(--line); flex:none; }
   .panel-head h2 { font-size:15px; margin:0; font-weight:600; flex:1; min-width:0;
                    overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
@@ -204,6 +270,25 @@
   .big.unknown { color:var(--unknown); } .big.unhealthy { color:var(--bad); }
   .big.failed { color:var(--bad); } .big.done { color:var(--ready); }
   .under { font-size:13px; color:var(--muted); margin:0 0 16px; }
+
+  /* ---- the hardware portrait ----------------------------------------
+     What this machine IS, at the head of what the controller knows about
+     it: the glyph large enough to recognise, the one spec line that bears
+     on a scheduling decision, and how much of the device is spoken for. */
+  .portrait { border:1px solid var(--line); border-radius:10px; background:var(--sunk);
+              padding:14px; margin:0 0 20px; display:flex; flex-direction:column; gap:var(--sp-4); }
+  .portrait.unhealthy { border-color:var(--bad-line); background:var(--bad-bg); }
+  .ptop { display:flex; align-items:flex-start; justify-content:space-between; gap:var(--sp-4); }
+  .pname { font-size:15px; font-weight:600; letter-spacing:-.01em; word-break:break-word; }
+  .pspec { color:var(--muted); font-size:12.5px; margin-top:2px; word-break:break-word; }
+  .meter { height:5px; background:var(--line); border-radius:100px; overflow:hidden; }
+  .meter > i { display:block; height:100%; border-radius:100px; background:var(--faint); }
+  .meter > i.busy { background:var(--busy); }
+  .meter > i.unhealthy { background:var(--bad); opacity:.4; }
+  .meter > i.unknown { background:var(--unknown); opacity:.5; }
+  .pfoot { display:flex; align-items:baseline; justify-content:space-between; gap:var(--sp-3);
+           font-size:12.5px; color:var(--muted); }
+  .pfoot .tnum { font-variant-numeric:tabular-nums; flex:none; }
 
   .note { padding:12px 14px; border-radius:9px; font-size:13.5px; margin:0 0 16px;
           background:var(--sunk); border:1px solid var(--line); }
@@ -220,7 +305,7 @@
 
   .block { margin:0 0 20px; }
   .block > .sec { margin-bottom:8px; }
-  .facts { display:grid; grid-template-columns:auto minmax(0,1fr); gap:4px 16px; margin:0; }
+  .facts { display:grid; grid-template-columns:auto minmax(0,1fr); gap:var(--sp-1) 16px; margin:0; }
   .facts dt { color:var(--muted); font-size:12.5px; }
   .facts dd { margin:0; font-size:13px; word-break:break-word; }
   .facts dd .src { color:var(--faint); font-size:11px; margin-left:6px; }
@@ -230,7 +315,7 @@
   .full { background:var(--sunk); border:1px solid var(--line); border-radius:8px;
           padding:10px 12px; font-size:12.5px; white-space:pre-wrap; word-break:break-all;
           max-height:200px; overflow:auto; margin:0; color:var(--ink-2); }
-  .full-head { display:flex; align-items:baseline; gap:10px; margin-bottom:6px; }
+  .full-head { display:flex; align-items:baseline; gap:var(--sp-3); margin-bottom:6px; }
   .full-head .sec { margin:0; flex:1; }
   .tiny { border:1px solid var(--line-2); background:var(--panel); color:var(--muted);
           border-radius:7px; padding:2px 8px; font:inherit; font-size:11.5px; cursor:pointer; }
@@ -243,7 +328,7 @@
   .log { background:var(--sunk); border:1px solid var(--line); border-radius:8px;
          padding:10px 12px; font-size:12px; line-height:1.5; height:260px; overflow:auto;
          white-space:pre-wrap; word-break:break-word; color:var(--ink-2); margin:0; }
-  .log-status { font-size:11.5px; color:var(--faint); margin:6px 2px 0; display:flex; gap:8px; }
+  .log-status { font-size:11.5px; color:var(--faint); margin:6px 2px 0; display:flex; gap:var(--sp-2); }
   .log-status .streaming { color:var(--ready); }
   .log-status .bad { color:var(--bad); }
 
@@ -263,7 +348,7 @@
                       color:var(--muted); }
   .sheet hr { border:0; border-top:1px solid var(--line); margin:12px 0; }
 
-  .jrow { display:flex; gap:9px; align-items:baseline; font-size:12.5px; width:100%;
+  .jrow { display:flex; gap:var(--sp-2); align-items:baseline; font-size:12.5px; width:100%;
           text-align:left; background:none; border:0; color:inherit; font-family:inherit;
           padding:5px 6px; border-radius:7px; cursor:pointer; }
   .jrow:hover { background:var(--hover); }
@@ -280,7 +365,7 @@
   /* The identity control is a footnote, not a headline: it is set once and
      never touched again, so it must not compete with the fleet. */
   .who-bar { margin-top:30px; padding-top:16px; border-top:1px solid var(--line);
-             display:flex; gap:9px; align-items:center; flex-wrap:wrap;
+             display:flex; gap:var(--sp-2); align-items:center; flex-wrap:wrap;
              font-size:13px; color:var(--muted); }
   .who-bar input { flex:0 1 240px; }
   .who-bar button { border:1px solid var(--line-2); background:var(--panel); color:var(--ink-2);
@@ -292,10 +377,18 @@
     outline:2px solid var(--accent); outline-offset:2px;
   }
 
+  /* The only motion on this page, and only for a reader who has not asked
+     for less of it: a row and a portrait ease between their colours instead
+     of snapping. Nothing here moves on its own, and nothing moves at all
+     under prefers-reduced-motion. */
+  @media (prefers-reduced-motion: no-preference) {
+    .row, .open, .portrait { transition:background-color .15s ease, border-color .15s ease; }
+  }
+
   #gate { padding:64px 24px; max-width:400px; margin:0 auto; }
   #gate h2 { font-size:16px; margin:0 0 6px; font-weight:600; }
   #gate p { color:var(--muted); font-size:13px; margin:0 0 18px; }
-  #gate form { display:flex; gap:8px; }
+  #gate form { display:flex; gap:var(--sp-2); }
   #gate input { flex:1; }
   #gate button { background:var(--ink); color:var(--bg); border:0; border-radius:8px;
                  padding:8px 15px; font:inherit; font-weight:600; cursor:pointer; }
@@ -364,6 +457,67 @@
   </div>
   <div class="panel-body" id="panelBody"></div>
 </aside>
+
+<!-- The device glyphs: four drawings, and deliberately only four.
+
+     They live here as static markup and are put on the page by cloning —
+     never by assembling a string of it — for the same reason nothing else
+     on this page is assembled from a string: the moment markup is built at
+     runtime, one of the values in it is a device ID or a label a host
+     wrote. Cloning a template moves no text at all.
+
+     They are drawn in one 48-unit box and used at two sizes, they carry no
+     colour of their own (see .glyph in the stylesheet, which is where the
+     three variables they use are bound to the page's tokens), and they are
+     aria-hidden: the state a glyph shows is always said in words by the
+     pill beside it.
+
+     Four is the whole set. Which one a device gets is decided by glyphKind()
+     from the labels the controller was given, so a box nobody here has
+     heard of still renders — as the generic die. Adding a fifth drawing is
+     a design decision; adding a fifth machine is not. -->
+<template id="glyph-discrete">
+  <!-- A discrete card: a board with a fan and a memory bank, the shape of
+       a thing that slots into a chassis. -->
+  <svg viewBox="0 0 48 48" class="glyph" aria-hidden="true" focusable="false">
+    <rect class="ink" x="5" y="12" width="38" height="26" rx="3"/>
+    <circle class="mark" cx="17" cy="25" r="7"/>
+    <path class="mark" d="M17 18v14M10 25h14"/>
+    <rect class="core-soft" x="29" y="19" width="9" height="12" rx="1.5"/>
+    <path class="faint" d="M12 38v5M36 38v5" stroke-linecap="round"/>
+  </svg>
+</template>
+<template id="glyph-module">
+  <!-- A module: a square carrier board with its die in the middle and a
+       connector along two edges, the shape of a Jetson. -->
+  <svg viewBox="0 0 48 48" class="glyph" aria-hidden="true" focusable="false">
+    <rect class="ink" x="9" y="9" width="30" height="30" rx="4"/>
+    <rect class="core-soft" x="17" y="17" width="14" height="14" rx="2"/>
+    <rect class="mark" x="17" y="17" width="14" height="14" rx="2"/>
+    <path class="faint" d="M15 9V4M24 9V4M33 9V4M15 44v-5M24 44v-5M33 44v-5" stroke-linecap="round"/>
+  </svg>
+</template>
+<template id="glyph-fault">
+  <!-- The same outline with its die replaced by an alert mark: a device
+       that is out of the pool reads as wrong by SHAPE, at any size, in
+       either palette, and with the colour taken away entirely. -->
+  <svg viewBox="0 0 48 48" class="glyph" aria-hidden="true" focusable="false">
+    <rect class="ink" x="9" y="9" width="30" height="30" rx="4"/>
+    <path class="mark hi" d="M24 17v9M24 30.5v.5" stroke-linecap="round"/>
+    <path class="faint" d="M15 9V4M24 9V4M33 9V4M15 44v-5M24 44v-5M33 44v-5" stroke-linecap="round"/>
+  </svg>
+</template>
+<template id="glyph-die">
+  <!-- The fallback: a bare die with pins on all four sides. It says "a
+       processor, and nothing was reported about which" — which is exactly
+       true of any device whose labels match none of the rules. -->
+  <svg viewBox="0 0 48 48" class="glyph" aria-hidden="true" focusable="false">
+    <rect class="ink" x="9" y="9" width="30" height="30" rx="5"/>
+    <rect class="core" x="17" y="17" width="14" height="14" rx="2"/>
+    <path class="faint" d="M18 9V4M30 9V4M18 44v-5M30 44v-5M9 18H4M9 30H4M44 18h-5M44 30h-5"
+          stroke-linecap="round"/>
+  </svg>
+</template>
 
 <script>
 (function () {
@@ -516,6 +670,109 @@
     if (m.disk_free_bytes) bits.push(bytes(m.disk_free_bytes) + " free");
     if (m.cpus) bits.push(m.cpus + " CPUs");
     return bits.join(" · ");
+  }
+
+  // ---- which machine is this ---------------------------------------------
+  //
+  // A glyph is chosen from what the controller was TOLD about the hardware
+  // and from nothing else. Not from the host name: this fleet is three boxes
+  // today, and the fourth has to render on the day its worker registers,
+  // from a machine nobody wrote code for. A hostname list would mean every
+  // new box arrives invisible until someone edits this file, which is the
+  // failure mode worth designing out.
+  //
+  // So: gather the label values that describe hardware, and match words in
+  // them. Both label sources count — a `gpu_model` an operator declared in
+  // the worker's config and a `model` nvidia-smi detected say the same kind
+  // of thing — and `kernel` is in the list on purpose: it is the one fact a
+  // Jetson reports (…-tegra) on a box that has no nvidia-smi at all, which
+  // is exactly the case orin is.
+  //
+  // Nothing matches? The generic die. That fallback is the point of having
+  // only four drawings: adding a fourth box needs no drawing, and a fleet
+  // this code has never heard of still renders as something.
+  var HARDWARE_KEYS = ["gpu_model", "model", "product", "board", "platform",
+                       "soc", "chassis", "form_factor", "arch", "vendor", "kernel"];
+
+  // Read in order; first match wins. To teach it a new shape, add a word —
+  // not a hostname, and not a fifth glyph.
+  var GLYPH_RULES = [
+    { kind: "module", re: /\b(jetson|orin|thor|xavier|tegra|igx|agx)\b/ },
+    { kind: "discrete", re: /\b(g[bh]\d+|dgx|spark|grace|blackwell|hopper|ampere|rtx|gtx|geforce|quadro|tesla|titan|radeon|instinct|[ahlbvtp]\d{2,3}|[tl]4)\b/ }
+  ];
+
+  function glyphKind(v) {
+    // Out of the pool outranks what the hardware is: the reader who opens
+    // this page because something is wrong needs the wrong thing to be the
+    // shape they see, not a correctly-drawn Jetson.
+    if (v.device.state === "unhealthy") return "fault";
+    var m = labelMap(v), text = "";
+    HARDWARE_KEYS.forEach(function (k) {
+      if (m[k]) text += " " + String(m[k]).toLowerCase();
+    });
+    for (var i = 0; i < GLYPH_RULES.length; i++) {
+      if (GLYPH_RULES[i].re.test(text)) return GLYPH_RULES[i].kind;
+    }
+    return "die";
+  }
+
+  // The glyph is CLONED from a <template> in this document, never built
+  // from a string of markup: see the note beside the templates. Colour
+  // arrives as a class the stylesheet resolves against the state, so no
+  // colour value is chosen here.
+  function glyphFor(v, size) {
+    var tpl = document.getElementById("glyph-" + glyphKind(v));
+    var node = tpl.content.firstElementChild.cloneNode(true);
+    // setAttribute, not .className: on an SVG element className is an
+    // SVGAnimatedString and assigning to it silently does nothing.
+    node.setAttribute("class", "glyph glyph-" + size + " " + v.device.state);
+    return node;
+  }
+
+  // The portrait's line about the hardware — a little fuller than the
+  // board's, because the panel has the room. Every value is clipped: a
+  // label is whatever a probe on the host printed, and a probe that prints
+  // a paragraph must not stretch this panel.
+  function portraitSpec(v) {
+    var m = labelMap(v), bits = [];
+    if (m.gpu_model) bits.push(clip(m.gpu_model, 40));
+    else if (m.model) bits.push(clip(m.model, 40));
+    else if (m.vendor) bits.push(clip(m.vendor, 40));
+    if (m.vram) bits.push(clip(m.vram, 16) + " VRAM");
+    if (m.cpus) bits.push(clip(m.cpus, 8) + " CPUs");
+    if (!bits.length) return "Nothing has reported what this hardware is.";
+    return bits.join(" · ");
+  }
+
+  // How much of this device is spoken for. rc hands out a device whole —
+  // there is no half a GPU — so the bar is full or empty, EXCEPT while a
+  // job with a time limit runs, where it is how far through that limit the
+  // job has got. That is the one number worth watching during a run, and it
+  // is measured by the controller like every other age on this page; when
+  // there is no limit there is no number, and the bar says only "claimed".
+  function claim(v) {
+    var d = v.device;
+    if (d.state === "unhealthy") {
+      return { pct: 100, tone: "unhealthy", what: "out of the pool", when: "" };
+    }
+    if (v.holder) {
+      var job = jobIndex[v.job_id];
+      var limit = job && job.max_runtime_seconds;
+      var elapsed = v.elapsed_seconds || 0;
+      return {
+        // Floored at a sliver so that "a job is running" is never drawn as
+        // an empty bar in its first seconds.
+        pct: limit ? Math.max(3, Math.min(100, Math.round(elapsed / limit * 100))) : 100,
+        tone: "busy",
+        what: (v.kind === "hold" ? "held by " : "running work for ") + clip(v.holder, 40),
+        when: limit ? ago(elapsed) + " of " + ago(limit) : ago(elapsed)
+      };
+    }
+    if (d.state === "unknown") {
+      return { pct: 0, tone: "unknown", what: "nothing is reporting for it",
+               when: "quiet " + ago(v.heartbeat_age_seconds) };
+    }
+    return { pct: 0, tone: "ready", what: "nothing is using it", when: "ready for work" };
   }
 
   // A job's command as one string, bounded. `hold` has no command a
@@ -1092,22 +1349,33 @@
     var down = d.state === "unhealthy";
     var row = el("div", "row" + (down ? " down" : ""));
 
-    var open = el("button", "open");
+    // The rail runs the full height of the row, outside the button, so it is
+    // a property of the row rather than of anything clickable inside it.
+    row.appendChild(el("span", "rail " + d.state));
+
+    var open = el("button", "open devrow");
     open.type = "button";
     open.addEventListener("click", function () { openDevice(d.id); });
+    // The glyph, decorative and hidden from a screen reader: it repeats the
+    // state and the hardware, both of which are already words further down
+    // this row. It is here for the eye that is not reading.
+    open.appendChild(glyphFor(v, "sm"));
+
+    var body = el("div", "rowbody");
 
     var l1 = el("div", "line1");
-    l1.appendChild(el("span", "pip " + d.state));
     // The short name reads better in a list already grouped by host, but the
     // full ID is what an operator types into `rc run -d`, so keep it one
     // hover away rather than gone.
     var name = el("span", "dev mono", d.name || d.id);
     name.title = d.id;
     l1.appendChild(name);
-    l1.appendChild(el("span", "state " + d.state, stateWord(d.state)));
+    // The pill replaces the pip-and-word pair: the same two carriers, one
+    // object, and the word is the part that survives if the colour does not.
+    l1.appendChild(el("span", "pill " + d.state, stateWord(d.state)));
     var spec = specLine(v);
     if (spec) l1.appendChild(el("span", "spec", spec));
-    open.appendChild(l1);
+    body.appendChild(l1);
 
     // Who has it and for how long — the question this page exists to answer.
     if (v.holder) {
@@ -1115,7 +1383,7 @@
       l2.appendChild(el("span", "who", v.holder));
       if (v.kind === "hold") l2.appendChild(txt(" is holding it" + (v.reason ? " — " + clip(v.reason, 60) : "")));
       l2.appendChild(el("span", "dur", " · " + ago(v.elapsed_seconds)));
-      open.appendChild(l2);
+      body.appendChild(l2);
     }
 
     // A worker that has gone quiet while still holding a claim is a ghost:
@@ -1124,7 +1392,7 @@
       var quiet = el("div", "line2");
       quiet.appendChild(el("span", "quiet",
         "nothing heard from this host for " + ago(v.heartbeat_age_seconds)));
-      open.appendChild(quiet);
+      body.appendChild(quiet);
     }
 
     // The explanation, promoted above everything else on a device that is
@@ -1136,11 +1404,11 @@
       var why = el("div", "why");
       why.appendChild(el("b", null, reason.headline));
       if (reason.quote) why.appendChild(el("span", "txt", clip(reason.quote, 160)));
-      open.appendChild(why);
+      body.appendChild(why);
     }
 
     if (v.kind !== "hold" && v.command && v.command.length) {
-      open.appendChild(el("div", "cmd mono", clip(v.command.join(" "), 200)));
+      body.appendChild(el("div", "cmd mono", clip(v.command.join(" "), 200)));
     }
 
     if (queuedFor.length) {
@@ -1150,9 +1418,10 @@
         line.textContent = "waiting " + ago(j.waited) + " · " + j.submitter;
         w.appendChild(line);
       });
-      open.appendChild(w);
+      body.appendChild(w);
     }
 
+    open.appendChild(body);
     row.appendChild(open);
 
     var actions = el("div", "actions");
@@ -1379,6 +1648,16 @@
       panelBody.appendChild(actions);
     }
 
+    // The hardware portrait: which machine this actually is, drawn rather
+    // than spelled, with its one spec line and how much of it is spoken for.
+    //
+    // It sits here, below the state and the reason and above everything the
+    // controller knows about the device, because the two modes want opposite
+    // things: diagnosis wants the answer first, and this is not the answer —
+    // it is what the answer is about. So the alarm keeps the top of the
+    // panel, and the portrait heads the facts.
+    panelBody.appendChild(portrait(v));
+
     // Facts, with provenance. describe is painted from cache first so
     // reopening a device never flashes empty, and refetched only when what
     // is cached has had time to go stale — this panel is rebuilt on every
@@ -1400,6 +1679,38 @@
         }
       })
       .catch(function () { /* the labels from /v1/state still stand */ });
+  }
+
+  function portrait(v) {
+    var d = v.device;
+    var card = el("div", "portrait" + (d.state === "unhealthy" ? " unhealthy" : ""));
+
+    var top = el("div", "ptop");
+    var head = el("div");
+    // The full ID here, not the short name: the panel is where an operator
+    // copies the thing they will type into `rc run -d`.
+    head.appendChild(el("div", "pname mono", d.id));
+    head.appendChild(el("div", "pspec", portraitSpec(v)));
+    top.appendChild(head);
+    top.appendChild(glyphFor(v, "lg"));
+    card.appendChild(top);
+
+    var c = claim(v);
+    var meter = el("div", "meter");
+    // Hidden from a screen reader on purpose: the two lines under it say
+    // the same thing in words, and a bar with no accessible value is worse
+    // than no bar at all.
+    meter.setAttribute("aria-hidden", "true");
+    var fill = el("i", c.tone);
+    fill.style.width = c.pct + "%";
+    meter.appendChild(fill);
+    card.appendChild(meter);
+
+    var foot = el("div", "pfoot");
+    foot.appendChild(el("span", null, c.what));
+    foot.appendChild(el("span", "tnum", c.when));
+    card.appendChild(foot);
+    return card;
   }
 
   function paintDescribe(box, v, data) {
