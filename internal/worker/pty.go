@@ -252,9 +252,30 @@ func sessionProcessGroups(sid int) []int {
 // and "could not look" mean opposite things to a caller deciding whether to
 // declare a target empty.
 func liveProcExists(want func(procStat) bool) (live, scanned bool) {
+	pids, scanned := scanLiveProcs(want, true)
+	return len(pids) > 0, scanned
+}
+
+// liveProcPids is liveProcExists with the pids kept instead of thrown away,
+// for the caller that has to DO something to each match rather than merely
+// know that one exists — the RC_JOB_ID sweep in sweep.go, which signals
+// them. It walks /proc exactly once, through the same code and with the same
+// zombie rule: an entry in state Z holds no memory, no device and no CPU, and
+// signalling it would achieve nothing (see groupAlive in exec.go for what
+// treating one as a live process cost the day it shipped).
+func liveProcPids(want func(procStat) bool) (pids []int, scanned bool) {
+	return scanLiveProcs(want, false)
+}
+
+// scanLiveProcs is the one /proc walk this package has. stopAtFirst exists
+// because the two callers genuinely differ in what they need and a walk of a
+// busy box's /proc is a few thousand file reads: liveProcExists answers a
+// yes/no question and can stop the moment it knows, while liveProcPids needs
+// the complete set.
+func scanLiveProcs(want func(procStat) bool, stopAtFirst bool) (pids []int, scanned bool) {
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
-		return false, false
+		return nil, false
 	}
 	for _, e := range entries {
 		pid, err := strconv.Atoi(e.Name())
@@ -268,12 +289,15 @@ func liveProcExists(want func(procStat) bool) (live, scanned bool) {
 		if st.state == 'Z' || !want(st) {
 			continue
 		}
-		return true, true
+		pids = append(pids, pid)
+		if stopAtFirst {
+			return pids, true
+		}
 	}
-	return false, true
+	return pids, true
 }
 
-// procStat is the four fields this worker reads out of /proc/<pid>/stat.
+// procStat is the five fields this worker reads out of /proc/<pid>/stat.
 type procStat struct {
 	// pid is the process's own id (field 1). It is here so a predicate
 	// handed to liveProcExists can exclude a specific process — the worker
@@ -284,8 +308,13 @@ type procStat struct {
 	// state is proc(5)'s single-character state. Only 'Z' (zombie: exited,
 	// unreaped) is interpreted here, and only to mean "not really there".
 	state byte
-	pgid  int
-	sid   int
+	// ppid is the parent's pid (field 4). It is read for one reason: the
+	// RC_JOB_ID sweep (sweep.go) has to walk from itself up to init to build
+	// the set of processes it must never signal, and a worker started from
+	// inside a job carries the very marker the sweep hunts for.
+	ppid int
+	pgid int
+	sid  int
 }
 
 // readProcStat reads /proc/<pid>/stat and parses it via parseProcStat.
@@ -297,9 +326,9 @@ func readProcStat(pid int) (procStat, bool) {
 	return parseProcStat(data)
 }
 
-// parseProcStat extracts the pid, state, process group and session ids
-// (fields 1, 3, 5 and 6 in proc(5), 1-indexed) from the raw contents of a
-// /proc/<pid>/stat file. The comm field (field 2) is parenthesized and may
+// parseProcStat extracts the pid, state, parent, process group and session
+// ids (fields 1, 3, 4, 5 and 6 in proc(5), 1-indexed) from the raw contents
+// of a /proc/<pid>/stat file. The comm field (field 2) is parenthesized and may
 // itself contain spaces or even parens (a process can name itself anything
 // via prctl/argv[0]), so the fields after it are located from the LAST ')'
 // rather than by naive whitespace splitting, exactly as proc(5) documents —
@@ -318,10 +347,11 @@ func parseProcStat(data []byte) (procStat, bool) {
 	if len(fields) < 4 {
 		return procStat{}, false
 	}
-	pgrp, err1 := strconv.Atoi(fields[2])
-	sess, err2 := strconv.Atoi(fields[3])
-	if err0 != nil || err1 != nil || err2 != nil || fields[0] == "" {
+	ppid, err1 := strconv.Atoi(fields[1])
+	pgrp, err2 := strconv.Atoi(fields[2])
+	sess, err3 := strconv.Atoi(fields[3])
+	if err0 != nil || err1 != nil || err2 != nil || err3 != nil || fields[0] == "" {
 		return procStat{}, false
 	}
-	return procStat{pid: pid, state: fields[0][0], pgid: pgrp, sid: sess}, true
+	return procStat{pid: pid, state: fields[0][0], ppid: ppid, pgid: pgrp, sid: sess}, true
 }

@@ -38,6 +38,21 @@ type JobSpec struct {
 	// It is wired through an os.Pipe this package creates rather than handed
 	// to os/exec directly, and that is not incidental — see Run.
 	Stdin io.Reader
+	// SweepJobID, when non-empty, turns on the RC_JOB_ID sweep: once the
+	// process group (or PTY session) has been torn down, every remaining
+	// process whose environment carries exactly this job id is signalled out
+	// of existence too. That is what catches a child which called setsid(2)
+	// and so left the group and the session the kill was aimed at. See
+	// sweepJobSurvivors in sweep.go for the mechanism and its residual.
+	//
+	// It is an explicit opt-in and not read out of Env["RC_JOB_ID"], even
+	// though execute() sets both to the same value, because the callers must
+	// differ: a JOB gets swept, while lifecycle hooks (hooks.go) and verify
+	// probes (verify.go) run with the same RC_JOB_ID in their environment and
+	// must never sweep — a hook or probe hunting for processes by job id is
+	// a mechanism nobody asked for, aimed at a job that is either about to
+	// start or already accounted for.
+	SweepJobID string
 }
 
 type Result struct {
@@ -45,6 +60,13 @@ type Result struct {
 	Killed   bool
 	Reason   string
 	Err      error
+	// Sweep records what the RC_JOB_ID sweep found and did, when
+	// JobSpec.SweepJobID asked for one. It is a report, NOT an outcome:
+	// nothing about it ever touches Killed, Reason or ExitCode, because a
+	// job that exited 0 and left a detached process behind is a successful
+	// job. See SweepReport in sweep.go for what happened the last time a
+	// straggler sweep was allowed to relabel a job.
+	Sweep SweepReport
 }
 
 // stragglerWait bounds how long Run waits for a process group to empty out
@@ -147,7 +169,28 @@ func (t pgidTarget) alive() bool { return groupAlive(int(t)) }
 // cancellation, SIGTERM -> grace -> SIGKILL, then mop up stragglers" that
 // both Run (via pgidTarget) and startPTY (via sessionTarget) rely on. cmd
 // must already have been started; runSupervised owns waiting on it.
+//
+// It is a thin wrapper over superviseTarget, which is the supervision itself,
+// plus the RC_JOB_ID sweep that runs AFTER it: the sweep's whole purpose is
+// to catch what is left once the process group and session have been torn
+// down, so it can only run when that teardown is finished and it must run on
+// every path out of it — a clean exit leaks a detached child exactly as
+// readily as a cancelled one does.
+//
+// The result of the sweep lands in its own field and changes nothing else.
+// That separation is the point; see SweepReport.
 func runSupervised(ctx context.Context, cmd *exec.Cmd, target processTarget, spec JobSpec, clock *idleClock) Result {
+	res := superviseTarget(ctx, cmd, target, spec, clock)
+	if spec.SweepJobID != "" {
+		res.Sweep = sweepJobSurvivors(spec.SweepJobID, os.Getpid())
+	}
+	return res
+}
+
+// superviseTarget is the supervision itself, unchanged by the sweep sitting
+// on top of it: wait, and on cancellation signal the target, wait out the
+// grace, force it, then mop up whatever is left INSIDE the target.
+func superviseTarget(ctx context.Context, cmd *exec.Cmd, target processTarget, spec JobSpec, clock *idleClock) Result {
 	grace := spec.GraceCeiling
 	if grace <= 0 {
 		grace = 10 * time.Second

@@ -306,6 +306,7 @@ func TestParseProcStat(t *testing.T) {
 		stat      string
 		wantPid   int
 		wantState byte
+		wantPpid  int
 		wantPgid  int
 		wantSid   int
 		wantOK    bool
@@ -315,6 +316,7 @@ func TestParseProcStat(t *testing.T) {
 			stat:      "12345 (sh) S 1 12345 12345 34816 12345 4194304 10 0 0 0 0 0 0 0 20 0 1 0\n",
 			wantPid:   12345,
 			wantState: 'S',
+			wantPpid:  1,
 			wantPgid:  12345,
 			wantSid:   12345,
 			wantOK:    true,
@@ -324,6 +326,7 @@ func TestParseProcStat(t *testing.T) {
 			stat:      "999 (my (weird) cmd) S 100 200 300 34816 300 4194304 10 0 0 0 0 0 0 0 20 0 1 0\n",
 			wantPid:   999,
 			wantState: 'S',
+			wantPpid:  100,
 			wantPgid:  200,
 			wantSid:   300,
 			wantOK:    true,
@@ -335,6 +338,7 @@ func TestParseProcStat(t *testing.T) {
 			stat:      "999 (sleep) Z 100 200 300 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0\n",
 			wantPid:   999,
 			wantState: 'Z',
+			wantPpid:  100,
 			wantPgid:  200,
 			wantSid:   300,
 			wantOK:    true,
@@ -361,6 +365,12 @@ func TestParseProcStat(t *testing.T) {
 			if tc.wantOK {
 				require.Equal(t, tc.wantPid, st.pid)
 				require.Equal(t, tc.wantState, st.state)
+				// ppid and pgid are adjacent fields holding the same kind of
+				// number, which is exactly the pair a reader confuses. The
+				// ancestor walk that keeps the sweep off this worker's own
+				// process tree is built on ppid, so it is pinned separately
+				// and with different values per case.
+				require.Equal(t, tc.wantPpid, st.ppid)
 				require.Equal(t, tc.wantPgid, st.pgid)
 				require.Equal(t, tc.wantSid, st.sid)
 			}
