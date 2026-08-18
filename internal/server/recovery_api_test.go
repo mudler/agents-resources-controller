@@ -120,7 +120,7 @@ func TestAutoRecoveryEmitsAnEvent(t *testing.T) {
 	// stopped reporting and the sweep quarantined them. No job is involved —
 	// an unhealthyAfter of zero is how this test says "the silence has gone
 	// on long enough" without needing the clock.
-	res, err := st.Sweep(0, 0)
+	res, err := st.Sweep(0, 0, time.Time{})
 	require.NoError(t, err)
 	require.Len(t, res.DevicesUnhealthy, 2)
 

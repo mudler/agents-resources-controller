@@ -372,7 +372,7 @@ func TestHeartbeatRenewsOnlyTheJobsTheWorkerNames(t *testing.T) {
 				hb.Body.Close()
 			}
 
-			_, err := st.Sweep(30*time.Second, 5*time.Minute)
+			_, err := st.Sweep(30*time.Second, 5*time.Minute, time.Time{})
 			require.NoError(t, err)
 
 			reloaded, err := st.Job(job.ID)

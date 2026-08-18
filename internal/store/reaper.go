@@ -45,9 +45,42 @@ type SweepResult struct {
 
 // Sweep demotes devices whose worker has stopped reporting. A device is never
 // promoted to ready by this path: silence is not evidence that it is free.
-func (s *Store) Sweep(grace, unhealthyAfter time.Duration) (SweepResult, error) {
+//
+// holdOffUntil is the instant before which this sweep must not conclude
+// anything DESTRUCTIVE — it expires no lease and writes off no worker until
+// the clock has passed it. A zero time means "judge now", which is what every
+// caller with no startup to wait out passes.
+//
+// It exists because both of those conclusions are drawn from a stored
+// timestamp — leases.expires_at and workers.last_heartbeat_at — and a stored
+// timestamp keeps running while this process is not. On 2026-08-18 the
+// controller was restarted to pick up a new image, was down for a few
+// seconds, and its first sweep found a lease whose deadline had passed during
+// exactly that gap. It expired the lease, quarantined the device and marked a
+// job that was running perfectly well as lost. The holder had been alive
+// throughout; it had simply had nobody to renew against. A worker that was
+// silent across the same gap is the same mistake one table over, and worse in
+// proportion to the outage: a controller down longer than unhealthyAfter
+// would write off every device in the fleet on its first tick and lose every
+// job on it.
+//
+// So for a bounded window after the controller starts (see
+// internal/cli/serve.go, which is where the window is chosen), the sweep
+// declines to judge and gives the holders a chance to renew. It is NOT an
+// amnesty and it does not touch any deadline: a holder that is genuinely gone
+// renews nothing, and the very next sweep after the window closes reaches the
+// identical verdict. Demotion to unknown is deliberately left running through
+// the window — it is not a quarantine, nothing schedules against it, the next
+// heartbeat undoes it, and "we have not heard from this worker since we
+// started" is the honest thing to say about a worker we have not heard from
+// since we started.
+func (s *Store) Sweep(grace, unhealthyAfter time.Duration, holdOffUntil time.Time) (SweepResult, error) {
 	var res SweepResult
 	now := s.clock.Now()
+	// judging is false only inside the startup window. Read once, so a
+	// single sweep cannot decide one way for the devices and the other way
+	// for the leases.
+	judging := !now.Before(holdOffUntil)
 
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -84,7 +117,10 @@ func (s *Store) Sweep(grace, unhealthyAfter time.Duration) (SweepResult, error) 
 		}
 		silence := now.Sub(time.Unix(hb, 0).UTC())
 		switch {
-		case silence >= unhealthyAfter:
+		// Inside the startup window a long-silent worker falls through to
+		// the unknown branch below instead: unknown says what we actually
+		// know, and costs nothing to be wrong about.
+		case judging && silence >= unhealthyAfter:
 			reap = append(reap, id)
 			if state != model.DeviceUnhealthy {
 				pending = append(pending, demotion{id, model.DeviceUnhealthy})
@@ -164,25 +200,27 @@ func (s *Store) Sweep(grace, unhealthyAfter time.Duration) (SweepResult, error) 
 	// that the hardware is idle. expires_at is a deadline, not a "still
 	// live until" marker: at now == expires_at the TTL has fully elapsed,
 	// so <= (not <) is correct here.
-	expRows, err := tx.Query(
-		`SELECT id, job_id, device_id FROM leases
-		 WHERE released_at IS NULL AND expires_at <= ?`, now.Unix())
-	if err != nil {
-		return res, err
-	}
 	type expired struct{ leaseID, jobID, deviceID string }
 	var stale []expired
-	for expRows.Next() {
-		var e expired
-		if err := expRows.Scan(&e.leaseID, &e.jobID, &e.deviceID); err != nil {
-			expRows.Close()
+	if judging {
+		expRows, err := tx.Query(
+			`SELECT id, job_id, device_id FROM leases
+			 WHERE released_at IS NULL AND expires_at <= ?`, now.Unix())
+		if err != nil {
 			return res, err
 		}
-		stale = append(stale, e)
-	}
-	expRows.Close()
-	if err := expRows.Err(); err != nil {
-		return res, err
+		for expRows.Next() {
+			var e expired
+			if err := expRows.Scan(&e.leaseID, &e.jobID, &e.deviceID); err != nil {
+				expRows.Close()
+				return res, err
+			}
+			stale = append(stale, e)
+		}
+		expRows.Close()
+		if err := expRows.Err(); err != nil {
+			return res, err
+		}
 	}
 
 	for _, e := range stale {

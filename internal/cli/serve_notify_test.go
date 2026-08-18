@@ -186,7 +186,7 @@ func TestSweepAndNotifyEmitsWorkerLostAndJobLost(t *testing.T) {
 	n, flush := newRecordingNotifier(t)
 
 	c.Advance(10 * time.Minute)
-	res, err := sweepAndNotify(st, n, HeartbeatGrace, 5*time.Minute)
+	res, err := sweepAndNotify(st, n, HeartbeatGrace, 5*time.Minute, time.Time{})
 	require.NoError(t, err)
 	require.Equal(t, []string{"gpubox:gpu0"}, res.DevicesUnhealthy)
 	require.Equal(t, []string{job.ID}, res.JobsLost)
@@ -210,7 +210,7 @@ func TestSweepAndNotifyEmitsLeaseExpired(t *testing.T) {
 	c.Advance(2 * time.Minute)
 	require.NoError(t, st.RecordHeartbeat("w1", c.Now(), nil))
 
-	res, err := sweepAndNotify(st, n, HeartbeatGrace, 5*time.Minute)
+	res, err := sweepAndNotify(st, n, HeartbeatGrace, 5*time.Minute, time.Time{})
 	require.NoError(t, err)
 	require.Equal(t, []string{job.ID}, res.LeasesExpired)
 	require.Empty(t, res.DevicesUnhealthy, "the worker never went silent")
@@ -236,7 +236,7 @@ func TestSweepAndNotifyEmitsNothingWhenNothingChanged(t *testing.T) {
 	allocateJob(t, st)
 	n, flush := newRecordingNotifier(t)
 
-	_, err := sweepAndNotify(st, n, HeartbeatGrace, 5*time.Minute)
+	_, err := sweepAndNotify(st, n, HeartbeatGrace, 5*time.Minute, time.Time{})
 	require.NoError(t, err)
 	require.Empty(t, flush())
 }
@@ -251,7 +251,7 @@ func TestNoWebhookConfiguredYieldsNilNotifierAndASafeSweep(t *testing.T) {
 	job := allocateJob(t, st)
 
 	c.Advance(10 * time.Minute)
-	res, err := sweepAndNotify(st, nil, HeartbeatGrace, 5*time.Minute)
+	res, err := sweepAndNotify(st, nil, HeartbeatGrace, 5*time.Minute, time.Time{})
 	require.NoError(t, err)
 	require.Equal(t, []string{job.ID}, res.JobsLost, "the sweep still did its work")
 }
@@ -281,6 +281,12 @@ func TestReaperAnnouncesALostWorkerThroughTheConfiguredWebhook(t *testing.T) {
 
 	shorten(t, &sweepInterval, 50*time.Millisecond)
 	shorten(t, &sweepUnhealthyAfter, time.Millisecond)
+	// The startup grace holds every destructive verdict for thirty seconds
+	// after the process starts (see startupGrace), which is longer than this
+	// test is willing to wait for the write-off it is here to observe.
+	// TestTheReaperWritesNothingOffInsideTheStartupGrace is the test that
+	// leaves it alone.
+	shorten(t, &startupGrace, time.Millisecond)
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
