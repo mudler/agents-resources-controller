@@ -1,8 +1,10 @@
 package client_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -14,6 +16,47 @@ import (
 	"github.com/mudler/resource-controller/internal/server"
 	"github.com/stretchr/testify/require"
 )
+
+func TestLogsPreflightsMetadataAndSetsFollow(t *testing.T) {
+	paths := make(chan string, 2)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths <- r.URL.RequestURI()
+		if r.URL.Path == "/v1/jobs/job1" {
+			_ = json.NewEncoder(w).Encode(server.JobView{Job: model.Job{ID: "job1"}})
+			return
+		}
+		_, _ = w.Write([]byte("snapshot"))
+	}))
+	defer ts.Close()
+	var out bytes.Buffer
+	require.NoError(t, client.New(ts.URL, "tok").Logs(context.Background(), "job1", &out, false))
+	require.Equal(t, "snapshot", out.String())
+	require.Equal(t, "/v1/jobs/job1", <-paths)
+	require.Equal(t, "/v1/jobs/job1/logs?follow=false", <-paths)
+}
+
+func TestLogsRejectsAttachedJobBeforeRequestingLogs(t *testing.T) {
+	var calls int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		_ = json.NewEncoder(w).Encode(server.JobView{Job: model.Job{ID: "job1", Stdio: model.StdioTTY}})
+	}))
+	defer ts.Close()
+	err := client.New(ts.URL, "tok").Logs(context.Background(), "job1", io.Discard, true)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "logs_not_stored")
+	require.Equal(t, int32(1), atomic.LoadInt32(&calls))
+}
+
+func TestStreamLogsRemainsDirectAlwaysFollow(t *testing.T) {
+	uri := make(chan string, 1)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		uri <- r.URL.RequestURI()
+	}))
+	defer ts.Close()
+	require.NoError(t, client.New(ts.URL, "tok").StreamLogs(context.Background(), "job1", io.Discard))
+	require.Equal(t, "/v1/jobs/job1/logs", <-uri)
+}
 
 func intPtr(i int) *int { return &i }
 

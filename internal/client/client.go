@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"time"
 
 	"github.com/mudler/resource-controller/internal/model"
@@ -415,9 +416,27 @@ func (c *Client) Clear(ctx context.Context, deviceID string) error {
 	return nil
 }
 
-// StreamLogs copies the job's output to out until the job finishes.
+// Logs copies either a snapshot of the job's currently stored output or follows
+// it until completion. Attached TTY and pipe jobs do not have stored logs.
+func (c *Client) Logs(ctx context.Context, id string, out io.Writer, follow bool) error {
+	job, err := c.Job(ctx, id)
+	if err != nil {
+		return err
+	}
+	if model.StdioAttached(job.Stdio) {
+		return errors.New("logs_not_stored: logs are not stored for attached jobs")
+	}
+	return c.copyLogs(ctx, id, out, "?follow="+strconv.FormatBool(follow))
+}
+
+// StreamLogs copies the job's output to out until the job finishes. It remains
+// a direct request so run and attach callers preserve their existing behavior.
 func (c *Client) StreamLogs(ctx context.Context, id string, out io.Writer) error {
-	resp, err := c.do(ctx, http.MethodGet, "/v1/jobs/"+id+"/logs", nil)
+	return c.copyLogs(ctx, id, out, "")
+}
+
+func (c *Client) copyLogs(ctx context.Context, id string, out io.Writer, query string) error {
+	resp, err := c.do(ctx, http.MethodGet, "/v1/jobs/"+id+"/logs"+query, nil)
 	if err != nil {
 		return err
 	}

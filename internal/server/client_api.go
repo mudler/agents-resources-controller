@@ -985,6 +985,35 @@ var logWriteTimeout = 10 * time.Second
 // ends when the job reaches a terminal state.
 func (s *Server) handleStreamLogs(w http.ResponseWriter, r *http.Request) {
 	jobID := r.PathValue("id")
+	followValue, hasFollow := r.URL.Query()["follow"]
+	if hasFollow && (len(followValue) != 1 || (followValue[0] != "true" && followValue[0] != "false")) {
+		writeErr(w, http.StatusBadRequest, "bad_request", "follow must be true or false")
+		return
+	}
+	follow := !hasFollow || followValue[0] == "true"
+
+	job, err := s.cfg.Store.Job(jobID)
+	if err != nil {
+		writeJobLookupError(w, err)
+		return
+	}
+	if model.StdioAttached(job.Stdio) {
+		writeErr(w, http.StatusBadRequest, "logs_not_stored", "logs are not stored for attached jobs")
+		return
+	}
+
+	if !follow {
+		data, err := s.cfg.Logs.Read(jobID)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "bad_request", err.Error())
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(data)
+		return
+	}
 
 	if _, ok := w.(http.Flusher); !ok {
 		writeErr(w, http.StatusInternalServerError, "unsupported", "streaming unsupported")
@@ -996,11 +1025,6 @@ func (s *Server) handleStreamLogs(w http.ResponseWriter, r *http.Request) {
 	// O_CREATE a log file for an unknown ID and the watcher below would spin
 	// forever since Job() never succeeds, leaking a goroutine and an fd per
 	// request to any client token.
-	if _, err := s.cfg.Store.Job(jobID); err != nil {
-		writeJobLookupError(w, err)
-		return
-	}
-
 	done := make(chan struct{})
 	chunks, err := s.cfg.Logs.Follow(r.Context(), jobID, done)
 	if err != nil {

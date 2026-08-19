@@ -393,6 +393,63 @@ func TestStreamLogsForUnknownJobReturns404(t *testing.T) {
 	require.Empty(t, entries, "no log file should exist for a job that was never allocated")
 }
 
+func TestLogsSnapshotReturnsCurrentBytesWithoutWaiting(t *testing.T) {
+	ts, _, _, _ := newServer(t)
+	registerWorker(t, ts)
+	created := post(t, ts, "ctok", "/v1/jobs", server.SubmitRequest{
+		DeviceID: "gpubox:gpu0", Command: []string{"./bench"}, Submitter: "agent-a",
+	})
+	var job model.Job
+	require.NoError(t, json.NewDecoder(created.Body).Decode(&job))
+	created.Body.Close()
+
+	pushed := postRaw(t, ts, "Bearer wtok", "/v1/jobs/"+job.ID+"/logs", []byte("already here\n"))
+	pushed.Body.Close()
+	resp := get(t, ts, "ctok", "/v1/jobs/"+job.ID+"/logs?follow=false")
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	raw, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.Equal(t, "already here\n", string(raw))
+}
+
+func TestLogsSnapshotEmptyAndAttachedModes(t *testing.T) {
+	ts, _, _, _ := newServer(t)
+	registerWorker(t, ts)
+	for _, tc := range []struct {
+		name, stdio string
+		wantStatus  int
+	}{
+		{name: "normal job without file", stdio: model.StdioLogs, wantStatus: http.StatusOK},
+		{name: "tty", stdio: model.StdioTTY, wantStatus: http.StatusBadRequest},
+		{name: "pipe", stdio: model.StdioPipe, wantStatus: http.StatusBadRequest},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			created := post(t, ts, "ctok", "/v1/jobs", server.SubmitRequest{
+				DeviceID: "gpubox:gpu0", Command: []string{"./bench"}, Submitter: "agent-a", Stdio: tc.stdio,
+			})
+			var job model.Job
+			require.NoError(t, json.NewDecoder(created.Body).Decode(&job))
+			created.Body.Close()
+			resp := get(t, ts, "ctok", "/v1/jobs/"+job.ID+"/logs?follow=false")
+			defer resp.Body.Close()
+			require.Equal(t, tc.wantStatus, resp.StatusCode)
+			if tc.wantStatus != http.StatusOK {
+				var body map[string]string
+				require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
+				require.Equal(t, "logs_not_stored", body["error"])
+			}
+		})
+	}
+}
+
+func TestLogsRejectsInvalidFollow(t *testing.T) {
+	ts, _, _, _ := newServer(t)
+	resp := get(t, ts, "ctok", "/v1/jobs/anything/logs?follow=sometimes")
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+}
+
 // TestGetJobStoreFailureIsNot404 makes sure an infrastructure failure is
 // never reported to the client as "job not found": a live job during a DB
 // outage must not look like a vanished job, or a client might resubmit onto
