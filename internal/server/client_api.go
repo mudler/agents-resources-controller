@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/mudler/resource-controller/internal/model"
@@ -138,6 +139,10 @@ type StateResponse struct {
 	// same reason every other age is: a reader's clock must not be able to
 	// make a stuck queue look fresh.
 	QueuedWaitingSeconds map[string]int `json:"queued_waiting_seconds,omitempty"`
+}
+
+type JobsResponse struct {
+	Jobs []model.Job `json:"jobs"`
 }
 
 // describeRecentJobs bounds how much job history `rc describe` shows: five
@@ -665,6 +670,48 @@ func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, JobView{Job: *job, QueuePosition: pos})
 }
 
+func (s *Server) handleListJobs(w http.ResponseWriter, r *http.Request) {
+	query := r.URL.Query()
+	limit := 20
+	if query.Has("limit") {
+		raw := query.Get("limit")
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 1 || parsed > 200 {
+			writeErr(w, http.StatusBadRequest, "bad_request", "limit must be an integer between 1 and 200")
+			return
+		}
+		limit = parsed
+	}
+
+	state := model.JobState(query.Get("state"))
+	if state != "" && !validJobState(state) {
+		writeErr(w, http.StatusBadRequest, "bad_request", "unknown job state")
+		return
+	}
+
+	jobs, err := s.cfg.Store.ListJobs(store.JobFilter{
+		Limit:     limit,
+		DeviceID:  query.Get("device"),
+		Submitter: query.Get("submitter"),
+		State:     state,
+	})
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "store_error", "could not list jobs")
+		return
+	}
+	writeJSON(w, http.StatusOK, JobsResponse{Jobs: jobs})
+}
+
+func validJobState(state model.JobState) bool {
+	switch state {
+	case model.JobAssigned, model.JobRunning, model.JobSucceeded, model.JobFailed,
+		model.JobKilled, model.JobLost, model.JobQueued:
+		return true
+	default:
+		return false
+	}
+}
+
 type KillRequest struct {
 	Submitter string `json:"submitter"`
 }
@@ -938,6 +985,35 @@ var logWriteTimeout = 10 * time.Second
 // ends when the job reaches a terminal state.
 func (s *Server) handleStreamLogs(w http.ResponseWriter, r *http.Request) {
 	jobID := r.PathValue("id")
+	followValue, hasFollow := r.URL.Query()["follow"]
+	if hasFollow && (len(followValue) != 1 || (followValue[0] != "true" && followValue[0] != "false")) {
+		writeErr(w, http.StatusBadRequest, "bad_request", "follow must be true or false")
+		return
+	}
+	follow := !hasFollow || followValue[0] == "true"
+
+	job, err := s.cfg.Store.Job(jobID)
+	if err != nil {
+		writeJobLookupError(w, err)
+		return
+	}
+	if model.StdioAttached(job.Stdio) {
+		writeErr(w, http.StatusBadRequest, "logs_not_stored", "logs are not stored for attached jobs")
+		return
+	}
+
+	if !follow {
+		data, err := s.cfg.Logs.Read(jobID)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "bad_request", err.Error())
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(data)
+		return
+	}
 
 	if _, ok := w.(http.Flusher); !ok {
 		writeErr(w, http.StatusInternalServerError, "unsupported", "streaming unsupported")
@@ -949,11 +1025,6 @@ func (s *Server) handleStreamLogs(w http.ResponseWriter, r *http.Request) {
 	// O_CREATE a log file for an unknown ID and the watcher below would spin
 	// forever since Job() never succeeds, leaking a goroutine and an fd per
 	// request to any client token.
-	if _, err := s.cfg.Store.Job(jobID); err != nil {
-		writeJobLookupError(w, err)
-		return
-	}
-
 	done := make(chan struct{})
 	chunks, err := s.cfg.Logs.Follow(r.Context(), jobID, done)
 	if err != nil {

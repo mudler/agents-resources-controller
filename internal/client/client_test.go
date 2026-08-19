@@ -1,8 +1,10 @@
 package client_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -14,6 +16,47 @@ import (
 	"github.com/mudler/resource-controller/internal/server"
 	"github.com/stretchr/testify/require"
 )
+
+func TestLogsPreflightsMetadataAndSetsFollow(t *testing.T) {
+	paths := make(chan string, 2)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths <- r.URL.RequestURI()
+		if r.URL.Path == "/v1/jobs/job1" {
+			_ = json.NewEncoder(w).Encode(server.JobView{Job: model.Job{ID: "job1"}})
+			return
+		}
+		_, _ = w.Write([]byte("snapshot"))
+	}))
+	defer ts.Close()
+	var out bytes.Buffer
+	require.NoError(t, client.New(ts.URL, "tok").Logs(context.Background(), "job1", &out, false))
+	require.Equal(t, "snapshot", out.String())
+	require.Equal(t, "/v1/jobs/job1", <-paths)
+	require.Equal(t, "/v1/jobs/job1/logs?follow=false", <-paths)
+}
+
+func TestLogsRejectsAttachedJobBeforeRequestingLogs(t *testing.T) {
+	var calls int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		_ = json.NewEncoder(w).Encode(server.JobView{Job: model.Job{ID: "job1", Stdio: model.StdioTTY}})
+	}))
+	defer ts.Close()
+	err := client.New(ts.URL, "tok").Logs(context.Background(), "job1", io.Discard, true)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "logs_not_stored")
+	require.Equal(t, int32(1), atomic.LoadInt32(&calls))
+}
+
+func TestStreamLogsRemainsDirectAlwaysFollow(t *testing.T) {
+	uri := make(chan string, 1)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		uri <- r.URL.RequestURI()
+	}))
+	defer ts.Close()
+	require.NoError(t, client.New(ts.URL, "tok").StreamLogs(context.Background(), "job1", io.Discard))
+	require.Equal(t, "/v1/jobs/job1/logs", <-uri)
+}
 
 func intPtr(i int) *int { return &i }
 
@@ -61,6 +104,40 @@ func TestSubmitSendsBearerToken(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("handler was never invoked")
 	}
+}
+
+func TestJobsEncodesOnlySuppliedFilters(t *testing.T) {
+	requestCh := make(chan *http.Request, 1)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCh <- r.Clone(r.Context())
+		_ = json.NewEncoder(w).Encode(server.JobsResponse{Jobs: []model.Job{{ID: "job1"}}})
+	}))
+	defer ts.Close()
+
+	c := client.New(ts.URL, "tok")
+	jobs, err := c.Jobs(context.Background(), client.JobsOptions{
+		Limit: 7, DeviceID: "gpu0", State: model.JobFailed,
+	})
+	require.NoError(t, err)
+	require.Equal(t, []model.Job{{ID: "job1"}}, jobs)
+
+	req := <-requestCh
+	require.Equal(t, "/v1/jobs", req.URL.Path)
+	require.Equal(t, "device=gpu0&limit=7&state=failed", req.URL.RawQuery)
+	require.False(t, req.URL.Query().Has("submitter"))
+}
+
+func TestJobsOmitsAllZeroValueFilters(t *testing.T) {
+	queryCh := make(chan string, 1)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		queryCh <- r.URL.RawQuery
+		_ = json.NewEncoder(w).Encode(server.JobsResponse{})
+	}))
+	defer ts.Close()
+
+	_, err := client.New(ts.URL, "tok").Jobs(context.Background(), client.JobsOptions{})
+	require.NoError(t, err)
+	require.Empty(t, <-queryCh)
 }
 
 func TestWaitTerminalGivesUpWithClearError(t *testing.T) {

@@ -98,6 +98,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /v1/jobs/{id}/tty/in", s.require("worker", s.handleTTYWorkerIn))
 
 	mux.Handle("POST /v1/jobs", s.require("client", s.handleSubmit))
+	mux.Handle("GET /v1/jobs", s.require("client", s.handleListJobs))
 	mux.Handle("GET /v1/jobs/{id}", s.require("client", s.handleGetJob))
 	mux.Handle("POST /v1/jobs/{id}/kill", s.require("client", s.handleKill))
 	mux.Handle("GET /v1/jobs/{id}/logs", s.require("client", s.handleStreamLogs))

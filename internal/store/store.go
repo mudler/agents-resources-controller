@@ -6,6 +6,7 @@ package store
 import (
 	"database/sql"
 	_ "embed"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -30,6 +31,15 @@ var ErrWorkerNotFound = errors.New("worker not found")
 type Store struct {
 	db    *sql.DB
 	clock clock.Clock
+}
+
+// JobFilter selects job history using exact matches. Limit is required and
+// must be between 1 and 200, inclusive.
+type JobFilter struct {
+	Limit     int
+	DeviceID  string
+	Submitter string
+	State     model.JobState
 }
 
 func Open(path string, c clock.Clock) (*Store, error) {
@@ -385,38 +395,105 @@ func (s *Store) Leases() ([]model.Lease, error) {
 // one this controller has never heard of, yields an empty slice rather than
 // an error: a freshly registered device legitimately has nothing to show.
 func (s *Store) RecentJobsForDevice(deviceID string, limit int) ([]model.Job, error) {
-	rows, err := s.db.Query(
-		`SELECT id FROM jobs WHERE device_id = ? ORDER BY submitted_at DESC, rowid DESC LIMIT ?`,
-		deviceID, limit)
+	return s.ListJobs(JobFilter{Limit: limit, DeviceID: deviceID})
+}
+
+// ListJobs returns matching jobs newest first. Jobs submitted in the same
+// second are ordered by descending ID so repeated reads are deterministic.
+func (s *Store) ListJobs(filter JobFilter) ([]model.Job, error) {
+	if filter.Limit < 1 || filter.Limit > 200 {
+		return nil, fmt.Errorf("job limit must be between 1 and 200: %d", filter.Limit)
+	}
+
+	query := `SELECT id, selector, command, cwd, env, submitter, idempotency_key, state,
+	                device_id, worker_id, exit_code, kill_reason, submitted_at, started_at, finished_at,
+	                priority, max_runtime, idle_timeout, queued_at, kind, reason, stdio
+	           FROM jobs WHERE 1 = 1`
+	args := make([]any, 0, 4)
+	if filter.DeviceID != "" {
+		query += ` AND device_id = ?`
+		args = append(args, filter.DeviceID)
+	}
+	if filter.Submitter != "" {
+		query += ` AND submitter = ?`
+		args = append(args, filter.Submitter)
+	}
+	if filter.State != "" {
+		query += ` AND state = ?`
+		args = append(args, string(filter.State))
+	}
+	query += ` ORDER BY submitted_at DESC, id DESC LIMIT ?`
+	args = append(args, filter.Limit)
+
+	rows, err := s.db.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}
-	var ids []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		ids = append(ids, id)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
+	defer rows.Close()
 
-	// Rows are fully drained above before Job() issues its own query: the
-	// pool is capped at one connection, so a write or read with the cursor
-	// still open would deadlock.
-	out := make([]model.Job, 0, len(ids))
-	for _, id := range ids {
-		j, err := s.Job(id)
+	jobs := make([]model.Job, 0)
+	for rows.Next() {
+		job, err := scanJob(rows)
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, *j)
+		jobs = append(jobs, job)
 	}
-	return out, nil
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return jobs, nil
+}
+
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanJob(row rowScanner) (model.Job, error) {
+	var (
+		job                                       model.Job
+		commandJSON, envJSON                      string
+		idempotencyKey                            sql.NullString
+		exitCode, startedAt, finishedAt, queuedAt sql.NullInt64
+		submittedAt                               int64
+		priority, maxRuntime, idleTimeout         int64
+	)
+	if err := row.Scan(
+		&job.ID, &job.Selector, &commandJSON, &job.Cwd, &envJSON, &job.Submitter,
+		&idempotencyKey, &job.State, &job.DeviceID, &job.WorkerID, &exitCode,
+		&job.KillReason, &submittedAt, &startedAt, &finishedAt, &priority,
+		&maxRuntime, &idleTimeout, &queuedAt, &job.Kind, &job.Reason, &job.Stdio,
+	); err != nil {
+		return model.Job{}, err
+	}
+	if err := json.Unmarshal([]byte(commandJSON), &job.Command); err != nil {
+		return model.Job{}, err
+	}
+	if err := json.Unmarshal([]byte(envJSON), &job.Env); err != nil {
+		return model.Job{}, err
+	}
+	job.IdempotencyKey = idempotencyKey.String
+	job.Priority = int(priority)
+	job.MaxRuntimeSeconds = int(maxRuntime)
+	job.IdleTimeoutSeconds = int(idleTimeout)
+	job.SubmittedAt = time.Unix(submittedAt, 0).UTC()
+	if exitCode.Valid {
+		value := int(exitCode.Int64)
+		job.ExitCode = &value
+	}
+	if startedAt.Valid {
+		value := time.Unix(startedAt.Int64, 0).UTC()
+		job.StartedAt = &value
+	}
+	if finishedAt.Valid {
+		value := time.Unix(finishedAt.Int64, 0).UTC()
+		job.FinishedAt = &value
+	}
+	if queuedAt.Valid && queuedAt.Int64 > 0 {
+		value := time.Unix(queuedAt.Int64, 0).UTC()
+		job.QueuedAt = &value
+	}
+	return job, nil
 }
 
 // AssignedJobsFor returns jobs handed to a worker that it has not started yet.
