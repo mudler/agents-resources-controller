@@ -30,6 +30,133 @@ func registerWorker(t *testing.T, ts *httptest.Server) string {
 	return reg.WorkerID
 }
 
+func enqueueJobHistory(t *testing.T, st *store.Store, deviceID, submitter string) model.Job {
+	t.Helper()
+	job, err := st.Enqueue(store.EnqueueRequest{
+		DeviceID:  deviceID,
+		Command:   []string{"./bench"},
+		Submitter: submitter,
+	})
+	require.NoError(t, err)
+	return *job
+}
+
+func TestListJobsReturnsEnvelopeEmptyArrayAndDefaultsToNewestTwenty(t *testing.T) {
+	ts, st, _, c := newServer(t)
+
+	empty := get(t, ts, "ctok", "/v1/jobs")
+	defer empty.Body.Close()
+	require.Equal(t, http.StatusOK, empty.StatusCode)
+	var emptyBody map[string]json.RawMessage
+	require.NoError(t, json.NewDecoder(empty.Body).Decode(&emptyBody))
+	require.JSONEq(t, `[]`, string(emptyBody["jobs"]), "an empty history must be [] rather than null")
+	registerWorker(t, ts)
+
+	jobs := make([]model.Job, 21)
+	for i := range jobs {
+		jobs[i] = enqueueJobHistory(t, st, "gpubox:gpu0", "agent-a")
+		c.Advance(time.Second)
+	}
+
+	resp := get(t, ts, "ctok", "/v1/jobs")
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	var body server.JobsResponse
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
+	require.Len(t, body.Jobs, 20)
+	require.Equal(t, jobs[20].ID, body.Jobs[0].ID)
+	require.Equal(t, jobs[1].ID, body.Jobs[19].ID)
+}
+
+func TestListJobsAppliesExactAndCombinedFilters(t *testing.T) {
+	ts, st, _, c := newServer(t)
+	registered := post(t, ts, "wtok", "/v1/workers/register", server.RegisterRequest{
+		Host: "gpubox", Devices: []server.DeviceSpec{{Name: "gpu0"}, {Name: "gpu1"}},
+	})
+	registered.Body.Close()
+	require.Equal(t, http.StatusOK, registered.StatusCode)
+	first := enqueueJobHistory(t, st, "gpubox:gpu0", "alice")
+	c.Advance(time.Second)
+	second := enqueueJobHistory(t, st, "gpubox:gpu1", "alice")
+	c.Advance(time.Second)
+	third := enqueueJobHistory(t, st, "gpubox:gpu1", "bob")
+
+	tests := []struct {
+		name  string
+		query string
+		want  []string
+	}{
+		{name: "device", query: "device=gpubox:gpu1", want: []string{third.ID, second.ID}},
+		{name: "submitter", query: "submitter=alice", want: []string{second.ID, first.ID}},
+		{name: "state", query: "state=queued", want: []string{third.ID, second.ID, first.ID}},
+		{name: "combined", query: "device=gpubox:gpu1&submitter=alice&state=queued", want: []string{second.ID}},
+		{name: "empty exact filters are absent", query: "device=&submitter=&state=", want: []string{third.ID, second.ID, first.ID}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resp := get(t, ts, "ctok", "/v1/jobs?limit=10&"+tt.query)
+			defer resp.Body.Close()
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+			var body server.JobsResponse
+			require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
+			ids := make([]string, 0, len(body.Jobs))
+			for _, job := range body.Jobs {
+				ids = append(ids, job.ID)
+			}
+			require.Equal(t, tt.want, ids)
+		})
+	}
+}
+
+func TestListJobsValidatesLimitAndState(t *testing.T) {
+	ts, _, _, _ := newServer(t)
+	tests := []struct {
+		name  string
+		query string
+		want  int
+	}{
+		{name: "lower boundary", query: "limit=1", want: http.StatusOK},
+		{name: "upper boundary", query: "limit=200", want: http.StatusOK},
+		{name: "empty limit", query: "limit=", want: http.StatusBadRequest},
+		{name: "malformed limit", query: "limit=nope", want: http.StatusBadRequest},
+		{name: "zero limit", query: "limit=0", want: http.StatusBadRequest},
+		{name: "negative limit", query: "limit=-1", want: http.StatusBadRequest},
+		{name: "limit too large", query: "limit=201", want: http.StatusBadRequest},
+		{name: "unknown state", query: "state=pending", want: http.StatusBadRequest},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resp := get(t, ts, "ctok", "/v1/jobs?"+tt.query)
+			defer resp.Body.Close()
+			require.Equal(t, tt.want, resp.StatusCode)
+		})
+	}
+}
+
+func TestListJobsRequiresClientAuthentication(t *testing.T) {
+	ts, _, _, _ := newServer(t)
+
+	unauthorized := get(t, ts, "unknown", "/v1/jobs")
+	defer unauthorized.Body.Close()
+	require.Equal(t, http.StatusUnauthorized, unauthorized.StatusCode)
+
+	forbidden := get(t, ts, "wtok", "/v1/jobs")
+	defer forbidden.Body.Close()
+	require.Equal(t, http.StatusForbidden, forbidden.StatusCode)
+}
+
+func TestListJobsStoreFailureReturnsStoreError(t *testing.T) {
+	ts, st, _, _ := newServer(t)
+	require.NoError(t, st.Close())
+
+	resp := get(t, ts, "ctok", "/v1/jobs")
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusInternalServerError, resp.StatusCode)
+	var body map[string]string
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
+	require.Equal(t, "store_error", body["error"])
+}
+
 func TestSubmitAllocatesDeviceAndReturnsJob(t *testing.T) {
 	ts, _, _, _ := newServer(t)
 	registerWorker(t, ts)

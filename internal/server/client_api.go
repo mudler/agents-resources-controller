@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/mudler/resource-controller/internal/model"
@@ -138,6 +139,10 @@ type StateResponse struct {
 	// same reason every other age is: a reader's clock must not be able to
 	// make a stuck queue look fresh.
 	QueuedWaitingSeconds map[string]int `json:"queued_waiting_seconds,omitempty"`
+}
+
+type JobsResponse struct {
+	Jobs []model.Job `json:"jobs"`
 }
 
 // describeRecentJobs bounds how much job history `rc describe` shows: five
@@ -663,6 +668,48 @@ func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, JobView{Job: *job, QueuePosition: pos})
+}
+
+func (s *Server) handleListJobs(w http.ResponseWriter, r *http.Request) {
+	query := r.URL.Query()
+	limit := 20
+	if query.Has("limit") {
+		raw := query.Get("limit")
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 1 || parsed > 200 {
+			writeErr(w, http.StatusBadRequest, "bad_request", "limit must be an integer between 1 and 200")
+			return
+		}
+		limit = parsed
+	}
+
+	state := model.JobState(query.Get("state"))
+	if state != "" && !validJobState(state) {
+		writeErr(w, http.StatusBadRequest, "bad_request", "unknown job state")
+		return
+	}
+
+	jobs, err := s.cfg.Store.ListJobs(store.JobFilter{
+		Limit:     limit,
+		DeviceID:  query.Get("device"),
+		Submitter: query.Get("submitter"),
+		State:     state,
+	})
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "store_error", "could not list jobs")
+		return
+	}
+	writeJSON(w, http.StatusOK, JobsResponse{Jobs: jobs})
+}
+
+func validJobState(state model.JobState) bool {
+	switch state {
+	case model.JobAssigned, model.JobRunning, model.JobSucceeded, model.JobFailed,
+		model.JobKilled, model.JobLost, model.JobQueued:
+		return true
+	default:
+		return false
+	}
 }
 
 type KillRequest struct {
