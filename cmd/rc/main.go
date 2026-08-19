@@ -20,6 +20,7 @@ func main() {
 		SilenceErrors: true,
 	}
 	root.AddCommand(cli.NewRunCmd(), cli.NewPsCmd(), cli.NewDevicesCmd(),
+		cli.NewJobsCmd(),
 		cli.NewServeCmd(), cli.NewWorkerCmd(), cli.NewKillCmd(), cli.NewAttachCmd(),
 		cli.NewDescribeCmd(), cli.NewHoldCmd(), cli.NewReleaseCmd(),
 		cli.NewRetireCmd(), cli.NewClearCmd(), cli.NewCpCmd())

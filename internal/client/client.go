@@ -78,6 +78,47 @@ type SubmitOptions struct {
 	Stdio string
 }
 
+type JobsOptions struct {
+	Limit     int
+	DeviceID  string
+	Submitter string
+	State     model.JobState
+}
+
+func (c *Client) Jobs(ctx context.Context, opts JobsOptions) ([]model.Job, error) {
+	query := url.Values{}
+	if opts.Limit != 0 {
+		query.Set("limit", fmt.Sprint(opts.Limit))
+	}
+	if opts.DeviceID != "" {
+		query.Set("device", opts.DeviceID)
+	}
+	if opts.Submitter != "" {
+		query.Set("submitter", opts.Submitter)
+	}
+	if opts.State != "" {
+		query.Set("state", string(opts.State))
+	}
+	path := "/v1/jobs"
+	if encoded := query.Encode(); encoded != "" {
+		path += "?" + encoded
+	}
+
+	resp, err := c.do(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, apiError(resp)
+	}
+	var result server.JobsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+	return result.Jobs, nil
+}
+
 func (c *Client) do(ctx context.Context, method, path string, body io.Reader) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, body)
 	if err != nil {

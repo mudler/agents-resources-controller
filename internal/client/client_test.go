@@ -63,6 +63,40 @@ func TestSubmitSendsBearerToken(t *testing.T) {
 	}
 }
 
+func TestJobsEncodesOnlySuppliedFilters(t *testing.T) {
+	requestCh := make(chan *http.Request, 1)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCh <- r.Clone(r.Context())
+		_ = json.NewEncoder(w).Encode(server.JobsResponse{Jobs: []model.Job{{ID: "job1"}}})
+	}))
+	defer ts.Close()
+
+	c := client.New(ts.URL, "tok")
+	jobs, err := c.Jobs(context.Background(), client.JobsOptions{
+		Limit: 7, DeviceID: "gpu0", State: model.JobFailed,
+	})
+	require.NoError(t, err)
+	require.Equal(t, []model.Job{{ID: "job1"}}, jobs)
+
+	req := <-requestCh
+	require.Equal(t, "/v1/jobs", req.URL.Path)
+	require.Equal(t, "device=gpu0&limit=7&state=failed", req.URL.RawQuery)
+	require.False(t, req.URL.Query().Has("submitter"))
+}
+
+func TestJobsOmitsAllZeroValueFilters(t *testing.T) {
+	queryCh := make(chan string, 1)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		queryCh <- r.URL.RawQuery
+		_ = json.NewEncoder(w).Encode(server.JobsResponse{})
+	}))
+	defer ts.Close()
+
+	_, err := client.New(ts.URL, "tok").Jobs(context.Background(), client.JobsOptions{})
+	require.NoError(t, err)
+	require.Empty(t, <-queryCh)
+}
+
 func TestWaitTerminalGivesUpWithClearError(t *testing.T) {
 	// The job never leaves "assigned" — e.g. no worker ever attached to
 	// the device — so WaitTerminal must give up rather than poll forever.
