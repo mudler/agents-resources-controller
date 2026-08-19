@@ -1054,6 +1054,24 @@ streaming
 done
 ```
 
+`rc jobs` searches job history across the fleet, including completed jobs.
+Use `--device`, `--submitter`, or `--state` to narrow the results. Use `-n`
+to set the result limit, and use `-o json` for machine-readable output:
+
+```sh
+rc jobs --submitter agent-x --state succeeded -n 50
+rc jobs --device gpubox:gpu0 -o json
+```
+
+`rc logs <job-id>` prints a snapshot of the output stored so far and exits.
+`rc logs -f <job-id>` first replays stored output. It then follows new output
+until the job finishes or you press Ctrl-C. `rc attach` remains compatible
+with running jobs and continues to stream from the beginning.
+
+The controller does not store output for `rc run --tty` or attached pipe
+jobs. Their bytes belong to the live terminal or pipe, so `rc logs` cannot
+recover them later.
+
 `rc devices` shows the fleet, including devices whose worker has gone quiet:
 
 ```
