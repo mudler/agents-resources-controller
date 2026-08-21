@@ -83,6 +83,43 @@ func TestKillFinalizesDisconnectedJobAndPublishesKilled(t *testing.T) {
 	require.Equal(t, model.JobKilled, reloaded.State)
 }
 
+// A heartbeat proves only the jobs it names. If a returning worker omits a
+// retained job, promoting that job's device to busy would strand the lease:
+// retention prevents expiry, while rc kill treats a busy device as reachable
+// and waits for a worker that has already said it does not own the process.
+func TestRetentionHeartbeatDoesNotRestoreUnknownDeviceForOmittedJob(t *testing.T) {
+	ts, st, c := newRetainingServer(t)
+	workerID := registerWorker(t, ts)
+
+	resp := post(t, ts, "ctok", "/v1/jobs", server.SubmitRequest{
+		DeviceID: "gpubox:gpu0", Command: []string{"./a"}, Submitter: "agent-a",
+	})
+	var job model.Job
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&job))
+	resp.Body.Close()
+
+	c.Advance(31 * time.Second)
+	_, err := st.Sweep(30*time.Second, 5*time.Minute, time.Time{}, store.SweepOptions{RetainDisconnectedJobs: true})
+	require.NoError(t, err)
+
+	heartbeat := post(t, ts, "wtok", "/v1/workers/"+workerID+"/heartbeat", server.HeartbeatRequest{})
+	heartbeat.Body.Close()
+	require.Equal(t, http.StatusOK, heartbeat.StatusCode)
+
+	devices, err := st.Devices()
+	require.NoError(t, err)
+	require.Equal(t, model.DeviceUnknown, devices[0].State,
+		"an omitted job is not proof that its retained process is alive")
+
+	kill := post(t, ts, "ctok", "/v1/jobs/"+job.ID+"/kill", map[string]string{"submitter": "agent-a"})
+	kill.Body.Close()
+	require.Equal(t, http.StatusOK, kill.StatusCode)
+	reloaded, err := st.Job(job.ID)
+	require.NoError(t, err)
+	require.Equal(t, model.JobKilled, reloaded.State,
+		"rc kill must finalize a retained job that the returning worker omitted")
+}
+
 func post(t *testing.T, ts *httptest.Server, token, path string, body any) *http.Response {
 	t.Helper()
 	var buf bytes.Buffer

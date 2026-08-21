@@ -464,7 +464,8 @@ const leaseRenewWindow = 15 * time.Minute
 // lease lapses, and Sweep reclaims it — marking the job lost and quarantining
 // the device, which is exactly the intended behaviour for a job nobody can
 // account for.
-func (s *Store) RecordHeartbeat(workerID string, at time.Time, runningJobIDs []string) error {
+func (s *Store) RecordHeartbeat(workerID string, at time.Time, runningJobIDs []string, options ...SweepOptions) error {
+	retainDisconnectedJobs := len(options) > 0 && options[0].RetainDisconnectedJobs
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
@@ -533,12 +534,39 @@ func (s *Store) RecordHeartbeat(workerID string, at time.Time, runningJobIDs []s
 		clearArgs...); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(
-		`UPDATE devices SET state = ?, last_heartbeat_at = ?
-		 WHERE worker_id = ? AND state = ?
-		   AND id IN (SELECT device_id FROM leases WHERE released_at IS NULL)`,
-		string(model.DeviceBusy), at.Unix(), workerID, string(model.DeviceUnknown)); err != nil {
-		return err
+	if retainDisconnectedJobs {
+		// A retained lease proves only that the controller chose not to forget
+		// an unreachable job. The returning worker must name that job before
+		// its unknown device can become busy again. Otherwise rc kill would
+		// wait on a worker that has already said it does not own the process.
+		if len(runningJobIDs) > 0 {
+			args := []any{
+				string(model.DeviceBusy), at.Unix(), workerID, string(model.DeviceUnknown),
+				workerID, string(model.JobAssigned), string(model.JobRunning),
+			}
+			placeholders := make([]string, len(runningJobIDs))
+			for i, id := range runningJobIDs {
+				placeholders[i] = "?"
+				args = append(args, id)
+			}
+			if _, err := tx.Exec(fmt.Sprintf(
+				`UPDATE devices SET state = ?, last_heartbeat_at = ?
+				 WHERE worker_id = ? AND state = ?
+				   AND id IN (SELECT j.device_id FROM jobs j
+				              JOIN leases l ON l.job_id = j.id AND l.released_at IS NULL
+				              WHERE j.worker_id = ? AND j.state IN (?, ?) AND j.id IN (%s))`,
+				strings.Join(placeholders, ", ")), args...); err != nil {
+				return err
+			}
+		}
+	} else {
+		if _, err := tx.Exec(
+			`UPDATE devices SET state = ?, last_heartbeat_at = ?
+			 WHERE worker_id = ? AND state = ?
+			   AND id IN (SELECT device_id FROM leases WHERE released_at IS NULL)`,
+			string(model.DeviceBusy), at.Unix(), workerID, string(model.DeviceUnknown)); err != nil {
+			return err
+		}
 	}
 	if _, err := tx.Exec(
 		`UPDATE devices SET state = ?, last_heartbeat_at = ?

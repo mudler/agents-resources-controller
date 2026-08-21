@@ -498,7 +498,8 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.cfg.Store.RecordHeartbeat(
-		r.PathValue("id"), s.cfg.Clock.Now(), req.RunningJobIDs); err != nil {
+		r.PathValue("id"), s.cfg.Clock.Now(), req.RunningJobIDs,
+		store.SweepOptions{RetainDisconnectedJobs: s.cfg.RetainDisconnectedJobs}); err != nil {
 		writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
 		return
 	}
