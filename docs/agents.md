@@ -262,9 +262,24 @@ the most antisocial thing you can do here.
 ```sh
 rc ps                          # what is running and queued, and whose it is
 rc attach <job-id>             # re-attach to a running job's output
+rc jobs                        # find current and completed jobs across the fleet
+rc jobs --state failed         # filter by state, device, or submitter
+rc logs <job-id>               # print stored output so far, then exit
+rc logs -f <job-id>            # replay stored output, then follow new output
 rc kill <job-id>               # stop a job you submitted
 rc release <hold-id>           # end a hold early
 ```
+
+`rc jobs` provides fleet-wide discovery. Use `--device`, `--submitter`, and
+`--state` to narrow the history. `rc logs` returns a finite snapshot by
+default, which makes it suitable for scripts. Add `--follow` to replay the
+snapshot and wait for new output. Press Ctrl-C to stop following without
+affecting the job.
+
+`rc attach` remains available for compatible running jobs and re-streams
+their output from the beginning. The controller does not store output from
+TTY jobs or attached pipe jobs. You cannot retrieve those live bytes later
+with `rc logs` or `rc attach`.
 
 `rc kill` only lets you kill a job whose submitter matches yours. Be aware of
 what that check is and is not: with a shared client token, anyone can claim

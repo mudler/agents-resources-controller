@@ -91,6 +91,15 @@ func TestEndToEndClaimRunRelease(t *testing.T) {
 	require.NotNil(t, final.ExitCode, "terminal job must carry an exit code")
 	require.Equal(t, 0, *final.ExitCode)
 
+	// Completed work remains discoverable across the fleet, and its stored
+	// output is available as a finite snapshot after the live stream closes.
+	history, err := cl.Jobs(ctx, client.JobsOptions{Submitter: "agent-a"})
+	require.NoError(t, err)
+	require.Contains(t, history, *final)
+	var snapshot bytes.Buffer
+	require.NoError(t, cl.Logs(ctx, job.ID, &snapshot, false))
+	require.Contains(t, snapshot.String(), "hello-from-device")
+
 	// 5. The device returns to the pool afterwards...
 	require.Eventually(t, func() bool {
 		state, err := cl.State(ctx)
