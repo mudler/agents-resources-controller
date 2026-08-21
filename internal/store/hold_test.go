@@ -87,9 +87,9 @@ func TestKillingAHoldFreesTheDevice(t *testing.T) {
 	require.Len(t, devices, 1)
 	require.Equal(t, model.DeviceBusy, devices[0].State, "the hold must occupy the device once granted")
 
-	flagged, err := s.RequestKill(hold.ID)
+	outcome, err := s.RequestKill(hold.ID, "released by rc release", false)
 	require.NoError(t, err)
-	require.True(t, flagged, "RequestKill must flag a hold exactly like an ordinary running job")
+	require.Equal(t, store.KillRequested, outcome, "RequestKill must flag a hold exactly like an ordinary running job")
 
 	require.NoError(t, s.Release(hold.ID, model.JobKilled, nil, "released by rc release"))
 

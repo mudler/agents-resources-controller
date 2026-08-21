@@ -61,6 +61,50 @@ func TestExpiredJobLeaseRemainsLiveInRetentionMode(t *testing.T) {
 	require.Len(t, leases, 1)
 }
 
+func TestHeartbeatKeepsImmediatelyKilledDisconnectedJobUnavailableWhileProcessExists(t *testing.T) {
+	s, c := newStore(t)
+	job, err := s.Allocate(req("agent-a"))
+	require.NoError(t, err)
+	require.NoError(t, s.MarkRunning(job.ID, c.Now()))
+
+	c.Advance(time.Minute)
+	_, err = s.Sweep(30*time.Second, 5*time.Minute, time.Time{}, store.SweepOptions{RetainDisconnectedJobs: true})
+	require.NoError(t, err)
+	devices, err := s.Devices()
+	require.NoError(t, err)
+	require.Equal(t, model.DeviceUnknown, devices[0].State)
+
+	outcome, err := s.RequestKill(job.ID, "operator cancelled", true)
+	require.NoError(t, err)
+	require.Equal(t, store.KillFinalized, outcome)
+	reloaded, err := s.Job(job.ID)
+	require.NoError(t, err)
+	require.Equal(t, model.JobKilled, reloaded.State)
+	require.Equal(t, "operator cancelled", reloaded.KillReason)
+	require.NotNil(t, reloaded.FinishedAt)
+	leases, err := s.Leases()
+	require.NoError(t, err)
+	require.Empty(t, leases)
+
+	// The worker reconnects before its process has disappeared. Even though
+	// immediate finalization released the lease, naming the killed job proves
+	// the process may still occupy the device, so the heartbeat must not make
+	// that device schedulable and the kill must remain deliverable.
+	require.NoError(t, s.RecordHeartbeat("w1", c.Now(), []string{job.ID}))
+	devices, err = s.Devices()
+	require.NoError(t, err)
+	require.NotEqual(t, model.DeviceReady, devices[0].State)
+	kills, err := s.TakeKillRequests("w1")
+	require.NoError(t, err)
+	require.Equal(t, []string{job.ID}, kills)
+
+	c.Advance(31 * time.Second)
+	require.NoError(t, s.RecordHeartbeat("w1", c.Now(), nil))
+	kills, err = s.TakeKillRequests("w1")
+	require.NoError(t, err)
+	require.Empty(t, kills, "redelivery stops once the worker no longer supervises the process")
+}
+
 func TestExpiredHoldLeaseStillExpiresInRetentionMode(t *testing.T) {
 	s, c := newStore(t)
 	hold, err := s.Enqueue(holdReq("mudler", "maintenance", time.Minute))

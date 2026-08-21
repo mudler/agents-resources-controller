@@ -504,28 +504,80 @@ func (s *Store) CancelQueued(jobID, reason string) (bool, error) {
 	return true, err
 }
 
-// RequestKill flags a running job for termination. The worker sees the flag on
-// its next poll and terminates the process group; the terminal report then
-// arrives through the normal path, so there is exactly one place where a job
-// ends. It reports whether it actually flagged anything: a job that has
-// already left assigned/running (finished, or raced onto a terminal state
-// between the caller's lookup and this call) flags nothing, and the caller
-// must not report success for a kill that did not land on anything live.
-func (s *Store) RequestKill(jobID string) (bool, error) {
+type KillOutcome int
+
+const (
+	KillNotCancellable KillOutcome = iota
+	KillRequested
+	KillFinalized
+)
+
+// RequestKill flags an active job for termination. Ordinarily the worker sees
+// the flag on its next poll and reports the terminal result asynchronously.
+// When requested, a job whose device is disconnected is finalized here while
+// retaining the flag so the original worker can still kill a surviving
+// process if it reconnects.
+func (s *Store) RequestKill(jobID, reason string, finalizeDisconnected bool) (KillOutcome, error) {
+	now := s.clock.Now()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return KillNotCancellable, err
+	}
+	defer tx.Rollback()
+
+	var state model.JobState
+	var deviceState model.DeviceState
+	var quarantineReason string
+	if err := tx.QueryRow(
+		`SELECT j.state, COALESCE(d.state, ''), COALESCE(d.quarantine_reason, '')
+		 FROM jobs j LEFT JOIN devices d ON d.id = j.device_id WHERE j.id = ?`, jobID,
+	).Scan(&state, &deviceState, &quarantineReason); err != nil {
+		return KillNotCancellable, err
+	}
+	if state != model.JobAssigned && state != model.JobRunning {
+		return KillNotCancellable, tx.Commit()
+	}
+
+	finalize := finalizeDisconnected && (deviceState == model.DeviceUnknown ||
+		(deviceState == model.DeviceUnhealthy && quarantineReason == quarantineWorkerLost))
+	if finalize {
+		if _, err := tx.Exec(
+			`UPDATE jobs SET state = ?, kill_requested = 1, kill_delivered_at = 0,
+			 kill_reason = ?, finished_at = ? WHERE id = ?`,
+			string(model.JobKilled), reason, now.Unix(), jobID); err != nil {
+			return KillNotCancellable, err
+		}
+		if _, err := tx.Exec(
+			`UPDATE leases SET released_at = ? WHERE job_id = ? AND released_at IS NULL`,
+			now.Unix(), jobID); err != nil {
+			return KillNotCancellable, err
+		}
+		if err := tx.Commit(); err != nil {
+			return KillNotCancellable, err
+		}
+		return KillFinalized, nil
+	}
+
 	// kill_delivered_at is reset so an operator re-issuing `rc kill` gets the
 	// flag re-offered on the next poll rather than waiting out
 	// killRedeliverInterval from an earlier delivery.
-	res, err := s.db.Exec(
+	res, err := tx.Exec(
 		`UPDATE jobs SET kill_requested = 1, kill_delivered_at = 0 WHERE id = ? AND state IN (?, ?)`,
 		jobID, string(model.JobAssigned), string(model.JobRunning))
 	if err != nil {
-		return false, err
+		return KillNotCancellable, err
 	}
 	n, err := res.RowsAffected()
 	if err != nil {
-		return false, err
+		return KillNotCancellable, err
 	}
-	return n > 0, nil
+	if err := tx.Commit(); err != nil {
+		return KillNotCancellable, err
+	}
+	if n == 0 {
+		return KillNotCancellable, nil
+	}
+	return KillRequested, nil
 }
 
 // killRedeliverInterval is how long a kill flag stays quiet after it has been
@@ -560,9 +612,9 @@ func (s *Store) TakeKillRequests(workerID string) ([]string, error) {
 
 	rows, err := tx.Query(
 		`SELECT id FROM jobs
-		 WHERE worker_id = ? AND kill_requested = 1 AND state IN (?, ?)
+		 WHERE worker_id = ? AND kill_requested = 1 AND state IN (?, ?, ?)
 		   AND kill_delivered_at <= ?`,
-		workerID, string(model.JobAssigned), string(model.JobRunning),
+		workerID, string(model.JobAssigned), string(model.JobRunning), string(model.JobKilled),
 		now.Add(-killRedeliverInterval).Unix())
 	if err != nil {
 		return nil, err

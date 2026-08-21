@@ -514,6 +514,25 @@ func (s *Store) RecordHeartbeat(workerID string, at time.Time, runningJobIDs []s
 			return err
 		}
 	}
+	// An immediately finalized disconnected job keeps its kill flag while the
+	// original worker still reports supervising it. Once omitted, the process
+	// is gone and redelivery can stop.
+	clearArgs := []any{workerID, string(model.JobKilled)}
+	clearPredicate := ""
+	if len(runningJobIDs) > 0 {
+		placeholders := make([]string, len(runningJobIDs))
+		for i, id := range runningJobIDs {
+			placeholders[i] = "?"
+			clearArgs = append(clearArgs, id)
+		}
+		clearPredicate = fmt.Sprintf(" AND id NOT IN (%s)", strings.Join(placeholders, ", "))
+	}
+	if _, err := tx.Exec(
+		`UPDATE jobs SET kill_requested = 0
+		 WHERE worker_id = ? AND state = ? AND kill_requested = 1`+clearPredicate,
+		clearArgs...); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(
 		`UPDATE devices SET state = ?, last_heartbeat_at = ?
 		 WHERE worker_id = ? AND state = ?
@@ -524,8 +543,11 @@ func (s *Store) RecordHeartbeat(workerID string, at time.Time, runningJobIDs []s
 	if _, err := tx.Exec(
 		`UPDATE devices SET state = ?, last_heartbeat_at = ?
 		 WHERE worker_id = ? AND state = ?
-		   AND id NOT IN (SELECT device_id FROM leases WHERE released_at IS NULL)`,
-		string(model.DeviceReady), at.Unix(), workerID, string(model.DeviceUnknown)); err != nil {
+		   AND id NOT IN (SELECT device_id FROM leases WHERE released_at IS NULL)
+		   AND id NOT IN (SELECT device_id FROM jobs
+		                  WHERE worker_id = ? AND state = ? AND kill_requested = 1)`,
+		string(model.DeviceReady), at.Unix(), workerID, string(model.DeviceUnknown),
+		workerID, string(model.JobKilled)); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(

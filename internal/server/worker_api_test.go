@@ -217,9 +217,9 @@ func TestAssignmentsEnvelopeCarriesKillRequests(t *testing.T) {
 	require.NoError(t, err)
 	firstResp.Body.Close()
 
-	flagged, err := st.RequestKill(job.ID)
+	outcome, err := st.RequestKill(job.ID, "test kill", false)
 	require.NoError(t, err)
-	require.True(t, flagged)
+	require.Equal(t, store.KillRequested, outcome)
 
 	req2, err := http.NewRequest(http.MethodGet,
 		ts.URL+"/v1/workers/"+workerID+"/assignments?wait=2s", nil)
@@ -274,9 +274,9 @@ func TestDeliveredKillDoesNotHotLoopTheLongPoll(t *testing.T) {
 
 	poll(t, ts, workerID, "50ms").Body.Close() // drain the assignment
 
-	flagged, err := st.RequestKill(job.ID)
+	outcome, err := st.RequestKill(job.ID, "test kill", false)
 	require.NoError(t, err)
-	require.True(t, flagged)
+	require.Equal(t, store.KillRequested, outcome)
 
 	first := poll(t, ts, workerID, "2s")
 	defer first.Body.Close()
@@ -312,7 +312,7 @@ func TestKillIsRedeliveredAfterTheQuietInterval(t *testing.T) {
 
 	poll(t, ts, workerID, "50ms").Body.Close()
 
-	_, err := st.RequestKill(job.ID)
+	_, err := st.RequestKill(job.ID, "test kill", false)
 	require.NoError(t, err)
 	poll(t, ts, workerID, "2s").Body.Close() // first delivery
 

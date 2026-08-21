@@ -716,12 +716,12 @@ func (s *Server) handleKill(w http.ResponseWriter, r *http.Request) {
 		}
 		s.publishJob(jobID, model.JobKilled)
 	case model.JobAssigned, model.JobRunning:
-		flagged, err := s.cfg.Store.RequestKill(jobID)
+		outcome, err := s.cfg.Store.RequestKill(jobID, reason, false)
 		if err != nil {
 			writeErr(w, http.StatusInternalServerError, "store_error", "could not request kill")
 			return
 		}
-		if !flagged {
+		if outcome == store.KillNotCancellable {
 			writeErr(w, http.StatusConflict, "not_cancellable", "job already finished")
 			return
 		}

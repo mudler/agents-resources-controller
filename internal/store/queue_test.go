@@ -83,6 +83,20 @@ func TestReleasingADeviceLetsTheNextQueuedJobRun(t *testing.T) {
 	require.Equal(t, second.ID, assigned[0].ID)
 }
 
+func TestRequestKillReturnsNotCancellableForTerminalSelectorJob(t *testing.T) {
+	s, _ := newStore(t)
+	labelled(t, s, "gpubox:gpu0", map[string]string{"vendor": "nvidia"})
+	job, err := s.Enqueue(selectorEnq("agent-a", "vendor=nvidia"))
+	require.NoError(t, err)
+	cancelled, err := s.CancelQueued(job.ID, "cancelled before assignment")
+	require.NoError(t, err)
+	require.True(t, cancelled)
+
+	outcome, err := s.RequestKill(job.ID, "cancel again", true)
+	require.NoError(t, err)
+	require.Equal(t, store.KillNotCancellable, outcome)
+}
+
 // The invariant, now with a queue in front of it.
 func TestSchedulingNeverProducesTwoLiveLeases(t *testing.T) {
 	s, _ := newStore(t)
