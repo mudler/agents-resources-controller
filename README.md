@@ -156,6 +156,17 @@ export RC_TOKENS='wtok:worker,ctok:client,atok:admin'
 rc serve --addr :8080 --data /var/lib/rc
 ```
 
+By default, the controller marks active jobs `lost` after their worker stays
+offline for five minutes. Add `--retain-disconnected-jobs` to keep those jobs
+and leases active until the worker returns or an operator runs `rc kill`:
+
+```bash
+rc serve --addr :8080 --data /var/lib/rc --retain-disconnected-jobs
+```
+
+This setting applies to every worker on the controller. It is disabled by
+default, so existing deployments keep their current behavior.
+
 `RC_TOKENS` is a comma-separated list of `token:role` pairs, roles are
 `worker`, `client`, or `admin`. It is validated at startup: a malformed
 entry, an unknown role, an empty token, or the same token listed twice (even
@@ -988,6 +999,12 @@ the one that ran `rc run`) and it actually terminates a *running* job, not
 just a queued one — the controller flags it and the worker SIGTERMs the
 process group, the same path an ordinary shutdown uses.
 
+With `rc serve --retain-disconnected-jobs`, `rc kill` also removes a retained
+job whose worker is unreachable. The controller records the job as `killed`
+and releases its lease immediately. It keeps the uncertain device out of the
+pool. If the old worker returns with the process, the controller still sends
+the kill request. Job history remains available in all cases.
+
 **`rc kill` checks ownership: only the job's own submitter, or an admin
 token, may kill it.** The controller checks the `submitter` on the
 kill request against the job's recorded submitter (`defaultSubmitter()`
@@ -1453,10 +1470,22 @@ from — still requires the header and rejects a query-string token.
 - A worker that stops reporting has its devices marked `unknown` after 30s
   without a heartbeat, then `unhealthy` after 5 minutes. Neither
   transition ever puts the device back in the pool — silence is never
-  treated as proof a device is free. A worker that starts heartbeating
-  again restores its `unknown` devices on its own (to `busy` if their lease
-  is still live, to `ready` otherwise); a device that reached `unhealthy`
-  stays out until an admin token clears it explicitly:
+  treated as proof a device is free. By default, the controller also marks
+  active jobs `lost` and releases their leases after five minutes.
+- `rc serve --retain-disconnected-jobs` changes only that job and lease
+  cleanup. The controller keeps `assigned` and `running` jobs active and
+  does not expire their job leases because of worker silence. Holds keep
+  their configured TTL. The device still becomes `unknown`, then
+  `unhealthy`, and remains unavailable to the scheduler.
+- A returning worker that reports a retained job changes a device
+  quarantined for `worker_lost` back to `busy`. It cannot clear a quarantine
+  caused by a hardware fault. The job then completes through its normal
+  terminal report. A new worker process still reconciles the old job as
+  `lost`; a reboot cannot resume a terminated process.
+- Without retention mode, a worker that starts heartbeating again restores
+  its `unknown` devices on its own (to `busy` if their lease is still live,
+  to `ready` otherwise). A device that reached `unhealthy` stays out until
+  an admin token clears it explicitly:
   `POST /v1/devices/{id}/clear`. That call only succeeds when the device is
   currently `unhealthy` **and** has no live lease; called against a device
   in any other state (e.g. `ready`) it refuses with 409 rather than
