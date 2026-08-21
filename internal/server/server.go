@@ -23,10 +23,11 @@ type contextKey int
 const roleContextKey contextKey = iota
 
 type Config struct {
-	Store  *store.Store
-	Logs   *logstore.Store
-	Clock  clock.Clock
-	Tokens map[string]string // token -> role: worker | client | admin
+	Store                  *store.Store
+	Logs                   *logstore.Store
+	Clock                  clock.Clock
+	Tokens                 map[string]string // token -> role: worker | client | admin
+	RetainDisconnectedJobs bool
 	// Notifier delivers operational events (a tripped watchdog, a failed
 	// verify probe) to whatever sink the operator configured. A nil
 	// Notifier is the supported and default state — no webhook configured —

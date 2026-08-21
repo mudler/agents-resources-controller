@@ -6,15 +6,81 @@ import (
 	"encoding/json"
 	"net"
 	"net/http"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/mudler/resource-controller/internal/cli"
 	"github.com/mudler/resource-controller/internal/client"
+	"github.com/mudler/resource-controller/internal/clock"
 	"github.com/mudler/resource-controller/internal/model"
 	"github.com/mudler/resource-controller/internal/server"
+	"github.com/mudler/resource-controller/internal/store"
 	"github.com/stretchr/testify/require"
 )
+
+func TestServeRetainDisconnectedJobsFlagDefaultsDisabled(t *testing.T) {
+	flag := cli.NewServeCmd().Flags().Lookup("retain-disconnected-jobs")
+	require.NotNil(t, flag)
+	require.Equal(t, "false", flag.DefValue)
+}
+
+func TestServeLoopRetainsDisconnectedJobWhenEnabled(t *testing.T) {
+	dataDir := t.TempDir()
+	old := clock.NewFake(time.Now().Add(-time.Hour))
+	st, err := store.Open(filepath.Join(dataDir, "rc.db"), old)
+	require.NoError(t, err)
+	require.NoError(t, st.UpsertWorker(
+		model.Worker{ID: "w1", Host: "stale", LastHeartbeatAt: old.Now()},
+		[]model.Device{{ID: "stale:gpu0", Host: "stale", Name: "gpu0", WorkerID: "w1", State: model.DeviceReady}},
+	))
+	job, err := st.Allocate(store.AllocateRequest{
+		DeviceID: "stale:gpu0", Command: []string{"true"}, Submitter: "agent", LeaseTTL: 24 * time.Hour,
+	})
+	require.NoError(t, err)
+	require.NoError(t, st.Close())
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	addr := ln.Addr().String()
+	require.NoError(t, ln.Close())
+	t.Setenv("RC_TOKENS", "ctok:client")
+	cmd := cli.NewServeCmd()
+	ctx, cancel := context.WithCancel(context.Background())
+	cmd.SetContext(ctx)
+	cmd.SetArgs([]string{"--addr", addr, "--data", dataDir, "--retain-disconnected-jobs"})
+	cmd.SilenceUsage = true
+	cmd.SilenceErrors = true
+	done := make(chan error, 1)
+	go func() { done <- cmd.Execute() }()
+	t.Cleanup(func() { cancel(); <-done })
+
+	baseURL := "http://" + addr
+	cl := client.New(baseURL, "ctok")
+	require.Eventually(t, func() bool {
+		_, err := cl.State(context.Background())
+		return err == nil
+	}, 5*time.Second, 50*time.Millisecond)
+	require.Eventually(t, func() bool {
+		check, err := store.Open(filepath.Join(dataDir, "rc.db"), clock.Real())
+		if err != nil {
+			return false
+		}
+		defer check.Close()
+		devices, err := check.Devices()
+		return err == nil && len(devices) == 1 && devices[0].State == model.DeviceUnhealthy
+	}, 15*time.Second, 100*time.Millisecond, "production reaper did not sweep stale worker")
+
+	check, err := store.Open(filepath.Join(dataDir, "rc.db"), clock.Real())
+	require.NoError(t, err)
+	defer check.Close()
+	retained, err := check.Job(job.ID)
+	require.NoError(t, err)
+	require.Equal(t, model.JobAssigned, retained.State)
+	leases, err := check.Leases()
+	require.NoError(t, err)
+	require.Len(t, leases, 1)
+}
 
 // TestServeExitsPromptlyWhenListenFails guards against rc serve hanging
 // silently on a bind failure. Before the fix, the reaper goroutine only ever

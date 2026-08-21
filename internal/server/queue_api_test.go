@@ -1,6 +1,7 @@
 package server_test
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -282,6 +283,37 @@ func TestRequestKillFlagsARunningJob(t *testing.T) {
 	flagged, err := st.TakeKillRequests(job.WorkerID)
 	require.NoError(t, err)
 	require.Contains(t, flagged, job.ID)
+}
+
+func TestKillPublishesExistingStateWhenWorkerCanAct(t *testing.T) {
+	ts, _, _, _ := newServer(t)
+	registerWorker(t, ts)
+
+	a := post(t, ts, "ctok", "/v1/jobs", server.SubmitRequest{
+		DeviceID: "gpubox:gpu0", Command: []string{"./a"}, Submitter: "agent-a",
+	})
+	var job model.Job
+	require.NoError(t, json.NewDecoder(a.Body).Decode(&job))
+	a.Body.Close()
+
+	events := get(t, ts, "ctok", "/v1/events")
+	defer events.Body.Close()
+	require.Equal(t, http.StatusOK, events.StatusCode)
+
+	kill := post(t, ts, "ctok", "/v1/jobs/"+job.ID+"/kill", map[string]string{"submitter": "agent-a"})
+	kill.Body.Close()
+	require.Equal(t, http.StatusOK, kill.StatusCode)
+
+	requireJobEvent(t, events, job.ID, model.JobAssigned)
+}
+
+func requireJobEvent(t *testing.T, resp *http.Response, jobID string, state model.JobState) {
+	t.Helper()
+	line, err := bufio.NewReader(resp.Body).ReadString('\n')
+	require.NoError(t, err)
+	require.Contains(t, line, `"kind":"jobs"`)
+	require.Contains(t, line, `"job_id":"`+jobID+`"`)
+	require.Contains(t, line, `"state":"`+string(state)+`"`)
 }
 
 // TestSubmitRejectsUnknownDevice covers the minor finding that an unknown

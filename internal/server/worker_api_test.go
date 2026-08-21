@@ -38,6 +38,51 @@ func newServer(t *testing.T) (*httptest.Server, *store.Store, *logstore.Store, *
 	return ts, st, logs, c
 }
 
+func newRetainingServer(t *testing.T) (*httptest.Server, *store.Store, *clock.Fake) {
+	t.Helper()
+	dir := t.TempDir()
+	c := clock.NewFake(time.Date(2026, 8, 13, 12, 0, 0, 0, time.UTC))
+	st, err := store.Open(filepath.Join(dir, "rc.db"), c)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+	logs, err := logstore.New(filepath.Join(dir, "logs"))
+	require.NoError(t, err)
+	srv := server.New(server.Config{
+		Store: st, Logs: logs, Clock: c,
+		Tokens:                 map[string]string{"wtok": "worker", "ctok": "client"},
+		RetainDisconnectedJobs: true,
+	})
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+	return ts, st, c
+}
+
+func TestKillFinalizesDisconnectedJobAndPublishesKilled(t *testing.T) {
+	ts, st, c := newRetainingServer(t)
+	registerWorker(t, ts)
+	a := post(t, ts, "ctok", "/v1/jobs", server.SubmitRequest{
+		DeviceID: "gpubox:gpu0", Command: []string{"./a"}, Submitter: "agent-a",
+	})
+	var job model.Job
+	require.NoError(t, json.NewDecoder(a.Body).Decode(&job))
+	a.Body.Close()
+
+	c.Advance(31 * time.Second)
+	_, err := st.Sweep(30*time.Second, 5*time.Minute, time.Time{}, store.SweepOptions{RetainDisconnectedJobs: true})
+	require.NoError(t, err)
+
+	events := get(t, ts, "ctok", "/v1/events")
+	defer events.Body.Close()
+	kill := post(t, ts, "ctok", "/v1/jobs/"+job.ID+"/kill", map[string]string{"submitter": "agent-a"})
+	kill.Body.Close()
+	require.Equal(t, http.StatusOK, kill.StatusCode)
+	requireJobEvent(t, events, job.ID, model.JobKilled)
+
+	reloaded, err := st.Job(job.ID)
+	require.NoError(t, err)
+	require.Equal(t, model.JobKilled, reloaded.State)
+}
+
 func post(t *testing.T, ts *httptest.Server, token, path string, body any) *http.Response {
 	t.Helper()
 	var buf bytes.Buffer

@@ -93,9 +93,10 @@ var startupGrace = HeartbeatGrace
 
 func NewServeCmd() *cobra.Command {
 	var (
-		addr       string
-		dataDir    string
-		webhookURL string
+		addr                   string
+		dataDir                string
+		webhookURL             string
+		retainDisconnectedJobs bool
 	)
 
 	cmd := &cobra.Command{
@@ -135,6 +136,7 @@ func NewServeCmd() *cobra.Command {
 
 			srv := server.New(server.Config{
 				Store: st, Logs: logs, Clock: c, Tokens: tokens, Notifier: notifier,
+				RetainDisconnectedJobs: retainDisconnectedJobs,
 			})
 
 			// The reaper: silent workers lose their devices to unknown, then
@@ -168,7 +170,7 @@ func NewServeCmd() *cobra.Command {
 					case <-reaperCtx.Done():
 						return
 					case <-t.C:
-						res, err := sweepAndNotify(st, notifier, HeartbeatGrace, sweepUnhealthyAfter, holdOffUntil)
+						res, err := sweepAndNotify(st, notifier, HeartbeatGrace, sweepUnhealthyAfter, holdOffUntil, retainDisconnectedJobs)
 						if err != nil {
 							slog.Error("sweep", "err", err)
 							continue
@@ -296,6 +298,8 @@ func NewServeCmd() *cobra.Command {
 
 	cmd.Flags().StringVar(&addr, "addr", ":8080", "listen address")
 	cmd.Flags().StringVar(&dataDir, "data", "/var/lib/rc", "state directory")
+	cmd.Flags().BoolVar(&retainDisconnectedJobs, "retain-disconnected-jobs", false,
+		"retain active jobs and leases while their workers are disconnected")
 	// The six kinds are listed in full, and in the same order the README's
 	// table uses: an operator deciding whether to wire this up should not
 	// have to discover from the README that the two most specific kinds —
@@ -421,8 +425,9 @@ const (
 // fail the sweep — the reaper's job is to reclaim hardware, and a
 // notification it could not fully label is still worth sending — so the
 // events degrade to device_unhealthy instead.
-func sweepAndNotify(st *store.Store, n *notify.Notifier, grace, unhealthyAfter time.Duration, holdOffUntil time.Time) (store.SweepResult, error) {
-	res, err := st.Sweep(grace, unhealthyAfter, holdOffUntil)
+func sweepAndNotify(st *store.Store, n *notify.Notifier, grace, unhealthyAfter time.Duration, holdOffUntil time.Time, retainDisconnectedJobs ...bool) (store.SweepResult, error) {
+	retain := len(retainDisconnectedJobs) > 0 && retainDisconnectedJobs[0]
+	res, err := st.Sweep(grace, unhealthyAfter, holdOffUntil, store.SweepOptions{RetainDisconnectedJobs: retain})
 	if err != nil {
 		return res, err
 	}

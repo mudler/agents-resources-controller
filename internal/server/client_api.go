@@ -716,7 +716,7 @@ func (s *Server) handleKill(w http.ResponseWriter, r *http.Request) {
 		}
 		s.publishJob(jobID, model.JobKilled)
 	case model.JobAssigned, model.JobRunning:
-		outcome, err := s.cfg.Store.RequestKill(jobID, reason, false)
+		outcome, err := s.cfg.Store.RequestKill(jobID, reason, s.cfg.RetainDisconnectedJobs)
 		if err != nil {
 			writeErr(w, http.StatusInternalServerError, "store_error", "could not request kill")
 			return
@@ -725,8 +725,12 @@ func (s *Server) handleKill(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusConflict, "not_cancellable", "job already finished")
 			return
 		}
-		s.notify.poke(job.WorkerID)
-		s.publishJob(jobID, job.State)
+		if outcome == store.KillFinalized {
+			s.publishJob(jobID, model.JobKilled)
+		} else {
+			s.notify.poke(job.WorkerID)
+			s.publishJob(jobID, job.State)
+		}
 	default:
 		writeErr(w, http.StatusConflict, "not_cancellable", "job already finished")
 		return
