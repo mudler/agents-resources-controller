@@ -43,6 +43,40 @@ func TestExpiredLeaseIsReleasedAndDeviceQuarantined(t *testing.T) {
 		"an expired lease proves nothing about whether the device is occupied")
 }
 
+func TestExpiredJobLeaseRemainsLiveInRetentionMode(t *testing.T) {
+	s, c := newStore(t)
+	job, err := s.Allocate(req("agent-a"))
+	require.NoError(t, err)
+
+	c.Advance(20 * time.Minute)
+	res, err := s.Sweep(time.Hour, time.Hour, time.Time{}, store.SweepOptions{RetainDisconnectedJobs: true})
+	require.NoError(t, err)
+	require.Empty(t, res.LeasesExpired)
+
+	reloaded, err := s.Job(job.ID)
+	require.NoError(t, err)
+	require.Equal(t, model.JobAssigned, reloaded.State)
+	leases, err := s.Leases()
+	require.NoError(t, err)
+	require.Len(t, leases, 1)
+}
+
+func TestExpiredHoldLeaseStillExpiresInRetentionMode(t *testing.T) {
+	s, c := newStore(t)
+	hold, err := s.Enqueue(holdReq("mudler", "maintenance", time.Minute))
+	require.NoError(t, err)
+	_, err = s.ScheduleOnce()
+	require.NoError(t, err)
+
+	c.Advance(20 * time.Minute)
+	res, err := s.Sweep(time.Hour, time.Hour, time.Time{}, store.SweepOptions{RetainDisconnectedJobs: true})
+	require.NoError(t, err)
+	require.Equal(t, []string{hold.ID}, res.LeasesExpired)
+	leases, err := s.Leases()
+	require.NoError(t, err)
+	require.Empty(t, leases)
+}
+
 // Pins the expiry boundary from the "not yet" side: one second short of the
 // TTL, the lease must still be live. See TestLeaseExpiresAtTTLBoundary for
 // the other side, one second later, where it must not be.

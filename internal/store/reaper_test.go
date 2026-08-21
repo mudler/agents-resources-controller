@@ -95,6 +95,54 @@ func TestSweepMarksLostWorkerDevicesUnhealthyNotReady(t *testing.T) {
 	require.ErrorIs(t, err, store.ErrNoDevice)
 }
 
+func TestSweepRetentionQuarantinesSilentWorkerWithoutReapingJob(t *testing.T) {
+	s, c := newStore(t)
+
+	job, err := s.Allocate(req("agent-a"))
+	require.NoError(t, err)
+	require.NoError(t, s.MarkRunning(job.ID, c.Now()))
+	before, err := s.Leases()
+	require.NoError(t, err)
+	require.Len(t, before, 1)
+
+	c.Advance(10 * time.Minute)
+	res, err := s.Sweep(30*time.Second, 5*time.Minute, time.Time{}, store.SweepOptions{RetainDisconnectedJobs: true})
+	require.NoError(t, err)
+	require.Equal(t, []string{"gpubox:gpu0"}, res.DevicesUnhealthy)
+	require.Empty(t, res.JobsLost)
+
+	reloaded, err := s.Job(job.ID)
+	require.NoError(t, err)
+	require.Equal(t, model.JobRunning, reloaded.State)
+	after, err := s.Leases()
+	require.NoError(t, err)
+	require.Equal(t, before, after)
+
+	reasons, err := s.QuarantineReasons([]string{"gpubox:gpu0"})
+	require.NoError(t, err)
+	require.Equal(t, "worker_lost", reasons["gpubox:gpu0"])
+
+	require.NoError(t, s.RecordHeartbeat("w1", c.Now(), []string{job.ID}))
+	devices, err := s.Devices()
+	require.NoError(t, err)
+	require.Equal(t, model.DeviceBusy, devices[0].State)
+	reasons, err = s.QuarantineReasons([]string{"gpubox:gpu0"})
+	require.NoError(t, err)
+	require.Empty(t, reasons["gpubox:gpu0"])
+}
+
+func TestHeartbeatDoesNotRestoreFaultQuarantineWithActiveJob(t *testing.T) {
+	s, c := newStore(t)
+	job, err := s.Allocate(req("agent-a"))
+	require.NoError(t, err)
+	require.NoError(t, s.SetDeviceState("gpubox:gpu0", model.DeviceUnhealthy, c.Now(), "fault"))
+
+	require.NoError(t, s.RecordHeartbeat("w1", c.Now(), []string{job.ID}))
+	devices, err := s.Devices()
+	require.NoError(t, err)
+	require.Equal(t, model.DeviceUnhealthy, devices[0].State)
+}
+
 func TestClearDeviceMakesUnhealthyDeviceSchedulableAgain(t *testing.T) {
 	s, c := newStore(t)
 

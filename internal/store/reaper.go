@@ -43,6 +43,10 @@ type SweepResult struct {
 	LeasesExpired    []string `json:"leases_expired"`
 }
 
+type SweepOptions struct {
+	RetainDisconnectedJobs bool
+}
+
 // Sweep demotes devices whose worker has stopped reporting. A device is never
 // promoted to ready by this path: silence is not evidence that it is free.
 //
@@ -74,9 +78,10 @@ type SweepResult struct {
 // heartbeat undoes it, and "we have not heard from this worker since we
 // started" is the honest thing to say about a worker we have not heard from
 // since we started.
-func (s *Store) Sweep(grace, unhealthyAfter time.Duration, holdOffUntil time.Time) (SweepResult, error) {
+func (s *Store) Sweep(grace, unhealthyAfter time.Duration, holdOffUntil time.Time, options ...SweepOptions) (SweepResult, error) {
 	var res SweepResult
 	now := s.clock.Now()
+	retainDisconnectedJobs := len(options) > 0 && options[0].RetainDisconnectedJobs
 	// judging is false only inside the startup window. Read once, so a
 	// single sweep cannot decide one way for the devices and the other way
 	// for the leases.
@@ -152,6 +157,9 @@ func (s *Store) Sweep(grace, unhealthyAfter time.Duration, holdOffUntil time.Tim
 		}
 	}
 
+	if retainDisconnectedJobs {
+		reap = nil
+	}
 	for _, deviceID := range reap {
 		// The worker is gone for good: its in-flight jobs are lost and their
 		// leases must be released, or the device is stuck forever. This runs
@@ -203,9 +211,14 @@ func (s *Store) Sweep(grace, unhealthyAfter time.Duration, holdOffUntil time.Tim
 	type expired struct{ leaseID, jobID, deviceID string }
 	var stale []expired
 	if judging {
-		expRows, err := tx.Query(
-			`SELECT id, job_id, device_id FROM leases
-			 WHERE released_at IS NULL AND expires_at <= ?`, now.Unix())
+		query := `SELECT id, job_id, device_id FROM leases
+			 WHERE released_at IS NULL AND expires_at <= ?`
+		args := []any{now.Unix()}
+		if retainDisconnectedJobs {
+			query += ` AND kind != ?`
+			args = append(args, model.LeaseKindJob)
+		}
+		expRows, err := tx.Query(query, args...)
 		if err != nil {
 			return res, err
 		}
@@ -481,6 +494,23 @@ func (s *Store) RecordHeartbeat(workerID string, at time.Time, runningJobIDs []s
 			   AND job_id IN (SELECT id FROM jobs
 			                  WHERE worker_id = ? AND state IN (?, ?) AND id IN (%s))`,
 			strings.Join(placeholders, ", ")), args...); err != nil {
+			return err
+		}
+
+		restoreArgs := []any{
+			string(model.DeviceBusy), at.Unix(), workerID,
+			string(model.DeviceUnhealthy), quarantineWorkerLost,
+			workerID, string(model.JobAssigned), string(model.JobRunning),
+		}
+		for _, id := range runningJobIDs {
+			restoreArgs = append(restoreArgs, id)
+		}
+		if _, err := tx.Exec(fmt.Sprintf(
+			`UPDATE devices SET state = ?, quarantine_reason = '', quarantine_detail = '', last_heartbeat_at = ?
+			 WHERE worker_id = ? AND state = ? AND quarantine_reason = ?
+			   AND id IN (SELECT device_id FROM jobs
+			              WHERE worker_id = ? AND state IN (?, ?) AND id IN (%s))`,
+			strings.Join(placeholders, ", ")), restoreArgs...); err != nil {
 			return err
 		}
 	}
